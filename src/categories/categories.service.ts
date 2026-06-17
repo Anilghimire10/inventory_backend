@@ -35,11 +35,8 @@ export class CategoriesService {
 
   async remove(businessId: string, id: string) {
     await this.assertOwned(businessId, id);
-    // Products keep working — their categoryId is set null on delete.
-    await this.prisma.product.updateMany({
-      where: { categoryId: id, businessId },
-      data: { categoryId: null },
-    });
+    // The product↔category join rows cascade away on delete; products
+    // themselves keep working, just without this category.
     return this.prisma.category.delete({ where: { id } });
   }
 

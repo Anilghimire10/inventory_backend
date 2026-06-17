@@ -6,7 +6,9 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+import { IsEmail, IsOptional } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { SalesService } from './sales.service';
 import { CreateSaleDto } from './dto/create-sale.dto';
@@ -16,13 +18,31 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
 
+export class EmailReceiptDto {
+  @ApiPropertyOptional({ description: 'Override recipient; defaults to the customer email' })
+  @IsOptional()
+  @IsEmail()
+  email?: string;
+}
+
 @ApiTags('sales')
 @ApiBearerAuth()
 @Controller('sales')
 export class SalesController {
   constructor(private readonly sales: SalesService) {}
 
-  // Cashiers and up can ring up sales
+  /** Email the receipt for a sale to the customer. */
+  @Throttle({ default: { limit: 8, ttl: 60_000 } }) // curb outbound-mail abuse
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Post(':id/email-receipt')
+  emailReceipt(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: EmailReceiptDto,
+  ) {
+    return this.sales.emailReceipt(u.businessId, id, dto.email);
+  }
+
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
   @Post()
   create(@CurrentUser() u: AuthUser, @Body() dto: CreateSaleDto) {

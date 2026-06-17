@@ -17,6 +17,7 @@ import {
   QueryStockDto,
 } from './dto/query-inventory.dto';
 import { paginate } from '../common/dto/pagination.dto';
+import { TX_OPTS } from '../common/prisma-tx';
 
 /** A Prisma client or an active transaction client. */
 type Db = PrismaClient | Prisma.TransactionClient;
@@ -89,17 +90,19 @@ export class InventoryService {
   /** Manual stock adjustment (damage, count correction, etc.). */
   async adjust(businessId: string, userId: string, dto: AdjustStockDto) {
     await this.assertStoreAndProduct(businessId, dto.storeId, dto.productId);
-    return this.prisma.$transaction((tx) =>
-      this.applyMovement(tx, {
-        businessId,
-        storeId: dto.storeId,
-        productId: dto.productId,
-        type: StockMovementType.ADJUSTMENT,
-        quantity: dto.delta,
-        reason: dto.reason,
-        note: dto.note,
-        userId,
-      }),
+    return this.prisma.$transaction(
+      (tx) =>
+        this.applyMovement(tx, {
+          businessId,
+          storeId: dto.storeId,
+          productId: dto.productId,
+          type: StockMovementType.ADJUSTMENT,
+          quantity: dto.delta,
+          reason: dto.reason,
+          note: dto.note,
+          userId,
+        }),
+      TX_OPTS,
     );
   }
 

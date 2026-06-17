@@ -13,6 +13,8 @@ datasource db {
 
 // ---------- Enums ----------
 
+// A simple descriptor for the kind of business (display only — does not gate
+// features). Inventory features are the same for every business.
 enum BusinessType {
   GROCERY
   PHARMACY
@@ -20,6 +22,13 @@ enum BusinessType {
   OTHER
 }
 
+// How the business sells — retail (to end customers) vs wholesale (bulk/B2B).
+enum SalesModel {
+  RETAIL
+  WHOLESALE
+}
+
+// Fixed staff roles. Access is gated by role (carried in the JWT).
 enum UserRole {
   OWNER
   MANAGER
@@ -66,6 +75,19 @@ enum PaymentMethod {
   MIXED
 }
 
+// One-time email codes: account verification and password reset.
+enum EmailTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+// Categories of in-app alerts surfaced in the notification bell.
+enum NotificationType {
+  LOW_STOCK
+  EXPIRING
+  GENERAL
+}
+
 // ---------- Tenant root ----------
 
 // Platform-level operator (super-admin). NOT a tenant user — sees/manages
@@ -84,15 +106,19 @@ model Business {
   id           String       @id @default(cuid())
   name         String
   type         BusinessType @default(OTHER)
+  salesModel   SalesModel   @default(RETAIL)
   currency     String       @default("USD")
   taxId        String?
   taxInclusive Boolean      @default(false)
   isSuspended  Boolean      @default(false) // suspended by a platform admin
+  isSubscribed Boolean      @default(true) // paid/active subscription (Fonepay later)
+  subscribedTo DateTime? // subscription end date; null = no expiry
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 
   stores         Store[]
   users          User[]
+  taxes          Tax[]
   categories     Category[]
   products       Product[]
   suppliers      Supplier[]
@@ -102,6 +128,8 @@ model Business {
   stockItems     StockItem[]
   stockMovements StockMovement[]
   batches        Batch[]
+  notifications  Notification[]
+  auditLogs      AuditLog[]
 }
 
 model Store {
@@ -133,18 +161,35 @@ model User {
   business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
   storeId      String? // default store for this user (optional)
   store        Store?   @relation(fields: [storeId], references: [id])
-  email        String   @unique // globally unique -> simple login
-  passwordHash String
-  name         String
-  role         UserRole @default(CASHIER)
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  email         String   @unique // globally unique -> simple login
+  passwordHash  String
+  name          String
+  role          UserRole @default(CASHIER)
+  isActive      Boolean  @default(true)
+  emailVerified Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   sales          Sale[]
   stockMovements StockMovement[]
+  emailTokens    EmailToken[]
+  auditLogs      AuditLog[]
 
   @@index([businessId])
+}
+
+// Short-lived one-time codes emailed to a user (verify / reset).
+model EmailToken {
+  id         String         @id @default(cuid())
+  userId     String
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       EmailTokenType
+  codeHash   String // sha256 of the emailed code — never store it in the clear
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime       @default(now())
+
+  @@index([userId, type])
 }
 
 // ---------- Catalog ----------
@@ -157,34 +202,56 @@ model Category {
   parentId   String?
   parent     Category?  @relation("CategoryTree", fields: [parentId], references: [id])
   children   Category[] @relation("CategoryTree")
-  products   Product[]
+  products   Product[]  @relation("ProductCategories")
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
 
   @@index([businessId])
 }
 
+// Admin-defined tax rates (e.g. VAT 13%). Products reference one; the rate is
+// also snapshotted onto the product (and sale items) for stable calculations.
+model Tax {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  rate       Decimal  @default(0) @db.Decimal(5, 2)
+  isActive   Boolean  @default(true)
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  products Product[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+}
+
 model Product {
-  id           String    @id @default(cuid())
+  id           String     @id @default(cuid())
   businessId   String
-  business     Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  categoryId   String?
-  category     Category? @relation(fields: [categoryId], references: [id])
+  business     Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  categories   Category[] @relation("ProductCategories")
+  taxId        String?
+  tax          Tax?       @relation(fields: [taxId], references: [id])
   name         String
   description  String?
   sku          String?
   barcode      String?
   brand        String?
-  unit         String    @default("pcs")
-  costPrice    Decimal   @default(0) @db.Decimal(12, 2)
-  sellingPrice Decimal   @default(0) @db.Decimal(12, 2)
-  taxRate      Decimal   @default(0) @db.Decimal(5, 2)
-  isRxRequired Boolean   @default(false) // pharmacy: prescription required
-  trackBatches Boolean   @default(false) // enable batch/expiry tracking
-  reorderLevel Int       @default(0)
-  isActive     Boolean   @default(true)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  imageUrl     String? // path to a locally-stored image, e.g. /api/uploads/products/<file>
+  expiryDate   DateTime? // product-level expiry (separate from per-batch expiry)
+  unit         String     @default("pcs")
+  costPrice    Decimal    @default(0) @db.Decimal(12, 2)
+  sellingPrice Decimal    @default(0) @db.Decimal(12, 2)
+  taxRate      Decimal    @default(0) @db.Decimal(5, 2)
+  isRxRequired Boolean    @default(false) // pharmacy: prescription required
+  trackBatches Boolean    @default(false) // enable batch/expiry tracking
+  reorderLevel Int        @default(0)
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
 
   stockItems     StockItem[]
   batches        Batch[]
@@ -195,7 +262,6 @@ model Product {
   @@unique([businessId, sku])
   @@unique([businessId, barcode])
   @@index([businessId])
-  @@index([businessId, categoryId])
 }
 
 // ---------- Stock ----------
@@ -292,6 +358,7 @@ model Purchase {
   subtotal   Decimal        @default(0) @db.Decimal(12, 2)
   tax        Decimal        @default(0) @db.Decimal(12, 2)
   total      Decimal        @default(0) @db.Decimal(12, 2)
+  amountPaid Decimal        @default(0) @db.Decimal(12, 2) // paid to supplier; outstanding = total - amountPaid
   note       String?
   receivedAt DateTime?
   createdAt  DateTime       @default(now())
@@ -385,4 +452,51 @@ model SaleItem {
   returnedQty Int      @default(0)
 
   @@index([saleId])
+}
+
+// ---------- Notifications ----------
+
+// In-app alerts shown in the notification bell. Auto-generated alerts
+// (LOW_STOCK / EXPIRING) are reconciled from live inventory each fetch and
+// carry a dedupeKey; read/dismissed state is preserved across reconciliations.
+model Notification {
+  id          String           @id @default(cuid())
+  businessId  String
+  business    Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type        NotificationType @default(GENERAL)
+  title       String
+  body        String?
+  link        String?
+  dedupeKey   String? // stable identity for auto alerts; null for one-off notices
+  readAt      DateTime?
+  dismissedAt DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([businessId, dedupeKey])
+  @@index([businessId])
+}
+
+// ---------- Audit / activity log ----------
+
+// One row per meaningful user action (login, create/update/delete of records).
+// Written by the audit interceptor + auth service; read on the admin log page.
+model AuditLog {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userName   String? // snapshot of who acted (survives user deletion)
+  action     String // e.g. "sale.create", "auth.login", "product.delete"
+  entity     String? // resource type, e.g. "Sale"
+  entityId   String?
+  summary    String? // human-readable description
+  method     String?
+  path       String?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([businessId, createdAt])
+  @@index([userId])
 }

@@ -25,7 +25,7 @@ export class UsersController {
 
   @Post()
   create(@CurrentUser() u: AuthUser, @Body() dto: CreateUserDto) {
-    return this.users.create(u.businessId, dto);
+    return this.users.create(u.businessId, dto, u.role);
   }
 
   @Get()
@@ -44,7 +44,7 @@ export class UsersController {
     @Param('id') id: string,
     @Body() dto: UpdateUserDto,
   ) {
-    return this.users.update(u.businessId, id, dto, u.userId);
+    return this.users.update(u.businessId, id, dto, u.role, u.userId);
   }
 
   @Delete(':id')

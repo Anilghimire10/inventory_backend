@@ -4,6 +4,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
+import { isSubscriptionActive } from '../../common/subscription';
 
 export interface JwtPayload {
   sub: string; // userId
@@ -27,13 +28,22 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   async validate(payload: JwtPayload): Promise<AuthUser> {
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
-      include: { business: { select: { isSuspended: true } } },
+      include: {
+        business: {
+          select: { isSuspended: true, isSubscribed: true, subscribedTo: true },
+        },
+      },
     });
     if (!user || !user.isActive) {
       throw new UnauthorizedException('User no longer active');
     }
     if (user.business.isSuspended) {
       throw new UnauthorizedException('This business has been suspended');
+    }
+    if (!isSubscriptionActive(user.business)) {
+      throw new UnauthorizedException(
+        'Your subscription is inactive. Please renew to continue.',
+      );
     }
     return {
       userId: user.id,

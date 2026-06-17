@@ -1,14 +1,23 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import * as argon2 from 'argon2';
-import { Prisma } from '@prisma/client';
+import { Prisma, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+
+// Lower number = more privileged.
+const ROLE_RANK: Record<UserRole, number> = {
+  [UserRole.OWNER]: 0,
+  [UserRole.MANAGER]: 1,
+  [UserRole.CASHIER]: 2,
+  [UserRole.STOCK_KEEPER]: 2,
+};
 
 const SAFE_SELECT = {
   id: true,
@@ -24,12 +33,13 @@ const SAFE_SELECT = {
 export class UsersService {
   constructor(private prisma: PrismaService) {}
 
-  async create(businessId: string, dto: CreateUserDto) {
+  async create(businessId: string, dto: CreateUserDto, actingRole: UserRole) {
+    this.assertCanAssignRole(actingRole, dto.role);
+
     const existing = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
     if (existing) throw new ConflictException('Email already in use');
-
     if (dto.storeId) await this.assertStore(businessId, dto.storeId);
 
     const passwordHash = await argon2.hash(dto.password);
@@ -67,12 +77,20 @@ export class UsersService {
     businessId: string,
     id: string,
     dto: UpdateUserDto,
+    actingRole: UserRole,
     actingUserId: string,
   ) {
-    await this.findOne(businessId, id); // ensures same tenant
-    if (dto.storeId) await this.assertStore(businessId, dto.storeId);
+    const target = await this.prisma.user.findFirst({
+      where: { id, businessId },
+    });
+    if (!target) throw new NotFoundException('User not found');
 
-    // Don't let a user deactivate or demote themselves accidentally
+    // You can't modify someone who outranks you.
+    if (ROLE_RANK[target.role] < ROLE_RANK[actingRole]) {
+      throw new ForbiddenException('You cannot modify a higher-ranked user');
+    }
+    if (dto.role) this.assertCanAssignRole(actingRole, dto.role);
+    if (dto.storeId) await this.assertStore(businessId, dto.storeId);
     if (id === actingUserId && dto.isActive === false) {
       throw new BadRequestException('You cannot deactivate yourself');
     }
@@ -85,11 +103,7 @@ export class UsersService {
     };
     if (dto.password) data.passwordHash = await argon2.hash(dto.password);
 
-    return this.prisma.user.update({
-      where: { id },
-      data,
-      select: SAFE_SELECT,
-    });
+    return this.prisma.user.update({ where: { id }, data, select: SAFE_SELECT });
   }
 
   async remove(businessId: string, id: string, actingUserId: string) {
@@ -97,12 +111,18 @@ export class UsersService {
       throw new BadRequestException('You cannot delete yourself');
     }
     await this.findOne(businessId, id);
-    // Soft delete: keep history, just deactivate
     return this.prisma.user.update({
       where: { id },
       data: { isActive: false },
       select: SAFE_SELECT,
     });
+  }
+
+  /** Only an owner may grant the OWNER role. */
+  private assertCanAssignRole(actingRole: UserRole, targetRole: UserRole) {
+    if (targetRole === UserRole.OWNER && actingRole !== UserRole.OWNER) {
+      throw new ForbiddenException('Only an owner can assign the owner role');
+    }
   }
 
   private async assertStore(businessId: string, storeId: string) {

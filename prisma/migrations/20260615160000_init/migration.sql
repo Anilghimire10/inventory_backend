@@ -2,6 +2,9 @@
 CREATE TYPE "BusinessType" AS ENUM ('GROCERY', 'PHARMACY', 'RETAIL', 'OTHER');
 
 -- CreateEnum
+CREATE TYPE "SalesModel" AS ENUM ('RETAIL', 'WHOLESALE');
+
+-- CreateEnum
 CREATE TYPE "UserRole" AS ENUM ('OWNER', 'MANAGER', 'CASHIER', 'STOCK_KEEPER');
 
 -- CreateEnum
@@ -19,14 +22,35 @@ CREATE TYPE "SaleStatus" AS ENUM ('COMPLETED', 'HELD', 'RETURNED', 'PARTIALLY_RE
 -- CreateEnum
 CREATE TYPE "PaymentMethod" AS ENUM ('CASH', 'CARD', 'MOBILE', 'CREDIT', 'MIXED');
 
+-- CreateEnum
+CREATE TYPE "EmailTokenType" AS ENUM ('EMAIL_VERIFY', 'PASSWORD_RESET');
+
+-- CreateEnum
+CREATE TYPE "NotificationType" AS ENUM ('LOW_STOCK', 'EXPIRING', 'GENERAL');
+
+-- CreateTable
+CREATE TABLE "PlatformAdmin" (
+    "id" TEXT NOT NULL,
+    "email" TEXT NOT NULL,
+    "passwordHash" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "PlatformAdmin_pkey" PRIMARY KEY ("id")
+);
+
 -- CreateTable
 CREATE TABLE "Business" (
     "id" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "type" "BusinessType" NOT NULL DEFAULT 'OTHER',
+    "salesModel" "SalesModel" NOT NULL DEFAULT 'RETAIL',
     "currency" TEXT NOT NULL DEFAULT 'USD',
     "taxId" TEXT,
     "taxInclusive" BOOLEAN NOT NULL DEFAULT false,
+    "isSuspended" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -57,10 +81,24 @@ CREATE TABLE "User" (
     "name" TEXT NOT NULL,
     "role" "UserRole" NOT NULL DEFAULT 'CASHIER',
     "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "emailVerified" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "EmailToken" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "type" "EmailTokenType" NOT NULL,
+    "codeHash" TEXT NOT NULL,
+    "expiresAt" TIMESTAMP(3) NOT NULL,
+    "consumedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "EmailToken_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -79,12 +117,13 @@ CREATE TABLE "Category" (
 CREATE TABLE "Product" (
     "id" TEXT NOT NULL,
     "businessId" TEXT NOT NULL,
-    "categoryId" TEXT,
     "name" TEXT NOT NULL,
     "description" TEXT,
     "sku" TEXT,
     "barcode" TEXT,
     "brand" TEXT,
+    "imageUrl" TEXT,
+    "expiryDate" TIMESTAMP(3),
     "unit" TEXT NOT NULL DEFAULT 'pcs',
     "costPrice" DECIMAL(12,2) NOT NULL DEFAULT 0,
     "sellingPrice" DECIMAL(12,2) NOT NULL DEFAULT 0,
@@ -172,6 +211,7 @@ CREATE TABLE "Purchase" (
     "subtotal" DECIMAL(12,2) NOT NULL DEFAULT 0,
     "tax" DECIMAL(12,2) NOT NULL DEFAULT 0,
     "total" DECIMAL(12,2) NOT NULL DEFAULT 0,
+    "amountPaid" DECIMAL(12,2) NOT NULL DEFAULT 0,
     "note" TEXT,
     "receivedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -239,6 +279,7 @@ CREATE TABLE "SaleItem" (
     "name" TEXT NOT NULL,
     "quantity" INTEGER NOT NULL,
     "unitPrice" DECIMAL(12,2) NOT NULL,
+    "unitCost" DECIMAL(12,2) NOT NULL DEFAULT 0,
     "discount" DECIMAL(12,2) NOT NULL DEFAULT 0,
     "taxRate" DECIMAL(5,2) NOT NULL DEFAULT 0,
     "lineTotal" DECIMAL(12,2) NOT NULL,
@@ -246,6 +287,50 @@ CREATE TABLE "SaleItem" (
 
     CONSTRAINT "SaleItem_pkey" PRIMARY KEY ("id")
 );
+
+-- CreateTable
+CREATE TABLE "Notification" (
+    "id" TEXT NOT NULL,
+    "businessId" TEXT NOT NULL,
+    "type" "NotificationType" NOT NULL DEFAULT 'GENERAL',
+    "title" TEXT NOT NULL,
+    "body" TEXT,
+    "link" TEXT,
+    "dedupeKey" TEXT,
+    "readAt" TIMESTAMP(3),
+    "dismissedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Notification_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "AuditLog" (
+    "id" TEXT NOT NULL,
+    "businessId" TEXT NOT NULL,
+    "userId" TEXT,
+    "userName" TEXT,
+    "action" TEXT NOT NULL,
+    "entity" TEXT,
+    "entityId" TEXT,
+    "summary" TEXT,
+    "method" TEXT,
+    "path" TEXT,
+    "ip" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "AuditLog_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "_ProductCategories" (
+    "A" TEXT NOT NULL,
+    "B" TEXT NOT NULL
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "PlatformAdmin_email_key" ON "PlatformAdmin"("email");
 
 -- CreateIndex
 CREATE INDEX "Store_businessId_idx" ON "Store"("businessId");
@@ -257,13 +342,13 @@ CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 CREATE INDEX "User_businessId_idx" ON "User"("businessId");
 
 -- CreateIndex
+CREATE INDEX "EmailToken_userId_type_idx" ON "EmailToken"("userId", "type");
+
+-- CreateIndex
 CREATE INDEX "Category_businessId_idx" ON "Category"("businessId");
 
 -- CreateIndex
 CREATE INDEX "Product_businessId_idx" ON "Product"("businessId");
-
--- CreateIndex
-CREATE INDEX "Product_businessId_categoryId_idx" ON "Product"("businessId", "categoryId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Product_businessId_sku_key" ON "Product"("businessId", "sku");
@@ -328,6 +413,24 @@ CREATE UNIQUE INDEX "Sale_businessId_receiptNo_key" ON "Sale"("businessId", "rec
 -- CreateIndex
 CREATE INDEX "SaleItem_saleId_idx" ON "SaleItem"("saleId");
 
+-- CreateIndex
+CREATE INDEX "Notification_businessId_idx" ON "Notification"("businessId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Notification_businessId_dedupeKey_key" ON "Notification"("businessId", "dedupeKey");
+
+-- CreateIndex
+CREATE INDEX "AuditLog_businessId_createdAt_idx" ON "AuditLog"("businessId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "AuditLog_userId_idx" ON "AuditLog"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "_ProductCategories_AB_unique" ON "_ProductCategories"("A", "B");
+
+-- CreateIndex
+CREATE INDEX "_ProductCategories_B_index" ON "_ProductCategories"("B");
+
 -- AddForeignKey
 ALTER TABLE "Store" ADD CONSTRAINT "Store_businessId_fkey" FOREIGN KEY ("businessId") REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
@@ -338,6 +441,9 @@ ALTER TABLE "User" ADD CONSTRAINT "User_businessId_fkey" FOREIGN KEY ("businessI
 ALTER TABLE "User" ADD CONSTRAINT "User_storeId_fkey" FOREIGN KEY ("storeId") REFERENCES "Store"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "EmailToken" ADD CONSTRAINT "EmailToken_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "Category" ADD CONSTRAINT "Category_businessId_fkey" FOREIGN KEY ("businessId") REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -345,9 +451,6 @@ ALTER TABLE "Category" ADD CONSTRAINT "Category_parentId_fkey" FOREIGN KEY ("par
 
 -- AddForeignKey
 ALTER TABLE "Product" ADD CONSTRAINT "Product_businessId_fkey" FOREIGN KEY ("businessId") REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "Product" ADD CONSTRAINT "Product_categoryId_fkey" FOREIGN KEY ("categoryId") REFERENCES "Category"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "StockItem" ADD CONSTRAINT "StockItem_businessId_fkey" FOREIGN KEY ("businessId") REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -417,3 +520,19 @@ ALTER TABLE "SaleItem" ADD CONSTRAINT "SaleItem_saleId_fkey" FOREIGN KEY ("saleI
 
 -- AddForeignKey
 ALTER TABLE "SaleItem" ADD CONSTRAINT "SaleItem_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Notification" ADD CONSTRAINT "Notification_businessId_fkey" FOREIGN KEY ("businessId") REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_businessId_fkey" FOREIGN KEY ("businessId") REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "_ProductCategories" ADD CONSTRAINT "_ProductCategories_A_fkey" FOREIGN KEY ("A") REFERENCES "Category"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "_ProductCategories" ADD CONSTRAINT "_ProductCategories_B_fkey" FOREIGN KEY ("B") REFERENCES "Product"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+

@@ -14,10 +14,14 @@ export class ReportsController {
 
   @Get('dashboard')
   dashboard(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
-    return this.reports.dashboard(u.businessId, storeId);
+    // Financial figures (revenue, profit, inventory value) are shown to
+    // management (owner/manager) only.
+    const includeFinancials =
+      u.role === UserRole.OWNER || u.role === UserRole.MANAGER;
+    return this.reports.dashboard(u.businessId, storeId, includeFinancials);
   }
 
-  // Financial reports are management-level
+  // Financial reports & analytics are management-level.
   @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get('sales-summary')
   salesSummary(
@@ -27,6 +31,17 @@ export class ReportsController {
     @Query('storeId') storeId?: string,
   ) {
     return this.reports.salesSummary(u.businessId, { from, to, storeId });
+  }
+
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Get('tax')
+  taxReport(
+    @CurrentUser() u: AuthUser,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('storeId') storeId?: string,
+  ) {
+    return this.reports.taxReport(u.businessId, { from, to, storeId });
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER)

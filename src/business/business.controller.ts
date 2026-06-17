@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Patch } from '@nestjs/common';
 import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
-import { BusinessType, UserRole } from '@prisma/client';
+import { SalesModel } from '@prisma/client';
 import {
   IsBoolean,
   IsEnum,
@@ -9,6 +9,7 @@ import {
   Length,
   MinLength,
 } from 'class-validator';
+import { UserRole } from '@prisma/client';
 import { BusinessService } from './business.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -21,10 +22,13 @@ export class UpdateBusinessDto {
   @MinLength(2)
   name?: string;
 
-  @ApiPropertyOptional({ enum: BusinessType })
+  // NOTE: `type` (the vertical) is deliberately NOT editable here. It is locked
+  // after signup and can only be changed by a platform super-admin.
+
+  @ApiPropertyOptional({ enum: SalesModel })
   @IsOptional()
-  @IsEnum(BusinessType)
-  type?: BusinessType;
+  @IsEnum(SalesModel)
+  salesModel?: SalesModel;
 
   @ApiPropertyOptional({ description: '3-letter currency code' })
   @IsOptional()
@@ -50,6 +54,7 @@ export class BusinessController {
   constructor(private readonly business: BusinessService) {}
 
   /** The current tenant's business profile. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get()
   get(@CurrentUser() u: AuthUser) {
     return this.business.get(u.businessId);
@@ -59,5 +64,12 @@ export class BusinessController {
   @Patch()
   update(@CurrentUser() u: AuthUser, @Body() dto: UpdateBusinessDto) {
     return this.business.update(u.businessId, dto);
+  }
+
+  /** Owner-only: full export of the business's data as a JSON snapshot. */
+  @Roles(UserRole.OWNER)
+  @Get('export')
+  exportData(@CurrentUser() u: AuthUser) {
+    return this.business.exportData(u.businessId);
   }
 }

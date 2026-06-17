@@ -1,6 +1,9 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  ArrayUnique,
+  IsArray,
   IsBoolean,
+  IsDateString,
   IsNumber,
   IsOptional,
   IsString,
@@ -34,10 +37,27 @@ export class CreateProductDto {
   @IsString()
   brand?: string;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({
+    type: [String],
+    description: 'IDs of one or more categories this product belongs to',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsString({ each: true })
+  categoryIds?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Image path returned by POST /products/upload-image',
+  })
   @IsOptional()
   @IsString()
-  categoryId?: string;
+  imageUrl?: string;
+
+  @ApiPropertyOptional({ description: 'Product expiry date (ISO 8601)' })
+  @IsOptional()
+  @IsDateString()
+  expiryDate?: string;
 
   @ApiPropertyOptional({ default: 'pcs' })
   @IsOptional()
@@ -56,7 +76,15 @@ export class CreateProductDto {
   @Min(0)
   sellingPrice?: number;
 
-  @ApiPropertyOptional({ default: 0, description: 'Tax percent, e.g. 13' })
+  @ApiPropertyOptional({ description: 'Id of an admin-defined tax (sets the rate)' })
+  @IsOptional()
+  @IsString()
+  taxId?: string;
+
+  @ApiPropertyOptional({
+    default: 0,
+    description: 'Tax percent (auto-set from taxId when provided)',
+  })
   @IsOptional()
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)

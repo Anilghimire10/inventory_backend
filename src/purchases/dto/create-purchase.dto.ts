@@ -67,6 +67,15 @@ export class CreatePurchaseDto {
   @IsBoolean()
   receiveNow?: boolean;
 
+  @ApiPropertyOptional({
+    description:
+      'Amount paid to the supplier now. Defaults to the full total (paid in cash). Pass 0 (or a partial amount) to buy on credit.',
+  })
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  amountPaid?: number;
+
   @ApiProperty({ type: [PurchaseItemDto] })
   @IsArray()
   @ArrayMinSize(1)

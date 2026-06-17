@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { BusinessType } from '@prisma/client';
+import { BusinessType, SalesModel } from '@prisma/client';
 import {
   IsEmail,
   IsEnum,
@@ -20,6 +20,11 @@ export class RegisterDto {
   @IsOptional()
   @IsEnum(BusinessType)
   businessType?: BusinessType;
+
+  @ApiPropertyOptional({ enum: SalesModel, default: SalesModel.RETAIL })
+  @IsOptional()
+  @IsEnum(SalesModel)
+  salesModel?: SalesModel;
 
   @ApiPropertyOptional({ default: 'USD', description: '3-letter currency code' })
   @IsOptional()

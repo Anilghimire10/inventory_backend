@@ -1,6 +1,5 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { UserRole } from '@prisma/client';
 import { InventoryService } from './inventory.service';
 import { AdjustStockDto, SetReorderLevelDto } from './dto/adjust-stock.dto';
 import {
@@ -8,6 +7,7 @@ import {
   QueryMovementsDto,
   QueryStockDto,
 } from './dto/query-inventory.dto';
+import { UserRole } from '@prisma/client';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';

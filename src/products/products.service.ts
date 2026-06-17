@@ -15,11 +15,27 @@ import { paginate } from '../common/dto/pagination.dto';
 export class ProductsService {
   constructor(private prisma: PrismaService) {}
 
+  private readonly detailInclude = {
+    categories: { select: { id: true, name: true } },
+    tax: { select: { id: true, name: true, rate: true } },
+  } satisfies Prisma.ProductInclude;
+
   async create(businessId: string, dto: CreateProductDto) {
-    if (dto.categoryId) await this.assertCategory(businessId, dto.categoryId);
+    const { categoryIds, expiryDate, taxId, ...rest } = dto;
+    await this.assertCategories(businessId, categoryIds);
+    const taxRate = await this.resolveTaxRate(businessId, taxId);
     try {
       return await this.prisma.product.create({
-        data: { businessId, ...dto },
+        data: {
+          businessId,
+          ...rest,
+          ...(taxId ? { taxId, taxRate } : {}),
+          ...(expiryDate ? { expiryDate: new Date(expiryDate) } : {}),
+          ...(categoryIds?.length
+            ? { categories: { connect: categoryIds.map((id) => ({ id })) } }
+            : {}),
+        },
+        include: this.detailInclude,
       });
     } catch (e) {
       throw this.handleUnique(e);
@@ -30,7 +46,7 @@ export class ProductsService {
     const where: Prisma.ProductWhereInput = {
       businessId,
       ...(q.activeOnly !== false ? { isActive: true } : {}),
-      ...(q.categoryId ? { categoryId: q.categoryId } : {}),
+      ...(q.categoryId ? { categories: { some: { id: q.categoryId } } } : {}),
       ...(q.search
         ? {
             OR: [
@@ -49,7 +65,7 @@ export class ProductsService {
         skip: q.skip,
         take: q.limit,
         orderBy: { name: 'asc' },
-        include: { category: { select: { id: true, name: true } } },
+        include: this.detailInclude,
       }),
       this.prisma.product.count({ where }),
     ]);
@@ -60,7 +76,7 @@ export class ProductsService {
     const product = await this.prisma.product.findFirst({
       where: { id, businessId },
       include: {
-        category: { select: { id: true, name: true } },
+        ...this.detailInclude,
         stockItems: { select: { storeId: true, quantity: true } },
       },
     });
@@ -79,12 +95,109 @@ export class ProductsService {
 
   async update(businessId: string, id: string, dto: UpdateProductDto) {
     await this.findOne(businessId, id);
-    if (dto.categoryId) await this.assertCategory(businessId, dto.categoryId);
+    const { categoryIds, expiryDate, taxId, ...rest } = dto;
+    await this.assertCategories(businessId, categoryIds);
     try {
-      return await this.prisma.product.update({ where: { id }, data: dto });
+      return await this.prisma.product.update({
+        where: { id },
+        data: {
+          ...rest,
+          // Setting a tax snapshots its rate; clearing it (null) leaves the rate.
+          ...(taxId !== undefined
+            ? taxId
+              ? { taxId, taxRate: await this.resolveTaxRate(businessId, taxId) }
+              : { taxId: null }
+            : {}),
+          ...(expiryDate !== undefined
+            ? { expiryDate: expiryDate ? new Date(expiryDate) : null }
+            : {}),
+          // `set` replaces the full category list when the field is provided.
+          ...(categoryIds !== undefined
+            ? { categories: { set: categoryIds.map((cid) => ({ id: cid })) } }
+            : {}),
+        },
+        include: this.detailInclude,
+      });
     } catch (e) {
       throw this.handleUnique(e);
     }
+  }
+
+  // ---- Bulk import / export ----
+
+  /** Flattened product rows for CSV export. */
+  async exportAll(businessId: string) {
+    const products = await this.prisma.product.findMany({
+      where: { businessId },
+      orderBy: { name: 'asc' },
+      include: { categories: { select: { name: true } } },
+    });
+    return products.map((p) => ({
+      name: p.name,
+      sku: p.sku ?? '',
+      barcode: p.barcode ?? '',
+      brand: p.brand ?? '',
+      unit: p.unit,
+      costPrice: Number(p.costPrice),
+      sellingPrice: Number(p.sellingPrice),
+      taxRate: Number(p.taxRate),
+      reorderLevel: p.reorderLevel,
+      categories: p.categories.map((c) => c.name).join('|'),
+      isActive: p.isActive,
+    }));
+  }
+
+  /**
+   * Upsert products from imported rows, keyed by SKU within the business.
+   * Rows without an SKU are always created. Returns a per-row summary.
+   */
+  async bulkImport(businessId: string, items: Record<string, unknown>[]) {
+    if (items.length > 5000) {
+      throw new BadRequestException('Import is limited to 5000 rows at a time');
+    }
+    const num = (v: unknown) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    };
+    const str = (v: unknown) => (v == null ? '' : String(v).trim());
+
+    let created = 0;
+    let updated = 0;
+    const errors: { row: number; error: string }[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      try {
+        const name = str(it.name);
+        if (!name) throw new Error('Name is required');
+        const data = {
+          name,
+          barcode: str(it.barcode) || null,
+          brand: str(it.brand) || null,
+          unit: str(it.unit) || 'pcs',
+          costPrice: num(it.costPrice),
+          sellingPrice: num(it.sellingPrice),
+          taxRate: num(it.taxRate),
+          reorderLevel: Math.round(num(it.reorderLevel)),
+        };
+        const sku = str(it.sku) || null;
+        const existing = sku
+          ? await this.prisma.product.findFirst({ where: { businessId, sku } })
+          : null;
+        if (existing) {
+          await this.prisma.product.update({ where: { id: existing.id }, data });
+          updated++;
+        } else {
+          await this.prisma.product.create({
+            data: { businessId, sku, ...data },
+          });
+          created++;
+        }
+      } catch (e) {
+        errors.push({ row: i + 1, error: (e as Error).message });
+      }
+    }
+    return { created, updated, errors };
   }
 
   async remove(businessId: string, id: string) {
@@ -96,11 +209,25 @@ export class ProductsService {
     });
   }
 
-  private async assertCategory(businessId: string, categoryId: string) {
-    const cat = await this.prisma.category.findFirst({
-      where: { id: categoryId, businessId },
+  /** Resolve a tax id to its current rate (validating tenant ownership). */
+  private async resolveTaxRate(businessId: string, taxId?: string) {
+    if (!taxId) return undefined;
+    const tax = await this.prisma.tax.findFirst({
+      where: { id: taxId, businessId },
     });
-    if (!cat) throw new BadRequestException('Invalid category');
+    if (!tax) throw new BadRequestException('Invalid tax');
+    return Number(tax.rate);
+  }
+
+  /** Ensure every supplied category id belongs to this business. */
+  private async assertCategories(businessId: string, categoryIds?: string[]) {
+    if (!categoryIds?.length) return;
+    const count = await this.prisma.category.count({
+      where: { id: { in: categoryIds }, businessId },
+    });
+    if (count !== categoryIds.length) {
+      throw new BadRequestException('One or more categories are invalid');
+    }
   }
 
   private handleUnique(e: unknown) {

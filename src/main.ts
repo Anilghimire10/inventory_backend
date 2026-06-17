@@ -1,16 +1,36 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
+import { json, urlencoded } from 'express';
+import { join } from 'path';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const config = app.get(ConfigService);
 
-  // Security headers (CSP disabled — this is a JSON API, not HTML).
-  app.use(helmet({ contentSecurityPolicy: false }));
+  // Allow larger JSON bodies for bulk product imports (default is ~100kb).
+  const bodyLimit = config.get<string>('BODY_LIMIT') ?? '8mb';
+  app.use(json({ limit: bodyLimit }));
+  app.use(urlencoded({ extended: true, limit: bodyLimit }));
+
+  // Security headers. crossOriginResourcePolicy is relaxed so uploaded images
+  // can be loaded by the web app on a different origin. (CSP disabled — JSON API.)
+  app.use(
+    helmet({
+      contentSecurityPolicy: false,
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+    }),
+  );
+
+  // Serve locally-stored uploads (product images) at /api/uploads/*.
+  // Sits under the same /api path the web app already proxies to the backend.
+  app.useStaticAssets(join(process.cwd(), 'uploads'), {
+    prefix: '/api/uploads',
+  });
 
   // All routes prefixed with /api
   app.setGlobalPrefix('api');

@@ -12,8 +12,16 @@ export class ReportsService {
     private inventory: InventoryService,
   ) {}
 
-  /** Home-screen snapshot: today's takings + alerts + value + best sellers. */
-  async dashboard(businessId: string, storeId?: string) {
+  /**
+   * Home-screen snapshot: today's takings + alerts + value + best sellers.
+   * Financial figures are included only when `includeFinancials` is true
+   * (owner). Other roles still see the operational widgets.
+   */
+  async dashboard(
+    businessId: string,
+    storeId?: string,
+    includeFinancials = true,
+  ) {
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
@@ -22,7 +30,7 @@ export class ReportsService {
       ...(storeId ? { storeId } : {}),
     };
 
-    const [today, lowStock, expiring, inventoryValue, topProducts] =
+    const [today, lowStock, expiring, inventoryValue, topProducts, slowProducts] =
       await Promise.all([
         this.prisma.sale.aggregate({
           where: { ...saleWhere, createdAt: { gte: startOfToday } },
@@ -31,17 +39,36 @@ export class ReportsService {
         }),
         this.inventory.lowStock(businessId, storeId),
         this.inventory.expiringBatches(businessId, { days: 30, storeId }),
-        this.inventoryValue(businessId, storeId),
+        includeFinancials
+          ? this.inventoryValue(businessId, storeId)
+          : Promise.resolve(null),
         this.topProducts(businessId, storeId, 5),
+        this.slowProducts(businessId, storeId, 5),
       ]);
 
+    // Charts below are revenue-based, so owner-only.
+    const [salesTrend, hourlyToday] = includeFinancials
+      ? await Promise.all([
+          this.salesTrend(businessId, storeId, 14),
+          this.hourlyToday(businessId, storeId, startOfToday),
+        ])
+      : [undefined, undefined];
+
     return {
-      todaySalesTotal: Number(today._sum.total ?? 0),
       todaySalesCount: today._count,
       lowStockCount: lowStock.length,
       expiringSoonCount: expiring.length,
-      inventoryValue,
       topProducts,
+      slowProducts,
+      // Owner-only financial figures + charts.
+      ...(includeFinancials
+        ? {
+            todaySalesTotal: Number(today._sum.total ?? 0),
+            inventoryValue,
+            salesTrend,
+            hourlyToday,
+          }
+        : {}),
     };
   }
 
@@ -207,6 +234,79 @@ export class ReportsService {
     };
   }
 
+  /**
+   * VAT / tax report for a period: tax collected on sales, the taxable base,
+   * and a per-rate breakdown. Computed from sale line items.
+   */
+  async taxReport(
+    businessId: string,
+    opts: { from?: string; to?: string; storeId?: string },
+  ) {
+    const items = await this.prisma.saleItem.findMany({
+      where: {
+        sale: {
+          businessId,
+          status: { not: SaleStatus.HELD },
+          ...(opts.storeId ? { storeId: opts.storeId } : {}),
+          ...(opts.from || opts.to
+            ? {
+                createdAt: {
+                  ...(opts.from ? { gte: new Date(opts.from) } : {}),
+                  ...(opts.to ? { lte: new Date(opts.to) } : {}),
+                },
+              }
+            : {}),
+        },
+      },
+      select: {
+        quantity: true,
+        returnedQty: true,
+        unitPrice: true,
+        discount: true,
+        taxRate: true,
+        lineTotal: true,
+      },
+    });
+
+    const byRate = new Map<number, { taxableAmount: number; tax: number }>();
+    let taxableAmount = 0;
+    let taxCollected = 0;
+    let grossSales = 0;
+
+    for (const it of items) {
+      const soldQty = it.quantity - it.returnedQty;
+      if (soldQty <= 0) continue;
+      const rate = Number(it.taxRate);
+      // Net of the per-unit discount, scaled to the non-returned quantity.
+      const perUnitNet =
+        Number(it.unitPrice) - Number(it.discount) / (it.quantity || 1);
+      const lineNet = perUnitNet * soldQty;
+      const lineTax = round2((lineNet * rate) / 100);
+      taxableAmount += lineNet;
+      taxCollected += lineTax;
+      grossSales += lineNet + lineTax;
+      if (rate > 0) {
+        const cur = byRate.get(rate) ?? { taxableAmount: 0, tax: 0 };
+        cur.taxableAmount += lineNet;
+        cur.tax += lineTax;
+        byRate.set(rate, cur);
+      }
+    }
+
+    return {
+      taxableAmount: round2(taxableAmount),
+      taxCollected: round2(taxCollected),
+      grossSales: round2(grossSales),
+      byRate: [...byRate.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([rate, v]) => ({
+          rate,
+          taxableAmount: round2(v.taxableAmount),
+          tax: round2(v.tax),
+        })),
+    };
+  }
+
   // ---- helpers ----
 
   private async inventoryValue(businessId: string, storeId?: string) {
@@ -236,5 +336,127 @@ export class ReportsService {
       name: g.name,
       quantitySold: g._sum.quantity ?? 0,
     }));
+  }
+
+  /**
+   * Slowest-moving stocked products: active products with stock on hand,
+   * ranked by units sold over the last 30 days (ascending). Surfaces items
+   * that are tying up capital without selling.
+   */
+  private async slowProducts(
+    businessId: string,
+    storeId: string | undefined,
+    take: number,
+  ) {
+    const since = new Date();
+    since.setDate(since.getDate() - 30);
+
+    const [products, sold] = await Promise.all([
+      this.prisma.product.findMany({
+        where: {
+          businessId,
+          isActive: true,
+          stockItems: {
+            some: { quantity: { gt: 0 }, ...(storeId ? { storeId } : {}) },
+          },
+        },
+        select: {
+          id: true,
+          name: true,
+          stockItems: {
+            where: storeId ? { storeId } : {},
+            select: { quantity: true },
+          },
+        },
+      }),
+      this.prisma.saleItem.groupBy({
+        by: ['productId'],
+        where: {
+          sale: {
+            businessId,
+            ...(storeId ? { storeId } : {}),
+            createdAt: { gte: since },
+          },
+        },
+        _sum: { quantity: true },
+      }),
+    ]);
+
+    const soldMap = new Map(sold.map((s) => [s.productId, s._sum.quantity ?? 0]));
+    return products
+      .map((p) => ({
+        productId: p.id,
+        name: p.name,
+        quantitySold: soldMap.get(p.id) ?? 0,
+        inStock: p.stockItems.reduce((s, si) => s + si.quantity, 0),
+      }))
+      .sort((a, b) => a.quantitySold - b.quantitySold || b.inStock - a.inStock)
+      .slice(0, take);
+  }
+
+  /** Daily sales totals for the last `days` days (continuous, zero-filled). */
+  private async salesTrend(
+    businessId: string,
+    storeId: string | undefined,
+    days: number,
+  ) {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - (days - 1));
+
+    const sales = await this.prisma.sale.findMany({
+      where: {
+        businessId,
+        ...(storeId ? { storeId } : {}),
+        status: { not: SaleStatus.HELD },
+        createdAt: { gte: start },
+      },
+      select: { total: true, createdAt: true },
+    });
+
+    const byDay = new Map<string, { total: number; count: number }>();
+    for (let i = 0; i < days; i++) {
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      byDay.set(d.toISOString().slice(0, 10), { total: 0, count: 0 });
+    }
+    for (const s of sales) {
+      const key = s.createdAt.toISOString().slice(0, 10);
+      const bucket = byDay.get(key);
+      if (bucket) {
+        bucket.total = round2(bucket.total + Number(s.total));
+        bucket.count += 1;
+      }
+    }
+    return [...byDay.entries()].map(([date, v]) => ({ date, ...v }));
+  }
+
+  /** Today's sales totals bucketed by hour (0–23, zero-filled). */
+  private async hourlyToday(
+    businessId: string,
+    storeId: string | undefined,
+    startOfToday: Date,
+  ) {
+    const sales = await this.prisma.sale.findMany({
+      where: {
+        businessId,
+        ...(storeId ? { storeId } : {}),
+        status: { not: SaleStatus.HELD },
+        createdAt: { gte: startOfToday },
+      },
+      select: { total: true, createdAt: true },
+    });
+
+    const hours = Array.from({ length: 24 }, (_, hour) => ({
+      hour,
+      total: 0,
+      count: 0,
+    }));
+    for (const s of sales) {
+      const h = s.createdAt.getHours();
+      hours[h].total = round2(hours[h].total + Number(s.total));
+      hours[h].count += 1;
+    }
+    return hours;
   }
 }

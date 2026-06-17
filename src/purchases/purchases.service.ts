@@ -12,6 +12,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
+import { TX_OPTS } from '../common/prisma-tx';
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 @Injectable()
 export class PurchasesService {
@@ -34,10 +37,12 @@ export class PurchasesService {
     }
     const productMap = new Map(products.map((p) => [p.id, p]));
 
-    const subtotal = dto.items.reduce(
-      (sum, i) => sum + i.quantity * i.costPrice,
-      0,
+    const subtotal = round2(
+      dto.items.reduce((sum, i) => sum + i.quantity * i.costPrice, 0),
     );
+    const total = subtotal;
+    // Paid in full by default; pass a smaller amountPaid to buy on credit.
+    const amountPaid = Math.min(Math.max(dto.amountPaid ?? total, 0), total);
     const receiveNow = dto.receiveNow !== false;
 
     return this.prisma.$transaction(async (tx) => {
@@ -51,7 +56,8 @@ export class PurchasesService {
           status: receiveNow ? PurchaseStatus.RECEIVED : PurchaseStatus.DRAFT,
           subtotal,
           tax: 0,
-          total: subtotal,
+          total,
+          amountPaid,
           receivedAt: receiveNow ? new Date() : null,
           items: {
             create: dto.items.map((i) => ({
@@ -70,7 +76,7 @@ export class PurchasesService {
         await this.receiveItems(tx, businessId, dto.storeId, purchase.id, dto, productMap);
       }
       return purchase;
-    });
+    }, TX_OPTS);
   }
 
   /** Receive a draft purchase: add stock, create batches, update cost. */
@@ -108,7 +114,30 @@ export class PurchasesService {
         data: { status: PurchaseStatus.RECEIVED, receivedAt: new Date() },
         include: { items: true },
       });
+    }, TX_OPTS);
+  }
+
+  /** Record a payment to the supplier against a purchase (clamped to the total). */
+  async recordPayment(businessId: string, id: string, amount: number) {
+    if (amount <= 0) throw new BadRequestException('Amount must be positive');
+    const purchase = await this.prisma.purchase.findFirst({
+      where: { id, businessId },
     });
+    if (!purchase) throw new NotFoundException('Purchase not found');
+    const outstanding = round2(Number(purchase.total) - Number(purchase.amountPaid));
+    if (amount > outstanding + 0.001) {
+      throw new BadRequestException(
+        `Payment exceeds the outstanding ${outstanding}`,
+      );
+    }
+    const updated = await this.prisma.purchase.update({
+      where: { id },
+      data: { amountPaid: { increment: amount } },
+    });
+    return {
+      ...updated,
+      outstanding: round2(Number(updated.total) - Number(updated.amountPaid)),
+    };
   }
 
   async findAll(businessId: string, q: PaginationDto) {
@@ -127,7 +156,11 @@ export class PurchasesService {
       }),
       this.prisma.purchase.count({ where }),
     ]);
-    return paginate(data, total, q.page, q.limit);
+    const mapped = data.map((p) => ({
+      ...p,
+      outstanding: round2(Number(p.total) - Number(p.amountPaid)),
+    }));
+    return paginate(mapped, total, q.page, q.limit);
   }
 
   async findOne(businessId: string, id: string) {
@@ -140,7 +173,10 @@ export class PurchasesService {
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
-    return purchase;
+    return {
+      ...purchase,
+      outstanding: round2(Number(purchase.total) - Number(purchase.amountPaid)),
+    };
   }
 
   // ---- helpers ----

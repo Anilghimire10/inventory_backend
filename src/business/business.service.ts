@@ -24,4 +24,67 @@ export class BusinessService {
       },
     });
   }
+
+  /**
+   * Full export of a tenant's data as a JSON snapshot (owner download).
+   * Passwords are never included.
+   */
+  async exportData(businessId: string) {
+    const where = { businessId };
+    const [
+      business,
+      stores,
+      users,
+      categories,
+      taxes,
+      products,
+      suppliers,
+      customers,
+      purchases,
+      sales,
+      stockItems,
+      stockMovements,
+      batches,
+    ] = await Promise.all([
+      this.get(businessId),
+      this.prisma.store.findMany({ where }),
+      this.prisma.user.findMany({
+        where,
+        select: {
+          id: true, email: true, name: true, role: true,
+          storeId: true, isActive: true, emailVerified: true, createdAt: true,
+        },
+      }),
+      this.prisma.category.findMany({ where }),
+      this.prisma.tax.findMany({ where }),
+      this.prisma.product.findMany({
+        where,
+        include: { categories: { select: { id: true, name: true } } },
+      }),
+      this.prisma.supplier.findMany({ where }),
+      this.prisma.customer.findMany({ where }),
+      this.prisma.purchase.findMany({ where, include: { items: true } }),
+      this.prisma.sale.findMany({ where, include: { items: true } }),
+      this.prisma.stockItem.findMany({ where }),
+      this.prisma.stockMovement.findMany({ where }),
+      this.prisma.batch.findMany({ where }),
+    ]);
+
+    return {
+      exportedAt: new Date().toISOString(),
+      business,
+      stores,
+      users,
+      categories,
+      taxes,
+      products,
+      suppliers,
+      customers,
+      purchases,
+      sales,
+      stockItems,
+      stockMovements,
+      batches,
+    };
+  }
 }

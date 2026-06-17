@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma, SaleStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
@@ -63,6 +67,8 @@ export class PlatformService {
           type: true,
           currency: true,
           isSuspended: true,
+          isSubscribed: true,
+          subscribedTo: true,
           createdAt: true,
           _count: {
             select: { users: true, products: true, sales: true, stores: true },
@@ -131,6 +137,147 @@ export class PlatformService {
       data: { isSuspended },
       select: { id: true, name: true, isSuspended: true },
     });
+  }
+
+  /** Activate/deactivate a business's subscription (until Fonepay is wired). */
+  async setSubscription(
+    id: string,
+    isSubscribed: boolean,
+    subscribedTo: string | null,
+  ) {
+    await this.getBusinessOrThrow(id);
+    return this.prisma.business.update({
+      where: { id },
+      data: {
+        isSubscribed,
+        subscribedTo: subscribedTo ? new Date(subscribedTo) : null,
+      },
+      select: { id: true, name: true, isSubscribed: true, subscribedTo: true },
+    });
+  }
+
+  // ---- Per-business drill-downs (super-admin) ----
+
+  /** Customers of a business, paginated. */
+  async businessCustomers(businessId: string, q: PaginationDto) {
+    await this.getBusinessOrThrow(businessId);
+    const where: Prisma.CustomerWhereInput = {
+      businessId,
+      ...(q.search
+        ? {
+            OR: [
+              { name: { contains: q.search, mode: 'insensitive' } },
+              { phone: { contains: q.search, mode: 'insensitive' } },
+              { email: { contains: q.search, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.customer.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          name: true,
+          phone: true,
+          email: true,
+          creditBalance: true,
+          createdAt: true,
+          _count: { select: { sales: true } },
+        },
+      }),
+      this.prisma.customer.count({ where }),
+    ]);
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  /** Sales history of a business, paginated. */
+  async businessSales(businessId: string, q: PaginationDto) {
+    await this.getBusinessOrThrow(businessId);
+    const where: Prisma.SaleWhereInput = {
+      businessId,
+      ...(q.search
+        ? { receiptNo: { contains: q.search, mode: 'insensitive' } }
+        : {}),
+    };
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.sale.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          receiptNo: true,
+          total: true,
+          status: true,
+          paymentMethod: true,
+          createdAt: true,
+          customer: { select: { name: true } },
+          user: { select: { name: true } },
+          _count: { select: { items: true } },
+        },
+      }),
+      this.prisma.sale.count({ where }),
+    ]);
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  /** A single sale with its line items — "what they sold". */
+  async businessSale(businessId: string, saleId: string) {
+    const sale = await this.prisma.sale.findFirst({
+      where: { id: saleId, businessId },
+      include: {
+        items: true,
+        customer: { select: { name: true } },
+        user: { select: { name: true } },
+        store: { select: { name: true } },
+      },
+    });
+    if (!sale) throw new NotFoundException('Sale not found');
+    return sale;
+  }
+
+  /** Global activity feed across every business (super-admin monitoring). */
+  async activityFeed(q: PaginationDto) {
+    const where: Prisma.AuditLogWhereInput = q.search
+      ? { action: { contains: q.search, mode: 'insensitive' } }
+      : {};
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.auditLog.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          business: { select: { id: true, name: true } },
+          user: { select: { name: true, role: true } },
+        },
+      }),
+      this.prisma.auditLog.count({ where }),
+    ]);
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  /** Activity log of a business, paginated. */
+  async businessActivity(businessId: string, q: PaginationDto) {
+    await this.getBusinessOrThrow(businessId);
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.auditLog.findMany({
+        where: { businessId },
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          user: { select: { id: true, name: true, role: true } },
+        },
+      }),
+      this.prisma.auditLog.count({ where: { businessId } }),
+    ]);
+    return paginate(data, total, q.page, q.limit);
   }
 
   private async getBusinessOrThrow(id: string) {

@@ -6,7 +6,8 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiProperty, ApiTags } from '@nestjs/swagger';
+import { IsNumber, Min } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { PurchasesService } from './purchases.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
@@ -14,6 +15,13 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
 import { PaginationDto } from '../common/dto/pagination.dto';
+
+export class PayPurchaseDto {
+  @ApiProperty({ description: 'Amount being paid to the supplier' })
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0.01)
+  amount: number;
+}
 
 @ApiTags('purchases')
 @ApiBearerAuth()
@@ -30,6 +38,17 @@ export class PurchasesController {
   @Post(':id/receive')
   receive(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.purchases.receive(u.businessId, id);
+  }
+
+  /** Record a payment to the supplier against this purchase (credit settlement). */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Post(':id/pay')
+  pay(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: PayPurchaseDto,
+  ) {
+    return this.purchases.recordPayment(u.businessId, id, dto.amount);
   }
 
   @Get()

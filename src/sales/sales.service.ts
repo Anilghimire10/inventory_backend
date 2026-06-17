@@ -11,11 +11,13 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
 import { CreateSaleDto } from './dto/create-sale.dto';
 import { ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
+import { TX_OPTS } from '../common/prisma-tx';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -24,7 +26,37 @@ export class SalesService {
   constructor(
     private prisma: PrismaService,
     private inventory: InventoryService,
+    private mail: MailService,
   ) {}
+
+  /** Email a sale's receipt to the customer (or an explicit address). */
+  async emailReceipt(businessId: string, saleId: string, overrideEmail?: string) {
+    const sale = await this.findOne(businessId, saleId);
+    const to = overrideEmail || sale.customer?.email;
+    if (!to) {
+      throw new BadRequestException(
+        'No email address — add one to the customer or provide one.',
+      );
+    }
+    await this.mail.sendReceipt(to, {
+      customerName: sale.customer?.name ?? 'Customer',
+      businessName: sale.business?.name ?? 'Your store',
+      receiptNo: sale.receiptNo,
+      date: sale.createdAt,
+      currency: sale.business?.currency ?? 'USD',
+      items: sale.items.map((i) => ({
+        name: i.name,
+        quantity: i.quantity,
+        unitPrice: Number(i.unitPrice),
+        lineTotal: Number(i.lineTotal),
+      })),
+      subtotal: Number(sale.subtotal),
+      discount: Number(sale.discount),
+      tax: Number(sale.tax),
+      total: Number(sale.total),
+    });
+    return { message: `Receipt emailed to ${to}` };
+  }
 
   async create(user: AuthUser, dto: CreateSaleDto) {
     const businessId = user.businessId;
@@ -150,7 +182,7 @@ export class SalesService {
       }
 
       return sale;
-    });
+    }, TX_OPTS);
   }
 
   async returnItems(user: AuthUser, saleId: string, dto: ReturnSaleDto) {
@@ -227,7 +259,7 @@ export class SalesService {
         include: { items: true },
       });
       return { sale: updated, refund };
-    });
+    }, TX_OPTS);
   }
 
   async findAll(businessId: string, q: QuerySaleDto) {
