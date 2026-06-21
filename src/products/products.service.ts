@@ -25,7 +25,7 @@ export class ProductsService {
     await this.assertCategories(businessId, categoryIds);
     const taxRate = await this.resolveTaxRate(businessId, taxId);
     try {
-      return await this.prisma.product.create({
+      const product = await this.prisma.product.create({
         data: {
           businessId,
           ...rest,
@@ -37,9 +37,34 @@ export class ProductsService {
         },
         include: this.detailInclude,
       });
+      await this.seedStockRows(businessId, product.id);
+      return product;
     } catch (e) {
       throw this.handleUnique(e);
     }
+  }
+
+  /**
+   * Give a brand-new product a zero-quantity StockItem in every store so it
+   * shows up on the stock page immediately (the stock list reads StockItem
+   * rows, not products). Without this it stays invisible until the first
+   * purchase/adjustment creates a row.
+   */
+  private async seedStockRows(businessId: string, productId: string) {
+    const stores = await this.prisma.store.findMany({
+      where: { businessId },
+      select: { id: true },
+    });
+    if (!stores.length) return;
+    await this.prisma.stockItem.createMany({
+      data: stores.map((s) => ({
+        businessId,
+        storeId: s.id,
+        productId,
+        quantity: 0,
+      })),
+      skipDuplicates: true,
+    });
   }
 
   async findAll(businessId: string, q: QueryProductDto) {
@@ -188,9 +213,10 @@ export class ProductsService {
           await this.prisma.product.update({ where: { id: existing.id }, data });
           updated++;
         } else {
-          await this.prisma.product.create({
+          const product = await this.prisma.product.create({
             data: { businessId, sku, ...data },
           });
+          await this.seedStockRows(businessId, product.id);
           created++;
         }
       } catch (e) {

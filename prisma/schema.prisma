@@ -108,8 +108,10 @@ model Business {
   type         BusinessType @default(OTHER)
   salesModel   SalesModel   @default(RETAIL)
   currency     String       @default("USD")
-  taxId        String?
+  taxId        String? // PAN/VAT registration number
+  showTaxIdOnBill Boolean   @default(false) // when on, the PAN/VAT number prints on bills
   taxInclusive Boolean      @default(false)
+  taxEnabled   Boolean      @default(true) // master switch: when off, no sale charges tax
   isSuspended  Boolean      @default(false) // suspended by a platform admin
   isSubscribed Boolean      @default(true) // paid/active subscription (Fonepay later)
   subscribedTo DateTime? // subscription end date; null = no expiry
@@ -246,6 +248,7 @@ model Product {
   costPrice    Decimal    @default(0) @db.Decimal(12, 2)
   sellingPrice Decimal    @default(0) @db.Decimal(12, 2)
   taxRate      Decimal    @default(0) @db.Decimal(5, 2)
+  isTaxable    Boolean    @default(true) // when false, this product is never taxed
   isRxRequired Boolean    @default(false) // pharmacy: prescription required
   trackBatches Boolean    @default(false) // enable batch/expiry tracking
   reorderLevel Int        @default(0)

@@ -11,6 +11,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
+import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 
@@ -76,6 +77,138 @@ export class PurchasesService {
         await this.receiveItems(tx, businessId, dto.storeId, purchase.id, dto, productMap);
       }
       return purchase;
+    }, TX_OPTS);
+  }
+
+  /**
+   * Edit an existing purchase. For a RECEIVED purchase this reverses the old
+   * stock, swaps the line items, then re-applies the new stock — all in one
+   * transaction. Editing is blocked if some of the original stock has already
+   * been sold/moved (the reversal would drive stock negative).
+   */
+  async update(businessId: string, id: string, dto: UpdatePurchaseDto) {
+    const existing = await this.prisma.purchase.findFirst({
+      where: { id, businessId },
+      include: { items: true },
+    });
+    if (!existing) throw new NotFoundException('Purchase not found');
+    if (existing.status === PurchaseStatus.CANCELLED) {
+      throw new BadRequestException('A cancelled purchase cannot be edited');
+    }
+
+    const items = dto.items ?? existing.items.map((i) => ({
+      productId: i.productId,
+      quantity: i.quantity,
+      costPrice: Number(i.costPrice),
+      batchNumber: i.batchNumber ?? undefined,
+      expiryDate: i.expiryDate ? i.expiryDate.toISOString() : undefined,
+    }));
+    if (!items.length) {
+      throw new BadRequestException('A purchase needs at least one item');
+    }
+
+    const newStoreId = dto.storeId ?? existing.storeId;
+    await this.assertStore(businessId, newStoreId);
+    if (dto.supplierId) await this.assertSupplier(businessId, dto.supplierId);
+
+    const productIds = items.map((i) => i.productId);
+    const products = await this.prisma.product.findMany({
+      where: { id: { in: productIds }, businessId },
+    });
+    if (products.length !== new Set(productIds).size) {
+      throw new BadRequestException('One or more products are invalid');
+    }
+
+    const subtotal = round2(
+      items.reduce((sum, i) => sum + i.quantity * i.costPrice, 0),
+    );
+    const total = subtotal;
+    const amountPaid = Math.min(
+      Math.max(dto.amountPaid ?? Number(existing.amountPaid), 0),
+      total,
+    );
+    const wasReceived = existing.status === PurchaseStatus.RECEIVED;
+
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Back out the stock this purchase had already added.
+      if (wasReceived) {
+        for (const item of existing.items) {
+          try {
+            await this.inventory.applyMovement(tx, {
+              businessId,
+              storeId: existing.storeId,
+              productId: item.productId,
+              type: StockMovementType.PURCHASE,
+              quantity: -item.quantity,
+              reference: existing.id,
+              note: 'Purchase edited — original stock reversed',
+            });
+          } catch {
+            throw new BadRequestException(
+              'Cannot edit: some of this purchase’s stock has already been sold or moved',
+            );
+          }
+        }
+      }
+
+      // 2. Replace the line items and recompute totals.
+      await tx.purchaseItem.deleteMany({ where: { purchaseId: id } });
+      await tx.purchase.update({
+        where: { id },
+        data: {
+          storeId: newStoreId,
+          supplierId: dto.supplierId ?? null,
+          reference: dto.reference ?? null,
+          note: dto.note ?? null,
+          subtotal,
+          tax: 0,
+          total,
+          amountPaid,
+          items: {
+            create: items.map((i) => ({
+              productId: i.productId,
+              quantity: i.quantity,
+              costPrice: i.costPrice,
+              batchNumber: i.batchNumber,
+              expiryDate: i.expiryDate ? new Date(i.expiryDate) : null,
+            })),
+          },
+        },
+      });
+
+      // 3. Re-apply stock for the new lines (only if already received).
+      if (wasReceived) {
+        for (const item of items) {
+          await this.inventory.applyMovement(tx, {
+            businessId,
+            storeId: newStoreId,
+            productId: item.productId,
+            type: StockMovementType.PURCHASE,
+            quantity: item.quantity,
+            reference: id,
+          });
+          await this.createBatchIfNeeded(tx, businessId, newStoreId, {
+            productId: item.productId,
+            quantity: item.quantity,
+            costPrice: new Prisma.Decimal(item.costPrice),
+            batchNumber: item.batchNumber ?? null,
+            expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
+          });
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { costPrice: item.costPrice },
+          });
+        }
+      }
+
+      const updated = await tx.purchase.findFirstOrThrow({
+        where: { id },
+        include: { items: true },
+      });
+      return {
+        ...updated,
+        outstanding: round2(Number(updated.total) - Number(updated.amountPaid)),
+      };
     }, TX_OPTS);
   }
 

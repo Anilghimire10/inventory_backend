@@ -9,16 +9,16 @@ interface SendArgs {
 }
 
 /**
- * Transactional email via ZeptoMail's HTTP API.
+ * Transactional email via Resend's HTTP API.
  *
  * Required env:
- *   ZEPTOMAIL_TOKEN     — the "Send Mail" token (used as `Zoho-enczapikey <token>`)
- *   ZEPTOMAIL_FROM      — a verified sender address on your ZeptoMail domain
+ *   RESEND_API_KEY  — your Resend API key (sent as `Authorization: Bearer <key>`)
+ *   RESEND_FROM     — a verified sender address on your Resend domain
  * Optional:
- *   ZEPTOMAIL_FROM_NAME — display name for the sender (default "Inventory Manager")
- *   ZEPTOMAIL_API_URL   — override the API endpoint (default api.zeptomail.com)
+ *   RESEND_FROM_NAME — display name for the sender (default "Inventory Manager")
+ *   RESEND_API_URL   — override the API endpoint (default api.resend.com/emails)
  *
- * If the token is missing we fail loudly rather than silently dropping mail.
+ * If the key is missing we fail loudly rather than silently dropping mail.
  */
 @Injectable()
 export class MailService {
@@ -27,45 +27,46 @@ export class MailService {
   constructor(private config: ConfigService) {}
 
   private cfg() {
-    const token = this.config.get<string>('ZEPTOMAIL_TOKEN');
-    const from = this.config.get<string>('ZEPTOMAIL_FROM');
-    if (!token || !from) {
+    const apiKey = this.config.get<string>('RESEND_API_KEY');
+    const from = this.config.get<string>('RESEND_FROM');
+    if (!apiKey || !from) {
       throw new InternalServerErrorException(
-        'Email service is not configured. Set ZEPTOMAIL_TOKEN and ZEPTOMAIL_FROM.',
+        'Email service is not configured. Set RESEND_API_KEY and RESEND_FROM.',
       );
     }
     return {
-      token,
+      apiKey,
       from,
       fromName:
-        this.config.get<string>('ZEPTOMAIL_FROM_NAME') ?? 'Inventory Manager',
+        this.config.get<string>('RESEND_FROM_NAME') ?? 'Inventory Manager',
       url:
-        this.config.get<string>('ZEPTOMAIL_API_URL') ??
-        'https://api.zeptomail.com/v1.1/email',
+        this.config.get<string>('RESEND_API_URL') ??
+        'https://api.resend.com/emails',
     };
   }
 
   async send({ to, toName, subject, html }: SendArgs) {
-    const { token, from, fromName, url } = this.cfg();
+    const { apiKey, from, fromName, url } = this.cfg();
 
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Zoho-enczapikey ${token}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
       body: JSON.stringify({
-        from: { address: from, name: fromName },
-        to: [{ email_address: { address: to, name: toName ?? to } }],
+        // Resend accepts a "Name <address>" string for both sender and recipient.
+        from: `${fromName} <${from}>`,
+        to: [toName ? `${toName} <${to}>` : to],
         subject,
-        htmlbody: html,
+        html,
       }),
     });
 
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      this.logger.error(`ZeptoMail send failed (${res.status}): ${detail}`);
+      this.logger.error(`Resend send failed (${res.status}): ${detail}`);
       throw new InternalServerErrorException('Failed to send email');
     }
   }

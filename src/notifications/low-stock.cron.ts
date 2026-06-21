@@ -7,7 +7,7 @@ import { MailService } from '../mail/mail.service';
 
 /**
  * Emails each business owner a once-a-day digest of items that have fallen to
- * or below their reorder level. Mail failures (e.g. ZeptoMail not configured)
+ * or below their reorder level. Mail failures (e.g. Resend not configured)
  * are logged and never throw, so one tenant can't break the run for others.
  */
 @Injectable()

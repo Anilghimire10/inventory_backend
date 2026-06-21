@@ -96,6 +96,14 @@ export class CreateProductDto {
   @Min(0)
   reorderLevel?: number;
 
+  @ApiPropertyOptional({
+    default: true,
+    description: 'Whether this product is subject to tax',
+  })
+  @IsOptional()
+  @IsBoolean()
+  isTaxable?: boolean;
+
   @ApiPropertyOptional({ description: 'Pharmacy: prescription required' })
   @IsOptional()
   @IsBoolean()

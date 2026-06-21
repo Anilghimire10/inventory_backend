@@ -67,6 +67,13 @@ export class SalesService {
     await this.assertStore(businessId, storeId);
     if (dto.customerId) await this.assertCustomer(businessId, dto.customerId);
 
+    // Master tax switch: when off, no line charges tax regardless of product.
+    const business = await this.prisma.business.findUnique({
+      where: { id: businessId },
+      select: { taxEnabled: true },
+    });
+    const taxEnabled = business?.taxEnabled ?? true;
+
     // Load all products in one go
     const productIds = dto.items.map((i) => i.productId);
     const products = await this.prisma.product.findMany({
@@ -92,7 +99,8 @@ export class SalesService {
       const itemDiscount = i.discount ?? 0;
       const lineNet = round2(unitPrice * i.quantity - itemDiscount);
       if (lineNet < 0) throw new BadRequestException('Discount exceeds line total');
-      const taxRate = Number(product.taxRate);
+      // Tax applies only when the master switch is on AND the product is taxable.
+      const taxRate = taxEnabled && product.isTaxable ? Number(product.taxRate) : 0;
       const lineTax = round2((lineNet * taxRate) / 100);
       return {
         productId: i.productId,
@@ -115,12 +123,27 @@ export class SalesService {
     const total = round2(subtotal + tax - billDiscount);
     if (total < 0) throw new BadRequestException('Discount exceeds sale total');
 
-    const paymentMethod = dto.paymentMethod ?? PaymentMethod.CASH;
-    if (paymentMethod === PaymentMethod.CREDIT && !dto.customerId) {
-      throw new BadRequestException('Credit sales require a customer');
+    const requestedMethod = dto.paymentMethod ?? PaymentMethod.CASH;
+    // How much is actually paid now. A CREDIT sale defaults to nothing paid;
+    // otherwise the full total unless the caller passes a smaller amount.
+    const rawPaid =
+      dto.amountPaid ?? (requestedMethod === PaymentMethod.CREDIT ? 0 : total);
+    const amountPaid = round2(Math.min(Math.max(rawPaid, 0), total));
+    // Whatever is left becomes the customer's credit (their outstanding due).
+    const creditDue = round2(total - amountPaid);
+    if (creditDue > 0 && !dto.customerId) {
+      throw new BadRequestException(
+        'A customer is required when part of the sale is left on credit',
+      );
     }
-    const amountPaid =
-      dto.amountPaid ?? (paymentMethod === PaymentMethod.CREDIT ? 0 : total);
+    // Record the real payment state: nothing paid -> CREDIT, part paid -> MIXED,
+    // fully paid -> whatever tender the cashier chose (cash/card/mobile).
+    const paymentMethod =
+      creditDue > 0
+        ? amountPaid > 0
+          ? PaymentMethod.MIXED
+          : PaymentMethod.CREDIT
+        : requestedMethod;
 
     return this.prisma.$transaction(async (tx) => {
       const receiptNo = await this.nextReceiptNo(tx, businessId);
@@ -173,11 +196,11 @@ export class SalesService {
         }
       }
 
-      // Credit sale -> add to the customer's outstanding balance
-      if (paymentMethod === PaymentMethod.CREDIT && dto.customerId) {
+      // Any unpaid remainder -> add to the customer's outstanding balance
+      if (creditDue > 0 && dto.customerId) {
         await tx.customer.update({
           where: { id: dto.customerId },
-          data: { creditBalance: { increment: total } },
+          data: { creditBalance: { increment: creditDue } },
         });
       }
 
@@ -242,16 +265,30 @@ export class SalesService {
         (it) => it.returnedQty >= it.quantity,
       );
 
-      if (sale.paymentMethod === PaymentMethod.CREDIT && sale.customerId) {
-        await tx.customer.update({
-          where: { id: sale.customerId },
-          data: { creditBalance: { decrement: refund } },
-        });
+      // A refund first cancels whatever the customer still owes on this sale
+      // (the unpaid/credit portion); only the rest is money handed back.
+      // Settling it via the return raises amountPaid too, so a later return
+      // on the same sale can't decrement the same credit twice.
+      let creditReduction = 0;
+      if (sale.customerId) {
+        const outstanding = round2(
+          Number(sale.total) - Number(sale.amountPaid),
+        );
+        creditReduction = Math.min(refund, Math.max(outstanding, 0));
+        if (creditReduction > 0) {
+          await tx.customer.update({
+            where: { id: sale.customerId },
+            data: { creditBalance: { decrement: creditReduction } },
+          });
+        }
       }
 
       const updated = await tx.sale.update({
         where: { id: sale.id },
         data: {
+          ...(creditReduction > 0
+            ? { amountPaid: { increment: creditReduction } }
+            : {}),
           status: fullyReturned
             ? SaleStatus.RETURNED
             : SaleStatus.PARTIALLY_RETURNED,
@@ -302,7 +339,14 @@ export class SalesService {
         customer: true,
         user: { select: { id: true, name: true } },
         store: { select: { id: true, name: true, address: true, phone: true } },
-        business: { select: { name: true, currency: true, taxId: true } },
+        business: {
+          select: {
+            name: true,
+            currency: true,
+            taxId: true,
+            showTaxIdOnBill: true,
+          },
+        },
       },
     });
     if (!sale) throw new NotFoundException('Sale not found');

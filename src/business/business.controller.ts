@@ -1,6 +1,6 @@
-import { Body, Controller, Get, Patch } from '@nestjs/common';
-import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
-import { SalesModel } from '@prisma/client';
+import { Body, Controller, Get, Patch } from "@nestjs/common";
+import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from "@nestjs/swagger";
+import { SalesModel } from "@prisma/client";
 import {
   IsBoolean,
   IsEnum,
@@ -8,12 +8,12 @@ import {
   IsString,
   Length,
   MinLength,
-} from 'class-validator';
-import { UserRole } from '@prisma/client';
-import { BusinessService } from './business.service';
-import { Roles } from '../common/decorators/roles.decorator';
-import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { AuthUser } from '../common/types/auth-user';
+} from "class-validator";
+import { UserRole } from "@prisma/client";
+import { BusinessService } from "./business.service";
+import { Roles } from "../common/decorators/roles.decorator";
+import { CurrentUser } from "../common/decorators/current-user.decorator";
+import { AuthUser } from "../common/types/auth-user";
 
 export class UpdateBusinessDto {
   @ApiPropertyOptional()
@@ -30,26 +30,40 @@ export class UpdateBusinessDto {
   @IsEnum(SalesModel)
   salesModel?: SalesModel;
 
-  @ApiPropertyOptional({ description: '3-letter currency code' })
+  @ApiPropertyOptional({ description: "3-letter currency code" })
   @IsOptional()
   @IsString()
   @Length(3, 3)
   currency?: string;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ description: "PAN/VAT registration number" })
   @IsOptional()
   @IsString()
   taxId?: string;
 
-  @ApiPropertyOptional({ description: 'Prices include tax' })
+  @ApiPropertyOptional({
+    description: "Show the PAN/VAT number on printed bills and invoices",
+  })
+  @IsOptional()
+  @IsBoolean()
+  showTaxIdOnBill?: boolean;
+
+  @ApiPropertyOptional({ description: "Prices include tax" })
   @IsOptional()
   @IsBoolean()
   taxInclusive?: boolean;
+
+  @ApiPropertyOptional({
+    description: "Master tax switch: when false, no sale charges tax",
+  })
+  @IsOptional()
+  @IsBoolean()
+  taxEnabled?: boolean;
 }
 
-@ApiTags('business')
+@ApiTags("business")
 @ApiBearerAuth()
-@Controller('business')
+@Controller("business")
 export class BusinessController {
   constructor(private readonly business: BusinessService) {}
 
@@ -68,7 +82,7 @@ export class BusinessController {
 
   /** Owner-only: full export of the business's data as a JSON snapshot. */
   @Roles(UserRole.OWNER)
-  @Get('export')
+  @Get("export")
   exportData(@CurrentUser() u: AuthUser) {
     return this.business.exportData(u.businessId);
   }

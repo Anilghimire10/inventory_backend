@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Param,
+  Patch,
   Post,
   Query,
 } from '@nestjs/common';
@@ -11,6 +12,7 @@ import { IsNumber, Min } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { PurchasesService } from './purchases.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
+import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
@@ -33,6 +35,15 @@ export class PurchasesController {
   @Post()
   create(@CurrentUser() u: AuthUser, @Body() dto: CreatePurchaseDto) {
     return this.purchases.create(u.businessId, dto);
+  }
+
+  @Patch(':id')
+  update(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdatePurchaseDto,
+  ) {
+    return this.purchases.update(u.businessId, id, dto);
   }
 
   @Post(':id/receive')

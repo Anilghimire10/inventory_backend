@@ -39,7 +39,9 @@ export class CreditService {
       orderBy: { creditBalance: 'desc' },
       include: {
         sales: {
-          where: { paymentMethod: PaymentMethod.CREDIT },
+          where: {
+            paymentMethod: { in: [PaymentMethod.CREDIT, PaymentMethod.MIXED] },
+          },
           orderBy: { createdAt: 'desc' },
           take: 50,
           select: {
