@@ -5,6 +5,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 
 import { PrismaModule } from './prisma/prisma.module';
+import { HealthController } from './health.controller';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 
@@ -63,6 +64,7 @@ import { CreditModule } from './credit/credit.module';
     ReportsModule,
     CreditModule,
   ],
+  controllers: [HealthController],
   providers: [
     // Rate limiting runs first (before auth/db work).
     { provide: APP_GUARD, useClass: ThrottlerGuard },

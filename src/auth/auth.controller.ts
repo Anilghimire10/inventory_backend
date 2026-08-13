@@ -74,6 +74,12 @@ export class AuthController {
   }
 
   @ApiBearerAuth()
+  @Post('logout')
+  logout(@CurrentUser() user: AuthUser) {
+    return this.auth.logout(user);
+  }
+
+  @ApiBearerAuth()
   @Get('me')
   me(@CurrentUser() user: AuthUser) {
     return this.auth.me(user.userId);

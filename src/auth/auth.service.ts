@@ -20,6 +20,7 @@ import {
   ResetPasswordDto,
 } from './dto/password.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+import { AuthUser } from '../common/types/auth-user';
 
 const CODE_TTL_MS = 15 * 60 * 1000; // verify/reset codes live 15 minutes
 
@@ -206,6 +207,23 @@ export class AuthService {
       data: { passwordHash },
     });
     return { message: 'Password changed.' };
+  }
+
+  /**
+   * Sign out the current user. JWTs are stateless, so there is no server-side
+   * session to destroy — the client simply discards its token. We record an
+   * audit event to mirror `auth.login`.
+   */
+  async logout(user: AuthUser) {
+    void this.audit.record({
+      businessId: user.businessId,
+      userId: user.userId,
+      userName: user.email,
+      action: 'auth.logout',
+      entity: 'auth',
+      summary: 'Signed out',
+    });
+    return { message: 'Signed out.' };
   }
 
   async me(userId: string) {

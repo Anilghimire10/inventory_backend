@@ -37,9 +37,15 @@ async function bootstrap() {
 
   // CORS. In production set CORS_ORIGIN to a comma-separated allowlist;
   // falls back to reflecting the request origin in dev.
+  // The Capacitor mobile app runs from these fixed WebView origins, so they are
+  // always allowed (otherwise a strict production allowlist would block the app):
+  //   Android -> https://localhost   iOS -> capacitor://localhost
+  const mobileOrigins = ['https://localhost', 'capacitor://localhost'];
   const corsOrigin = config.get<string>('CORS_ORIGIN');
   app.enableCors({
-    origin: corsOrigin ? corsOrigin.split(',').map((s) => s.trim()) : true,
+    origin: corsOrigin
+      ? [...corsOrigin.split(',').map((s) => s.trim()).filter(Boolean), ...mobileOrigins]
+      : true,
     credentials: true,
   });
 
