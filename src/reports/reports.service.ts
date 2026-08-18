@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma, SaleStatus } from '@prisma/client';
+import { Prisma, SaleStatus, StockMovementType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 
@@ -126,21 +126,37 @@ export class ReportsService {
     businessId: string,
     opts: { from?: string; to?: string; storeId?: string },
   ) {
+    const { from, to } = opts;
     const saleWhere: Prisma.SaleWhereInput = {
       businessId,
       ...(opts.storeId ? { storeId: opts.storeId } : {}),
       status: { not: SaleStatus.HELD },
-      ...(opts.from || opts.to
+      ...(from || to
         ? {
             createdAt: {
-              ...(opts.from ? { gte: new Date(opts.from) } : {}),
-              ...(opts.to ? { lte: new Date(opts.to) } : {}),
+              ...(from ? { gte: new Date(from) } : {}),
+              ...(to ? { lte: new Date(to) } : {}),
             },
           }
         : {}),
     };
 
-    const [agg, byPaymentRaw, sales, items] = await Promise.all([
+    // The equal-length window immediately before the selected one, for
+    // % change on the KPI cards. Null when there's no finite start (All time).
+    const prevWindow =
+      from && to
+        ? (() => {
+            const len = new Date(to).getTime() - new Date(from).getTime();
+            const prevTo = new Date(new Date(from).getTime() - 1);
+            const prevFrom = new Date(prevTo.getTime() - len);
+            return {
+              from: prevFrom.toISOString(),
+              to: prevTo.toISOString(),
+            };
+          })()
+        : null;
+
+    const [agg, byPaymentRaw, sales, items, prev] = await Promise.all([
       this.prisma.sale.aggregate({
         where: saleWhere,
         _sum: { total: true },
@@ -166,9 +182,62 @@ export class ReportsService {
           returnedQty: true,
           unitPrice: true,
           unitCost: true,
-          product: { select: { costPrice: true } },
+          sale: { select: { createdAt: true } },
+          product: {
+            select: {
+              costPrice: true,
+              categories: { select: { name: true } },
+            },
+          },
         },
       }),
+      prevWindow
+        ? (async () => {
+            const prevWhere: Prisma.SaleWhereInput = {
+              businessId,
+              ...(opts.storeId ? { storeId: opts.storeId } : {}),
+              status: { not: SaleStatus.HELD },
+              createdAt: {
+                gte: new Date(prevWindow.from),
+                lte: new Date(prevWindow.to),
+              },
+            };
+            const [prevAgg, prevItems] = await Promise.all([
+              this.prisma.sale.aggregate({
+                where: prevWhere,
+                _sum: { total: true },
+                _count: true,
+              }),
+              this.prisma.saleItem.findMany({
+                where: { sale: prevWhere },
+                select: {
+                  quantity: true,
+                  returnedQty: true,
+                  unitPrice: true,
+                  unitCost: true,
+                  product: { select: { costPrice: true } },
+                },
+              }),
+            ]);
+            const prevCost = prevItems.reduce(
+              (s, it) =>
+                s +
+                (it.quantity - it.returnedQty) *
+                  (Number(it.unitCost) || Number(it.product.costPrice)),
+              0,
+            );
+            const prevRevenue = prevItems.reduce(
+              (s, it) => s + (it.quantity - it.returnedQty) * Number(it.unitPrice),
+              0,
+            );
+            return {
+              revenue: round2(Number(prevAgg._sum.total ?? 0)),
+              orders: prevAgg._count,
+              netRevenue: round2(prevRevenue),
+              profit: round2(prevRevenue - prevCost),
+            };
+          })()
+        : Promise.resolve(null),
     ]);
 
     // Sales by item (net of returns)
@@ -206,14 +275,77 @@ export class ReportsService {
     const cost = round2(byProduct.reduce((s, p) => s + p.cost, 0));
     const profit = round2(netRevenue - cost);
 
-    // By day
-    const byDayMap: Record<string, { total: number; count: number }> = {};
+    // By day: revenue + order count (from sales) and units (from items)
+    const byDayMap: Record<string, { total: number; count: number; units: number }> = {};
     for (const s of sales) {
       const day = s.createdAt.toISOString().slice(0, 10);
-      byDayMap[day] ??= { total: 0, count: 0 };
+      byDayMap[day] ??= { total: 0, count: 0, units: 0 };
       byDayMap[day].total = round2(byDayMap[day].total + Number(s.total));
       byDayMap[day].count += 1;
     }
+    for (const it of items) {
+      const day = it.sale.createdAt.toISOString().slice(0, 10);
+      const bucket = byDayMap[day];
+      if (bucket) bucket.units += it.quantity - it.returnedQty;
+    }
+
+    // Sales by category (net of returns), attributed to the first category
+    const catMap = new Map<string, { category: string; revenue: number; units: number }>();
+    for (const it of items) {
+      const soldQty = it.quantity - it.returnedQty;
+      if (soldQty <= 0) continue;
+      const category = it.product.categories[0]?.name ?? 'Uncategorized';
+      const cur = catMap.get(category) ?? { category, revenue: 0, units: 0 };
+      cur.revenue += soldQty * Number(it.unitPrice);
+      cur.units += soldQty;
+      catMap.set(category, cur);
+    }
+    const catTotal = [...catMap.values()].reduce((s, c) => s + c.revenue, 0) || 1;
+    const byCategory = [...catMap.entries()]
+      .map(([category, v]) => ({
+        category,
+        revenue: round2(v.revenue),
+        units: v.units,
+        share: round2((v.revenue / catTotal) * 100),
+      }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    // Hour-of-day buckets across the whole range
+    const hours = Array.from({ length: 24 }, (_, hour) => ({ hour, total: 0, count: 0, units: 0 }));
+    for (const s of sales) {
+      const h = s.createdAt.getHours();
+      hours[h].total = round2(hours[h].total + Number(s.total));
+      hours[h].count += 1;
+    }
+    for (const it of items) {
+      const h = it.sale.createdAt.getHours();
+      hours[h].units += it.quantity - it.returnedQty;
+    }
+
+    // Payment methods with % share
+    const payTotal = byPaymentRaw.reduce((s, p) => s + Number(p._sum.total ?? 0), 0) || 1;
+    const byPaymentMethod = byPaymentRaw
+      .map((p) => ({
+        method: p.paymentMethod,
+        total: round2(Number(p._sum.total ?? 0)),
+        count: p._count,
+        share: round2((Number(p._sum.total ?? 0) / payTotal) * 100),
+      }))
+      .sort((a, b) => b.total - a.total);
+
+    // Inventory performance (across the selected period)
+    const [inventoryValue, movements, needs] = await Promise.all([
+      this.inventoryValue(businessId, opts.storeId),
+      this.stockMovementDaily(businessId, opts.storeId, from, to),
+      this.needsAttention(businessId, opts.storeId),
+    ]);
+    const totalUnits = byProduct.reduce((s, p) => s + p.quantitySold, 0);
+    const stockTurnover =
+      inventoryValue > 0 ? round2(cost / inventoryValue) : 0;
+    const sellThrough =
+      totalUnits + inventoryValue > 0
+        ? Math.min(100, round2((totalUnits / (totalUnits + (inventoryValue / 10))) * 100))
+        : 0;
 
     return {
       totals: {
@@ -223,14 +355,34 @@ export class ReportsService {
         cost,
         profit,
         margin: netRevenue > 0 ? round2((profit / netRevenue) * 100) : 0,
+        units: totalUnits,
       },
+      comparison: prev
+        ? {
+            revenue: prev.revenue,
+            orders: prev.orders,
+            netRevenue: prev.netRevenue,
+            profit: prev.profit,
+          }
+        : null,
       byProduct,
       byDay: Object.entries(byDayMap).map(([date, v]) => ({ date, ...v })),
-      byPaymentMethod: byPaymentRaw.map((p) => ({
-        method: p.paymentMethod,
-        total: round2(Number(p._sum.total ?? 0)),
-        count: p._count,
-      })),
+      byCategory,
+      byPaymentMethod,
+      hourly: hours,
+      inventory: {
+        value: inventoryValue,
+        stockTurnover,
+        sellThrough,
+        deadStockValue: round2(needs.deadStockValue),
+        deadStockPct: needs.deadStockPct,
+      },
+      stockMovement: movements,
+      needsAttention: {
+        lowStock: needs.lowStock,
+        unsold: needs.unsold,
+        expiring: needs.expiring,
+      },
     };
   }
 
@@ -363,6 +515,7 @@ export class ReportsService {
         select: {
           id: true,
           name: true,
+          costPrice: true,
           stockItems: {
             where: storeId ? { storeId } : {},
             select: { quantity: true },
@@ -387,6 +540,7 @@ export class ReportsService {
       .map((p) => ({
         productId: p.id,
         name: p.name,
+        costPrice: Number(p.costPrice),
         quantitySold: soldMap.get(p.id) ?? 0,
         inStock: p.stockItems.reduce((s, si) => s + si.quantity, 0),
       }))
@@ -458,5 +612,89 @@ export class ReportsService {
       hours[h].count += 1;
     }
     return hours;
+  }
+
+  /**
+   * Daily stock-movement buckets (purchases in, sales out, adjustments net)
+   * plus a running closing-stock index for the selected window.
+   */
+  private async stockMovementDaily(
+    businessId: string,
+    storeId: string | undefined,
+    from?: string,
+    to?: string,
+  ) {
+    const movements = await this.prisma.stockMovement.findMany({
+      where: {
+        businessId,
+        ...(storeId ? { storeId } : {}),
+        ...(from || to
+          ? {
+              createdAt: {
+                ...(from ? { gte: new Date(from) } : {}),
+                ...(to ? { lte: new Date(to) } : {}),
+              },
+            }
+          : {}),
+      },
+      select: { type: true, quantity: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const byDay = new Map<
+      string,
+      { date: string; purchases: number; sales: number; adjustments: number }
+    >();
+    let closing = 0;
+    const closingMap = new Map<string, number>();
+    for (const m of movements) {
+      const day = m.createdAt.toISOString().slice(0, 10);
+      const bucket = byDay.get(day) ?? { date: day, purchases: 0, sales: 0, adjustments: 0 };
+      const qty = m.quantity;
+      if (m.type === StockMovementType.PURCHASE) bucket.purchases += qty;
+      else if (m.type === StockMovementType.SALE) bucket.sales += -qty;
+      else bucket.adjustments += qty;
+      closing += qty;
+      byDay.set(day, bucket);
+      closingMap.set(day, closing);
+    }
+
+    return [...byDay.entries()].map(([date, v]) => ({
+      ...v,
+      purchases: round2(v.purchases),
+      sales: round2(v.sales),
+      adjustments: round2(v.adjustments),
+      closing: round2(closingMap.get(date) ?? 0),
+    }));
+  }
+
+  /**
+   * Alert counts for the "Needs attention" panel: products below their reorder
+   * level, stocked products with zero sales in the last 30 days, and batches
+   * expiring within 30 days (with the value of dead stock).
+   */
+  private async needsAttention(
+    businessId: string,
+    storeId: string | undefined,
+  ) {
+    const [lowStock, expiring, slow] = await Promise.all([
+      this.inventory.lowStock(businessId, storeId),
+      this.inventory.expiringBatches(businessId, { days: 30, storeId }),
+      this.slowProducts(businessId, storeId, 5000),
+    ]);
+    const unsold = slow.filter((p) => p.quantitySold === 0);
+    const deadStockValue = unsold.reduce(
+      (s, p) => s + p.inStock * p.costPrice,
+      0,
+    );
+    const inventoryValue = await this.inventoryValue(businessId, storeId);
+    return {
+      lowStock: lowStock.length,
+      unsold: unsold.length,
+      expiring: expiring.length,
+      deadStockValue,
+      deadStockPct:
+        inventoryValue > 0 ? round2((deadStockValue / inventoryValue) * 100) : 0,
+    };
   }
 }
