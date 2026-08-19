@@ -1,5 +1,12 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsDateString, IsOptional, IsString } from 'class-validator';
+import {
+  IsDateString,
+  IsEnum,
+  IsIn,
+  IsOptional,
+  IsString,
+} from 'class-validator';
+import { PaymentMethod } from '@prisma/client';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
 export class QuerySaleDto extends PaginationDto {
@@ -22,4 +29,15 @@ export class QuerySaleDto extends PaginationDto {
   @IsOptional()
   @IsDateString()
   to?: string;
+
+  /** Friendly status key matching the UI: paid | due | partial | return | held. */
+  @ApiPropertyOptional({ enum: ['paid', 'due', 'partial', 'return', 'held'] })
+  @IsOptional()
+  @IsIn(['paid', 'due', 'partial', 'return', 'held'])
+  status?: string;
+
+  @ApiPropertyOptional({ enum: PaymentMethod })
+  @IsOptional()
+  @IsEnum(PaymentMethod)
+  paymentMethod?: PaymentMethod;
 }

@@ -30,10 +30,19 @@ export class ReportsService {
       ...(storeId ? { storeId } : {}),
     };
 
-    const [today, lowStock, expiring, inventoryValue, topProducts, slowProducts] =
+    // Overall sales = all-time completed transactions (excludes held carts
+    // and returned sales, which are not revenue).
+    const completedWhere = {
+      ...saleWhere,
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
+    };
+
+    const [sales, lowStock, expiring, inventoryValue, topProducts, slowProducts] =
       await Promise.all([
         this.prisma.sale.aggregate({
-          where: { ...saleWhere, createdAt: { gte: startOfToday } },
+          where: completedWhere,
           _sum: { total: true },
           _count: true,
         }),
@@ -55,7 +64,7 @@ export class ReportsService {
       : [undefined, undefined];
 
     return {
-      todaySalesCount: today._count,
+      totalSalesCount: sales._count,
       lowStockCount: lowStock.length,
       expiringSoonCount: expiring.length,
       topProducts,
@@ -63,7 +72,7 @@ export class ReportsService {
       // Owner-only financial figures + charts.
       ...(includeFinancials
         ? {
-            todaySalesTotal: Number(today._sum.total ?? 0),
+            totalSalesTotal: Number(sales._sum.total ?? 0),
             inventoryValue,
             salesTrend,
             hourlyToday,

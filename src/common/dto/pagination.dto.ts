@@ -31,7 +31,17 @@ export class PaginationDto {
 
 export interface Paginated<T> {
   data: T[];
-  meta: { total: number; page: number; limit: number; pages: number };
+  meta: {
+    total: number;
+    page: number;
+    limit: number;
+    pages: number;
+    /** Optional aggregate (e.g. summed revenue) for the matching rows. */
+    revenue?: number;
+    /** Optional today-only aggregates (completed sales made today). */
+    todayRevenue?: number;
+    todayCount?: number;
+  };
 }
 
 export function paginate<T>(

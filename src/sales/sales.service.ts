@@ -300,10 +300,29 @@ export class SalesService {
   }
 
   async findAll(businessId: string, q: QuerySaleDto) {
+    const RETURNS = [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED];
+    const NOT_RETURNED_HELD = { notIn: [...RETURNS, SaleStatus.HELD] };
+    const statusWhere =
+      q.status === 'return'
+        ? { status: { in: RETURNS } }
+        : q.status === 'held'
+          ? { status: SaleStatus.HELD }
+          : q.status === 'due'
+            ? { status: NOT_RETURNED_HELD, paymentMethod: PaymentMethod.CREDIT }
+            : q.status === 'partial'
+              ? { status: NOT_RETURNED_HELD, paymentMethod: PaymentMethod.MIXED }
+              : q.status === 'paid'
+                ? {
+                    status: NOT_RETURNED_HELD,
+                    paymentMethod: { notIn: [PaymentMethod.CREDIT, PaymentMethod.MIXED] },
+                  }
+                : {};
+
     const where: Prisma.SaleWhereInput = {
       businessId,
       ...(q.storeId ? { storeId: q.storeId } : {}),
       ...(q.customerId ? { customerId: q.customerId } : {}),
+      ...(q.paymentMethod ? { paymentMethod: q.paymentMethod } : {}),
       ...(q.from || q.to
         ? {
             createdAt: {
@@ -313,8 +332,20 @@ export class SalesService {
           }
         : {}),
       ...(q.search ? { receiptNo: { contains: q.search, mode: 'insensitive' } } : {}),
+      ...statusWhere,
     };
-    const [data, total] = await this.prisma.$transaction([
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayWhere: Prisma.SaleWhereInput = {
+      businessId,
+      ...(q.storeId ? { storeId: q.storeId } : {}),
+      createdAt: { gte: startOfToday },
+      status: {
+        notIn: [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED, SaleStatus.HELD],
+      },
+    };
+
+    const [data, total, agg, today] = await this.prisma.$transaction([
       this.prisma.sale.findMany({
         where,
         skip: q.skip,
@@ -327,8 +358,14 @@ export class SalesService {
         orderBy: { createdAt: 'desc' },
       }),
       this.prisma.sale.count({ where }),
+      this.prisma.sale.aggregate({ where, _sum: { total: true } }),
+      this.prisma.sale.aggregate({ where: todayWhere, _sum: { total: true }, _count: true }),
     ]);
-    return paginate(data, total, q.page, q.limit);
+    const result = paginate(data, total, q.page, q.limit);
+    result.meta.revenue = Number(agg._sum.total ?? 0);
+    result.meta.todayRevenue = Number(today._sum.total ?? 0);
+    result.meta.todayCount = today._count;
+    return result;
   }
 
   async findOne(businessId: string, id: string) {
