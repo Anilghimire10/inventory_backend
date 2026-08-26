@@ -71,19 +71,36 @@ export class CustomersService {
 
   async payCredit(businessId: string, id: string, amount: number) {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
-    const customer = await this.ensure(businessId, id);
-    if (amount > Number(customer.creditBalance)) {
-      throw new BadRequestException('Payment exceeds outstanding balance');
-    }
-    return this.prisma.customer.update({
-      where: { id },
+    await this.ensure(businessId, id);
+    // Atomic guarded decrement: the balance check and the write happen in
+    // one statement against the row's live value, so two concurrent
+    // payments can't both pass a stale "amount <= balance" check and drive
+    // the balance negative.
+    const result = await this.prisma.customer.updateMany({
+      where: { id, businessId, creditBalance: { gte: amount } },
       data: { creditBalance: { decrement: amount } },
     });
+    if (result.count === 0) {
+      throw new BadRequestException('Payment exceeds outstanding balance');
+    }
+    return this.prisma.customer.findUniqueOrThrow({ where: { id } });
   }
 
   async remove(businessId: string, id: string) {
     await this.ensure(businessId, id);
-    return this.prisma.customer.delete({ where: { id } });
+    try {
+      return await this.prisma.customer.delete({ where: { id } });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2003'
+      ) {
+        throw new BadRequestException(
+          'This customer has sale history and cannot be deleted.',
+        );
+      }
+      throw err;
+    }
   }
 
   private async ensure(businessId: string, id: string) {

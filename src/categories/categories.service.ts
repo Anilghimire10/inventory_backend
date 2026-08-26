@@ -11,6 +11,9 @@ export class CategoriesService {
   constructor(private prisma: PrismaService) {}
 
   async create(businessId: string, dto: CreateCategoryDto) {
+    // Forms send "" for "no parent selected" -- treat that the same as
+    // omitted rather than letting it hit the FK constraint as a bad id.
+    if (dto.parentId === '') dto.parentId = undefined;
     if (dto.parentId) await this.assertOwned(businessId, dto.parentId);
     return this.prisma.category.create({ data: { businessId, ...dto } });
   }
@@ -25,6 +28,7 @@ export class CategoriesService {
 
   async update(businessId: string, id: string, dto: UpdateCategoryDto) {
     await this.assertOwned(businessId, id);
+    if (dto.parentId === '') dto.parentId = undefined;
     if (dto.parentId) {
       if (dto.parentId === id)
         throw new BadRequestException('A category cannot be its own parent');

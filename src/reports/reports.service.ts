@@ -89,7 +89,11 @@ export class ReportsService {
     const where = {
       businessId,
       ...(opts.storeId ? { storeId: opts.storeId } : {}),
-      status: { not: SaleStatus.HELD },
+      // Returned sales aren't revenue -- excluded everywhere a report sums
+      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
       ...(opts.from || opts.to
         ? {
             createdAt: {
@@ -139,7 +143,11 @@ export class ReportsService {
     const saleWhere: Prisma.SaleWhereInput = {
       businessId,
       ...(opts.storeId ? { storeId: opts.storeId } : {}),
-      status: { not: SaleStatus.HELD },
+      // Returned sales aren't revenue -- excluded everywhere a report sums
+      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
       ...(from || to
         ? {
             createdAt: {
@@ -205,7 +213,11 @@ export class ReportsService {
             const prevWhere: Prisma.SaleWhereInput = {
               businessId,
               ...(opts.storeId ? { storeId: opts.storeId } : {}),
-              status: { not: SaleStatus.HELD },
+              // Returned sales aren't revenue -- excluded everywhere a report sums
+      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
               createdAt: {
                 gte: new Date(prevWindow.from),
                 lte: new Date(prevWindow.to),
@@ -407,7 +419,11 @@ export class ReportsService {
       where: {
         sale: {
           businessId,
-          status: { not: SaleStatus.HELD },
+          // Returned sales aren't revenue -- excluded everywhere a report sums
+      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
           ...(opts.storeId ? { storeId: opts.storeId } : {}),
           ...(opts.from || opts.to
             ? {
@@ -571,7 +587,11 @@ export class ReportsService {
       where: {
         businessId,
         ...(storeId ? { storeId } : {}),
-        status: { not: SaleStatus.HELD },
+        // Returned sales aren't revenue -- excluded everywhere a report sums
+      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
         createdAt: { gte: start },
       },
       select: { total: true, createdAt: true },
@@ -604,7 +624,11 @@ export class ReportsService {
       where: {
         businessId,
         ...(storeId ? { storeId } : {}),
-        status: { not: SaleStatus.HELD },
+        // Returned sales aren't revenue -- excluded everywhere a report sums
+      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
+      status: {
+        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
+      },
         createdAt: { gte: startOfToday },
       },
       select: { total: true, createdAt: true },

@@ -25,6 +25,9 @@ export class PurchasesService {
   ) {}
 
   async create(businessId: string, dto: CreatePurchaseDto) {
+    // Forms send "" for "no supplier selected" -- treat that the same as
+    // omitted rather than letting it hit the FK constraint as a bad id.
+    if (dto.supplierId === '') dto.supplierId = undefined;
     await this.assertStore(businessId, dto.storeId);
     if (dto.supplierId) await this.assertSupplier(businessId, dto.supplierId);
 
@@ -107,6 +110,7 @@ export class PurchasesService {
       throw new BadRequestException('A purchase needs at least one item');
     }
 
+    if (dto.supplierId === '') dto.supplierId = undefined;
     const newStoreId = dto.storeId ?? existing.storeId;
     await this.assertStore(businessId, newStoreId);
     if (dto.supplierId) await this.assertSupplier(businessId, dto.supplierId);
@@ -130,7 +134,7 @@ export class PurchasesService {
     const wasReceived = existing.status === PurchaseStatus.RECEIVED;
 
     return this.prisma.$transaction(async (tx) => {
-      // 1. Back out the stock this purchase had already added.
+      // 1. Back out the stock (and matching batch) this purchase had added.
       if (wasReceived) {
         for (const item of existing.items) {
           try {
@@ -143,6 +147,7 @@ export class PurchasesService {
               reference: existing.id,
               note: 'Purchase edited — original stock reversed',
             });
+            await this.reverseBatchIfNeeded(tx, existing.storeId, item);
           } catch {
             throw new BadRequestException(
               'Cannot edit: some of this purchase’s stock has already been sold or moved',
@@ -227,6 +232,19 @@ export class PurchasesService {
     }
 
     return this.prisma.$transaction(async (tx) => {
+      // Atomically claim the DRAFT -> RECEIVED transition before touching
+      // stock. If another request already received this purchase (double
+      // click, retried request), this matches zero rows and we bail out
+      // before adding stock a second time -- the earlier findFirst check
+      // above ran outside the transaction and can't be trusted alone.
+      const claimed = await tx.purchase.updateMany({
+        where: { id, businessId, status: purchase.status },
+        data: { status: PurchaseStatus.RECEIVED, receivedAt: new Date() },
+      });
+      if (claimed.count === 0) {
+        throw new BadRequestException('Purchase already received');
+      }
+
       for (const item of purchase.items) {
         await this.inventory.applyMovement(tx, {
           businessId,
@@ -242,9 +260,8 @@ export class PurchasesService {
           data: { costPrice: item.costPrice },
         });
       }
-      return tx.purchase.update({
+      return tx.purchase.findFirstOrThrow({
         where: { id },
-        data: { status: PurchaseStatus.RECEIVED, receivedAt: new Date() },
         include: { items: true },
       });
     }, TX_OPTS);
@@ -257,16 +274,23 @@ export class PurchasesService {
       where: { id, businessId },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
-    const outstanding = round2(Number(purchase.total) - Number(purchase.amountPaid));
-    if (amount > outstanding + 0.001) {
+
+    // Atomic guarded increment: the outstanding check and the write happen
+    // in one statement against the row's live value, so two concurrent
+    // payments can't both pass a stale check and push amountPaid past total.
+    const claimed = await this.prisma.$executeRaw`
+      UPDATE "Purchase"
+      SET "amountPaid" = "amountPaid" + ${amount}
+      WHERE id = ${id} AND "businessId" = ${businessId}
+        AND "amountPaid" + ${amount} <= total + 0.001
+    `;
+    if (claimed === 0) {
+      const outstanding = round2(Number(purchase.total) - Number(purchase.amountPaid));
       throw new BadRequestException(
         `Payment exceeds the outstanding ${outstanding}`,
       );
     }
-    const updated = await this.prisma.purchase.update({
-      where: { id },
-      data: { amountPaid: { increment: amount } },
-    });
+    const updated = await this.prisma.purchase.findUniqueOrThrow({ where: { id } });
     return {
       ...updated,
       outstanding: round2(Number(updated.total) - Number(updated.amountPaid)),
@@ -358,16 +382,72 @@ export class PurchasesService {
     },
   ) {
     if (!item.batchNumber && !item.expiryDate) return;
-    await tx.batch.create({
-      data: {
-        businessId,
+    // Merge into an existing batch with the same natural key (store,
+    // product, batch number, expiry) instead of always inserting a new
+    // row -- otherwise receiving the same batch twice (a second purchase,
+    // or a purchase edit that re-applies its lines) forks into duplicate
+    // Batch rows that double-count "expiring soon" and desync from the
+    // real StockItem total.
+    const existing = await tx.batch.findFirst({
+      where: {
         storeId,
         productId: item.productId,
         batchNumber: item.batchNumber,
         expiryDate: item.expiryDate,
-        quantity: item.quantity,
-        costPrice: item.costPrice,
       },
+    });
+    if (existing) {
+      await tx.batch.update({
+        where: { id: existing.id },
+        data: { quantity: { increment: item.quantity }, costPrice: item.costPrice },
+      });
+    } else {
+      await tx.batch.create({
+        data: {
+          businessId,
+          storeId,
+          productId: item.productId,
+          batchNumber: item.batchNumber,
+          expiryDate: item.expiryDate,
+          quantity: item.quantity,
+          costPrice: item.costPrice,
+        },
+      });
+    }
+  }
+
+  /**
+   * Mirror of createBatchIfNeeded for reversing a purchase edit: decrements
+   * the matching batch instead of leaving a stale row behind. Throws (same
+   * as the stock reversal above) if some of that batch has already been
+   * sold/moved, since undoing it would drive the batch negative.
+   */
+  private async reverseBatchIfNeeded(
+    tx: Prisma.TransactionClient,
+    storeId: string,
+    item: {
+      productId: string;
+      quantity: number;
+      batchNumber: string | null;
+      expiryDate: Date | null;
+    },
+  ) {
+    if (!item.batchNumber && !item.expiryDate) return;
+    const existing = await tx.batch.findFirst({
+      where: {
+        storeId,
+        productId: item.productId,
+        batchNumber: item.batchNumber,
+        expiryDate: item.expiryDate,
+      },
+    });
+    if (!existing) return; // nothing tracked to reverse
+    if (existing.quantity < item.quantity) {
+      throw new BadRequestException('Cannot edit: batch stock already sold or moved');
+    }
+    await tx.batch.update({
+      where: { id: existing.id },
+      data: { quantity: { decrement: item.quantity } },
     });
   }
 

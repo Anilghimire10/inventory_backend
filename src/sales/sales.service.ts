@@ -64,21 +64,23 @@ export class SalesService {
     if (!storeId) {
       throw new BadRequestException('No store specified for this sale');
     }
-    await this.assertStore(businessId, storeId);
-    if (dto.customerId) await this.assertCustomer(businessId, dto.customerId);
-
-    // Master tax switch: when off, no line charges tax regardless of product.
-    const business = await this.prisma.business.findUnique({
-      where: { id: businessId },
-      select: { taxEnabled: true },
-    });
-    const taxEnabled = business?.taxEnabled ?? true;
-
-    // Load all products in one go
+    // Independent reads -- run concurrently instead of one round trip each.
     const productIds = dto.items.map((i) => i.productId);
-    const products = await this.prisma.product.findMany({
-      where: { id: { in: productIds }, businessId, isActive: true },
-    });
+    const [, , business, products] = await Promise.all([
+      this.assertStore(businessId, storeId),
+      dto.customerId
+        ? this.assertCustomer(businessId, dto.customerId)
+        : Promise.resolve(),
+      this.prisma.business.findUnique({
+        where: { id: businessId },
+        select: { taxEnabled: true },
+      }),
+      this.prisma.product.findMany({
+        where: { id: { in: productIds }, businessId, isActive: true },
+      }),
+    ]);
+    // Master tax switch: when off, no line charges tax regardless of product.
+    const taxEnabled = business?.taxEnabled ?? true;
     const productMap = new Map(products.map((p) => [p.id, p]));
     if (productMap.size !== new Set(productIds).size) {
       throw new BadRequestException('One or more products are invalid');
@@ -145,7 +147,7 @@ export class SalesService {
           : PaymentMethod.CREDIT
         : requestedMethod;
 
-    return this.prisma.$transaction(async (tx) => {
+    return this.createWithReceiptRetry(async () => this.prisma.$transaction(async (tx) => {
       const receiptNo = await this.nextReceiptNo(tx, businessId);
 
       const sale = await tx.sale.create({
@@ -180,9 +182,11 @@ export class SalesService {
         include: { items: true },
       });
 
-      // Deduct stock (blocks overselling) and consume batches FEFO
-      for (const l of lines) {
-        await this.inventory.applyMovement(tx, {
+      // Deduct stock (blocks overselling) and consume batches FEFO -- batched
+      // so an N-line sale costs a handful of round trips, not O(N).
+      await this.inventory.applyMovementsBatch(
+        tx,
+        lines.map((l) => ({
           businessId,
           storeId,
           productId: l.productId,
@@ -190,10 +194,15 @@ export class SalesService {
           quantity: -l.quantity,
           userId: user.userId,
           reference: sale.id,
-        });
-        if (l.trackBatches) {
-          await this.consumeBatchesFEFO(tx, storeId, l.productId, l.quantity);
-        }
+        })),
+      );
+      const batchTracked = lines.filter((l) => l.trackBatches);
+      if (batchTracked.length) {
+        await this.consumeBatchesFEFOBatch(
+          tx,
+          storeId,
+          batchTracked.map((l) => ({ productId: l.productId, quantity: l.quantity })),
+        );
       }
 
       // Any unpaid remainder -> add to the customer's outstanding balance
@@ -205,7 +214,31 @@ export class SalesService {
       }
 
       return sale;
-    }, TX_OPTS);
+    }, TX_OPTS));
+  }
+
+  /**
+   * nextReceiptNo() derives the next number from a plain COUNT with no
+   * locking, so two checkouts for the same business at the same instant can
+   * compute the same receipt number -- the second's insert then hits the
+   * (businessId, receiptNo) unique constraint. Rather than lock/serialize
+   * every checkout for that, just retry: recomputing the count and
+   * re-running the transaction on the rare collision is cheap and keeps the
+   * common case fully concurrent.
+   */
+  private async createWithReceiptRetry<T>(run: () => Promise<T>): Promise<T> {
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await run();
+      } catch (err) {
+        const isReceiptCollision =
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === 'P2002' &&
+          JSON.stringify(err.meta?.target ?? '').includes('receiptNo');
+        if (!isReceiptCollision || attempt >= MAX_ATTEMPTS) throw err;
+      }
+    }
   }
 
   async returnItems(user: AuthUser, saleId: string, dto: ReturnSaleDto) {
@@ -236,11 +269,14 @@ export class SalesService {
     refund = round2(refund);
 
     return this.prisma.$transaction(async (tx) => {
-      for (const r of dto.items) {
-        const item = itemMap.get(r.saleItemId)!;
-        await this.inventory.applyMovement(
-          tx,
-          {
+      // Stock-back-in is batched (one read + one bulk write for all lines);
+      // the returnedQty bumps stay per-row so duplicate saleItemIds in one
+      // request still accumulate correctly via the DB-level increment.
+      await this.inventory.applyMovementsBatch(
+        tx,
+        dto.items.map((r) => {
+          const item = itemMap.get(r.saleItemId)!;
+          return {
             businessId,
             storeId: sale.storeId,
             productId: item.productId,
@@ -248,9 +284,12 @@ export class SalesService {
             quantity: r.quantity, // stock back in
             userId: user.userId,
             reference: sale.id,
-          },
-          { allowNegative: true },
-        );
+          };
+        }),
+        { allowNegative: true },
+      );
+      for (const r of dto.items) {
+        const item = itemMap.get(r.saleItemId)!;
         await tx.saleItem.update({
           where: { id: item.id },
           data: { returnedQty: { increment: r.quantity } },
@@ -334,6 +373,28 @@ export class SalesService {
       ...(q.search ? { receiptNo: { contains: q.search, mode: 'insensitive' } } : {}),
       ...statusWhere,
     };
+    // Revenue is a fixed KPI, independent of whatever status filter the list
+    // is currently showing -- always exclude returns/holds so it can't
+    // include a returned sale's total just because the user filtered by
+    // payment method, date range, etc. (matches reports.dashboard()).
+    const revenueWhere: Prisma.SaleWhereInput = {
+      businessId,
+      ...(q.storeId ? { storeId: q.storeId } : {}),
+      ...(q.customerId ? { customerId: q.customerId } : {}),
+      ...(q.paymentMethod ? { paymentMethod: q.paymentMethod } : {}),
+      ...(q.from || q.to
+        ? {
+            createdAt: {
+              ...(q.from ? { gte: new Date(q.from) } : {}),
+              ...(q.to ? { lte: new Date(q.to) } : {}),
+            },
+          }
+        : {}),
+      ...(q.search ? { receiptNo: { contains: q.search, mode: 'insensitive' } } : {}),
+      status: {
+        notIn: [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED, SaleStatus.HELD],
+      },
+    };
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
     const todayWhere: Prisma.SaleWhereInput = {
@@ -358,7 +419,7 @@ export class SalesService {
         orderBy: { createdAt: 'desc' },
       }),
       this.prisma.sale.count({ where }),
-      this.prisma.sale.aggregate({ where, _sum: { total: true } }),
+      this.prisma.sale.aggregate({ where: revenueWhere, _sum: { total: true } }),
       this.prisma.sale.aggregate({ where: todayWhere, _sum: { total: true }, _count: true }),
     ]);
     const result = paginate(data, total, q.page, q.limit);
@@ -398,29 +459,58 @@ export class SalesService {
     return `INV-${String(count + 1).padStart(6, '0')}`;
   }
 
-  /** Reduce batch quantities oldest-expiry-first (First-Expired-First-Out). */
-  private async consumeBatchesFEFO(
+  /**
+   * Reduce batch quantities oldest-expiry-first (First-Expired-First-Out)
+   * for every batch-tracked line in one shot: one read for all products'
+   * batches, then a single bulk write for every batch touched, instead of
+   * a read + N updates per line.
+   */
+  private async consumeBatchesFEFOBatch(
     tx: Prisma.TransactionClient,
     storeId: string,
-    productId: string,
-    quantity: number,
+    items: { productId: string; quantity: number }[],
   ) {
-    let remaining = quantity;
+    if (items.length === 0) return;
+    const productIds = items.map((i) => i.productId);
     const batches = await tx.batch.findMany({
-      where: { storeId, productId, quantity: { gt: 0 } },
+      where: { storeId, productId: { in: productIds }, quantity: { gt: 0 } },
       orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
     });
-    for (const batch of batches) {
-      if (remaining <= 0) break;
-      const take = Math.min(batch.quantity, remaining);
-      await tx.batch.update({
-        where: { id: batch.id },
-        data: { quantity: { decrement: take } },
-      });
-      remaining -= take;
+    const batchesByProduct = new Map<string, typeof batches>();
+    for (const b of batches) {
+      const arr = batchesByProduct.get(b.productId);
+      if (arr) arr.push(b);
+      else batchesByProduct.set(b.productId, [b]);
     }
-    // If batches don't cover it, StockItem remains the source of truth; we
-    // don't block the sale on batch bookkeeping.
+
+    // Final quantity per batch (not a delta) -- a product can appear on more
+    // than one line, so we keep consuming the same in-memory batch list
+    // across lines and only record each batch's *last* resulting quantity.
+    const finalQtyByBatchId = new Map<string, number>();
+    for (const item of items) {
+      let remaining = item.quantity;
+      const productBatches = batchesByProduct.get(item.productId) ?? [];
+      for (const batch of productBatches) {
+        if (remaining <= 0) break;
+        if (batch.quantity <= 0) continue;
+        const take = Math.min(batch.quantity, remaining);
+        batch.quantity -= take;
+        finalQtyByBatchId.set(batch.id, batch.quantity);
+        remaining -= take;
+      }
+      // If batches don't cover it, StockItem remains the source of truth; we
+      // don't block the sale on batch bookkeeping.
+    }
+
+    if (finalQtyByBatchId.size === 0) return;
+    const updateIds = [...finalQtyByBatchId.keys()];
+    const updateQtys = updateIds.map((id) => finalQtyByBatchId.get(id)!);
+    await tx.$executeRaw`
+      UPDATE "Batch" AS b
+      SET quantity = v.qty
+      FROM (SELECT * FROM UNNEST(${updateIds}::text[], ${updateQtys}::int[])) AS v(id, qty)
+      WHERE b.id = v.id
+    `;
   }
 
   private async assertStore(businessId: string, storeId: string) {

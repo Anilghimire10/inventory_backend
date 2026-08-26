@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -21,11 +22,14 @@ import {
 } from './dto/password.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 import { AuthUser } from '../common/types/auth-user';
+import { normalizeEmail } from '../common/email';
 
 const CODE_TTL_MS = 15 * 60 * 1000; // verify/reset codes live 15 minutes
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private prisma: PrismaService,
     private jwt: JwtService,
@@ -41,9 +45,8 @@ export class AuthService {
    * Then emails a verification code. Login is blocked until the email is verified.
    */
   async register(dto: RegisterDto) {
-    const existing = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const email = normalizeEmail(dto.email);
+    const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) throw new ConflictException('Email already in use');
 
     const passwordHash = await argon2.hash(dto.password);
@@ -64,7 +67,7 @@ export class AuthService {
         data: {
           businessId: business.id,
           storeId: store.id,
-          email: dto.email,
+          email,
           name: dto.name,
           passwordHash,
           role: UserRole.OWNER,
@@ -77,16 +80,36 @@ export class AuthService {
       result.user.id,
       EmailTokenType.EMAIL_VERIFY,
     );
-    await this.mail.sendVerificationCode(dto.email, dto.name, code);
+    // The account is already committed above -- a mail outage must not turn
+    // this into a 500 that strands an unverifiable, unretryable account.
+    // The user can always hit "resend code" once mail is working again.
+    await this.sendMailBestEffort(() =>
+      this.mail.sendVerificationCode(email, dto.name, code),
+    );
 
     return {
       message: 'Account created. Check your email for a verification code.',
-      email: dto.email,
+      email,
     };
   }
 
+  /**
+   * Fire a transactional email without letting a delivery failure become an
+   * unhandled 500 in the caller -- log it and move on. Used anywhere the
+   * surrounding side effect (account creation, code issuance) has already
+   * happened and can't be un-done by an email provider being down.
+   */
+  private async sendMailBestEffort(send: () => Promise<unknown>) {
+    try {
+      await send();
+    } catch (err) {
+      this.logger.error('Failed to send email', err as Error);
+    }
+  }
+
   /** Confirm the emailed code, mark the account verified, and log the user in. */
-  async verifyEmail(email: string, code: string) {
+  async verifyEmail(rawEmail: string, code: string) {
+    const email = normalizeEmail(rawEmail);
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (!user) throw new BadRequestException('Invalid or expired code');
 
@@ -107,18 +130,24 @@ export class AuthService {
   }
 
   /** Re-send a verification code. Always responds the same way (no enumeration). */
-  async resendVerification(email: string) {
+  async resendVerification(rawEmail: string) {
+    const email = normalizeEmail(rawEmail);
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (user && !user.emailVerified) {
       const code = await this.issueCode(user.id, EmailTokenType.EMAIL_VERIFY);
-      await this.mail.sendVerificationCode(email, user.name, code);
+      // Best-effort: a mail failure must respond identically to the
+      // "no such account" branch above, or the endpoint becomes an
+      // account-enumeration oracle (200 vs 500 by email existence).
+      await this.sendMailBestEffort(() =>
+        this.mail.sendVerificationCode(email, user.name, code),
+      );
     }
     return { message: 'If that account exists, a new code has been sent.' };
   }
 
   async login(dto: LoginDto) {
     const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
+      where: { email: normalizeEmail(dto.email) },
       include: {
         business: {
           select: { isSuspended: true, isSubscribed: true, subscribedTo: true },
@@ -160,12 +189,14 @@ export class AuthService {
 
   /** Start a password reset. Always responds the same way (no enumeration). */
   async forgotPassword(dto: ForgotPasswordDto) {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const email = normalizeEmail(dto.email);
+    const user = await this.prisma.user.findUnique({ where: { email } });
     if (user && user.isActive) {
       const code = await this.issueCode(user.id, EmailTokenType.PASSWORD_RESET);
-      await this.mail.sendPasswordReset(dto.email, user.name, code);
+      // Best-effort, same enumeration-safety reasoning as resendVerification.
+      await this.sendMailBestEffort(() =>
+        this.mail.sendPasswordReset(email, user.name, code),
+      );
     }
     return {
       message: 'If that account exists, a reset code has been sent.',
@@ -175,7 +206,7 @@ export class AuthService {
   /** Complete a password reset with the emailed code. */
   async resetPassword(dto: ResetPasswordDto) {
     const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
+      where: { email: normalizeEmail(dto.email) },
     });
     if (!user) throw new BadRequestException('Invalid or expired code');
 
@@ -233,6 +264,20 @@ export class AuthService {
     });
     if (!user) throw new UnauthorizedException();
     const { passwordHash, ...safe } = user;
+
+    // Billing/platform-admin fields are deliberately withheld from every
+    // role except OWNER/MANAGER, matching the @Roles(OWNER, MANAGER) gate
+    // on GET /business -- otherwise this endpoint hands any CASHIER/
+    // STOCK_KEEPER the same subscription/suspension data that route
+    // withholds from them.
+    const canSeeAdminFields =
+      user.role === UserRole.OWNER || user.role === UserRole.MANAGER;
+    if (!canSeeAdminFields && safe.business) {
+      const { isSubscribed, subscribedTo, isSuspended, ...restrictedBusiness } =
+        safe.business;
+      safe.business = restrictedBusiness as typeof safe.business;
+    }
+
     return safe;
   }
 

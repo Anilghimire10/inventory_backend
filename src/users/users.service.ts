@@ -10,6 +10,7 @@ import { Prisma, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { normalizeEmail } from '../common/email';
 
 // Lower number = more privileged.
 const ROLE_RANK: Record<UserRole, number> = {
@@ -36,9 +37,8 @@ export class UsersService {
   async create(businessId: string, dto: CreateUserDto, actingRole: UserRole) {
     this.assertCanAssignRole(actingRole, dto.role);
 
-    const existing = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const email = normalizeEmail(dto.email);
+    const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) throw new ConflictException('Email already in use');
     if (dto.storeId) await this.assertStore(businessId, dto.storeId);
 
@@ -46,7 +46,7 @@ export class UsersService {
     return this.prisma.user.create({
       data: {
         businessId,
-        email: dto.email,
+        email,
         name: dto.name,
         role: dto.role,
         storeId: dto.storeId,
@@ -118,10 +118,17 @@ export class UsersService {
     });
   }
 
-  /** Only an owner may grant the OWNER role. */
+  /**
+   * A non-owner can only assign a role strictly below their own rank -- a
+   * MANAGER can create/promote CASHIER or STOCK_KEEPER, but not another
+   * MANAGER (or OWNER). Only an OWNER can assign OWNER or MANAGER.
+   */
   private assertCanAssignRole(actingRole: UserRole, targetRole: UserRole) {
-    if (targetRole === UserRole.OWNER && actingRole !== UserRole.OWNER) {
-      throw new ForbiddenException('Only an owner can assign the owner role');
+    if (actingRole === UserRole.OWNER) return;
+    if (ROLE_RANK[targetRole] <= ROLE_RANK[actingRole]) {
+      throw new ForbiddenException(
+        `Only an owner can assign the ${targetRole.toLowerCase()} role`,
+      );
     }
   }
 
