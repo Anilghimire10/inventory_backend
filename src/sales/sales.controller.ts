@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -12,6 +13,7 @@ import { IsEmail, IsOptional } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { SalesService } from './sales.service';
 import { CreateSaleDto } from './dto/create-sale.dto';
+import { HoldSaleDto } from './dto/hold-sale.dto';
 import { ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -47,6 +49,27 @@ export class SalesController {
   @Post()
   create(@CurrentUser() u: AuthUser, @Body() dto: CreateSaleDto) {
     return this.sales.create(u, dto);
+  }
+
+  /** Park a cart server-side, without deducting stock or a receipt number. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Post('hold')
+  hold(@CurrentUser() u: AuthUser, @Body() dto: HoldSaleDto) {
+    return this.sales.hold(u, dto);
+  }
+
+  /** Return a held sale's cart lines to the caller and remove the parked row. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Post(':id/resume')
+  resume(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.sales.resumeHeld(u.businessId, id);
+  }
+
+  /** Discard a parked sale (held only) without resuming it. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Delete(':id')
+  discard(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.sales.discardHeld(u.businessId, id);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)

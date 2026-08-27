@@ -3,6 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import {
   PaymentMethod,
   Prisma,
@@ -13,11 +14,20 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
-import { CreateSaleDto } from './dto/create-sale.dto';
+import { CreateSaleDto, SaleItemDto } from './dto/create-sale.dto';
+import { HoldSaleDto } from './dto/hold-sale.dto';
 import { ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+
+/** Fields `create()` and `hold()` share to price out a cart. */
+interface SaleLinesInput {
+  customerId?: string;
+  items: SaleItemDto[];
+  discount?: number;
+  prescriptionRef?: string;
+}
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -64,66 +74,11 @@ export class SalesService {
     if (!storeId) {
       throw new BadRequestException('No store specified for this sale');
     }
-    // Independent reads -- run concurrently instead of one round trip each.
-    const productIds = dto.items.map((i) => i.productId);
-    const [, , business, products] = await Promise.all([
-      this.assertStore(businessId, storeId),
-      dto.customerId
-        ? this.assertCustomer(businessId, dto.customerId)
-        : Promise.resolve(),
-      this.prisma.business.findUnique({
-        where: { id: businessId },
-        select: { taxEnabled: true },
-      }),
-      this.prisma.product.findMany({
-        where: { id: { in: productIds }, businessId, isActive: true },
-      }),
-    ]);
-    // Master tax switch: when off, no line charges tax regardless of product.
-    const taxEnabled = business?.taxEnabled ?? true;
-    const productMap = new Map(products.map((p) => [p.id, p]));
-    if (productMap.size !== new Set(productIds).size) {
-      throw new BadRequestException('One or more products are invalid');
-    }
-
-    // Pharmacy: block Rx items without a prescription reference
-    const needsRx = dto.items.some((i) => productMap.get(i.productId)!.isRxRequired);
-    if (needsRx && !dto.prescriptionRef) {
-      throw new BadRequestException(
-        'A prescription reference is required for prescription-only items',
-      );
-    }
-
-    // ---- Compute totals ----
-    const lines = dto.items.map((i) => {
-      const product = productMap.get(i.productId)!;
-      const unitPrice = i.unitPrice ?? Number(product.sellingPrice);
-      const itemDiscount = i.discount ?? 0;
-      const lineNet = round2(unitPrice * i.quantity - itemDiscount);
-      if (lineNet < 0) throw new BadRequestException('Discount exceeds line total');
-      // Tax applies only when the master switch is on AND the product is taxable.
-      const taxRate = taxEnabled && product.isTaxable ? Number(product.taxRate) : 0;
-      const lineTax = round2((lineNet * taxRate) / 100);
-      return {
-        productId: i.productId,
-        name: product.name,
-        quantity: i.quantity,
-        unitPrice,
-        unitCost: Number(product.costPrice), // snapshot for accurate profit later
-        discount: itemDiscount,
-        taxRate,
-        lineNet,
-        lineTax,
-        lineTotal: round2(lineNet + lineTax),
-        trackBatches: product.trackBatches,
-      };
-    });
-
-    const subtotal = round2(lines.reduce((s, l) => s + l.lineNet, 0));
-    const tax = round2(lines.reduce((s, l) => s + l.lineTax, 0));
-    const billDiscount = dto.discount ?? 0;
-    const total = round2(subtotal + tax - billDiscount);
-    if (total < 0) throw new BadRequestException('Discount exceeds sale total');
+    const { lines, subtotal, tax, billDiscount, total } = await this.buildLines(
+      businessId,
+      storeId,
+      dto,
+    );
 
     const requestedMethod = dto.paymentMethod ?? PaymentMethod.CASH;
     // How much is actually paid now. A CREDIT sale defaults to nothing paid;
@@ -239,6 +194,94 @@ export class SalesService {
         if (!isReceiptCollision || attempt >= MAX_ATTEMPTS) throw err;
       }
     }
+  }
+
+  /**
+   * Park a cart server-side: a HELD sale row that deducts no stock and,
+   * unlike `create()`, never calls `nextReceiptNo()` -- its receipt slot is
+   * a UUID placeholder so parking and discarding sales never creates gaps
+   * in the real INV-###### sequence.
+   */
+  async hold(user: AuthUser, dto: HoldSaleDto) {
+    const businessId = user.businessId;
+    const storeId = dto.storeId ?? user.storeId;
+    if (!storeId) {
+      throw new BadRequestException('No store specified for this sale');
+    }
+    const { lines, subtotal, tax, billDiscount, total } = await this.buildLines(
+      businessId,
+      storeId,
+      dto,
+    );
+
+    return this.prisma.sale.create({
+      data: {
+        businessId,
+        storeId,
+        userId: user.userId,
+        customerId: dto.customerId,
+        receiptNo: `HOLD-${randomUUID()}`,
+        status: SaleStatus.HELD,
+        subtotal,
+        discount: billDiscount,
+        tax,
+        total,
+        paymentMethod: PaymentMethod.CASH,
+        amountPaid: 0,
+        prescriptionRef: dto.prescriptionRef,
+        note: dto.note,
+        items: {
+          create: lines.map((l) => ({
+            productId: l.productId,
+            name: l.name,
+            quantity: l.quantity,
+            unitPrice: l.unitPrice,
+            unitCost: l.unitCost,
+            discount: l.discount,
+            taxRate: l.taxRate,
+            lineTotal: l.lineTotal,
+          })),
+        },
+      },
+      include: { items: true },
+    });
+  }
+
+  /**
+   * Hand a held sale's cart back to the caller and remove the parked row.
+   * Nothing here is a real sale yet -- the client re-submits the returned
+   * cart through `create()` to actually check out.
+   */
+  async resumeHeld(businessId: string, id: string) {
+    const sale = await this.prisma.sale.findFirst({
+      where: { id, businessId, status: SaleStatus.HELD },
+      include: { items: { include: { product: true } } },
+    });
+    if (!sale) throw new NotFoundException('Held sale not found');
+
+    await this.prisma.sale.delete({ where: { id: sale.id } });
+
+    return {
+      storeId: sale.storeId,
+      customerId: sale.customerId,
+      discount: Number(sale.discount),
+      prescriptionRef: sale.prescriptionRef,
+      note: sale.note,
+      items: sale.items.map((i) => ({
+        product: i.product,
+        quantity: i.quantity,
+      })),
+    };
+  }
+
+  /** Discard a parked sale without resuming it. */
+  async discardHeld(businessId: string, id: string) {
+    const sale = await this.prisma.sale.findFirst({
+      where: { id, businessId, status: SaleStatus.HELD },
+    });
+    if (!sale) throw new NotFoundException('Held sale not found');
+    await this.prisma.sale.delete({ where: { id: sale.id } });
+    return { message: 'Held sale discarded' };
   }
 
   async returnItems(user: AuthUser, saleId: string, dto: ReturnSaleDto) {
@@ -525,5 +568,74 @@ export class SalesService {
       where: { id: customerId, businessId },
     });
     if (!customer) throw new BadRequestException('Invalid customer');
+  }
+
+  /** Validate + price out a cart. Shared by `create()` and `hold()`. */
+  private async buildLines(
+    businessId: string,
+    storeId: string,
+    dto: SaleLinesInput,
+  ) {
+    // Independent reads -- run concurrently instead of one round trip each.
+    const productIds = dto.items.map((i) => i.productId);
+    const [, , business, products] = await Promise.all([
+      this.assertStore(businessId, storeId),
+      dto.customerId
+        ? this.assertCustomer(businessId, dto.customerId)
+        : Promise.resolve(),
+      this.prisma.business.findUnique({
+        where: { id: businessId },
+        select: { taxEnabled: true },
+      }),
+      this.prisma.product.findMany({
+        where: { id: { in: productIds }, businessId, isActive: true },
+      }),
+    ]);
+    // Master tax switch: when off, no line charges tax regardless of product.
+    const taxEnabled = business?.taxEnabled ?? true;
+    const productMap = new Map(products.map((p) => [p.id, p]));
+    if (productMap.size !== new Set(productIds).size) {
+      throw new BadRequestException('One or more products are invalid');
+    }
+
+    // Pharmacy: block Rx items without a prescription reference
+    const needsRx = dto.items.some((i) => productMap.get(i.productId)!.isRxRequired);
+    if (needsRx && !dto.prescriptionRef) {
+      throw new BadRequestException(
+        'A prescription reference is required for prescription-only items',
+      );
+    }
+
+    const lines = dto.items.map((i) => {
+      const product = productMap.get(i.productId)!;
+      const unitPrice = i.unitPrice ?? Number(product.sellingPrice);
+      const itemDiscount = i.discount ?? 0;
+      const lineNet = round2(unitPrice * i.quantity - itemDiscount);
+      if (lineNet < 0) throw new BadRequestException('Discount exceeds line total');
+      // Tax applies only when the master switch is on AND the product is taxable.
+      const taxRate = taxEnabled && product.isTaxable ? Number(product.taxRate) : 0;
+      const lineTax = round2((lineNet * taxRate) / 100);
+      return {
+        productId: i.productId,
+        name: product.name,
+        quantity: i.quantity,
+        unitPrice,
+        unitCost: Number(product.costPrice), // snapshot for accurate profit later
+        discount: itemDiscount,
+        taxRate,
+        lineNet,
+        lineTax,
+        lineTotal: round2(lineNet + lineTax),
+        trackBatches: product.trackBatches,
+      };
+    });
+
+    const subtotal = round2(lines.reduce((s, l) => s + l.lineNet, 0));
+    const tax = round2(lines.reduce((s, l) => s + l.lineTax, 0));
+    const billDiscount = dto.discount ?? 0;
+    const total = round2(subtotal + tax - billDiscount);
+    if (total < 0) throw new BadRequestException('Discount exceeds sale total');
+
+    return { lines, subtotal, tax, billDiscount, total };
   }
 }
