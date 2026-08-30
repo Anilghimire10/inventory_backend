@@ -23,7 +23,7 @@ export class SuppliersService {
         ? { name: { contains: q.search, mode: 'insensitive' } }
         : {}),
     };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.supplier.findMany({
         where,
         skip: q.skip,

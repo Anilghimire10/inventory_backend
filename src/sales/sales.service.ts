@@ -267,10 +267,20 @@ export class SalesService {
       discount: Number(sale.discount),
       prescriptionRef: sale.prescriptionRef,
       note: sale.note,
-      items: sale.items.map((i) => ({
-        product: i.product,
-        quantity: i.quantity,
-      })),
+      items: sale.items.map((i) => {
+        // The snapshotted unitPrice is always populated (it defaults to the
+        // product's price at hold time), so only surface it as an "override"
+        // when it actually diverges from the product's current price --
+        // otherwise every resumed line would wrongly show as price-adjusted.
+        const unitPrice = Number(i.unitPrice);
+        const currentPrice = Number(i.product.sellingPrice);
+        return {
+          product: i.product,
+          quantity: i.quantity,
+          unitPrice: unitPrice !== currentPrice ? unitPrice : undefined,
+          discount: Number(i.discount) || undefined,
+        };
+      }),
     };
   }
 
@@ -449,7 +459,7 @@ export class SalesService {
       },
     };
 
-    const [data, total, agg, today] = await this.prisma.$transaction([
+    const [data, total, agg, today] = await Promise.all([
       this.prisma.sale.findMany({
         where,
         skip: q.skip,

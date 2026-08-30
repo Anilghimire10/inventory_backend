@@ -55,7 +55,7 @@ export class PlatformService {
       ? { name: { contains: q.search, mode: 'insensitive' } }
       : {};
 
-    const [rows, total] = await this.prisma.$transaction([
+    const [rows, total] = await Promise.all([
       this.prisma.business.findMany({
         where,
         skip: q.skip,
@@ -173,7 +173,7 @@ export class PlatformService {
           }
         : {}),
     };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.customer.findMany({
         where,
         skip: q.skip,
@@ -203,7 +203,7 @@ export class PlatformService {
         ? { receiptNo: { contains: q.search, mode: 'insensitive' } }
         : {}),
     };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.sale.findMany({
         where,
         skip: q.skip,
@@ -246,7 +246,7 @@ export class PlatformService {
     const where: Prisma.AuditLogWhereInput = q.search
       ? { action: { contains: q.search, mode: 'insensitive' } }
       : {};
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.auditLog.findMany({
         where,
         skip: q.skip,
@@ -265,7 +265,7 @@ export class PlatformService {
   /** Activity log of a business, paginated. */
   async businessActivity(businessId: string, q: PaginationDto) {
     await this.getBusinessOrThrow(businessId);
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.auditLog.findMany({
         where: { businessId },
         skip: q.skip,

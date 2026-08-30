@@ -299,7 +299,7 @@ export class PurchasesService {
 
   async findAll(businessId: string, q: PaginationDto) {
     const where: Prisma.PurchaseWhereInput = { businessId };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.purchase.findMany({
         where,
         skip: q.skip,

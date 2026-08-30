@@ -43,7 +43,7 @@ export class AuditService {
         : {}),
       ...(filters.userId ? { userId: filters.userId } : {}),
     };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.auditLog.findMany({
         where,
         skip: q.skip,

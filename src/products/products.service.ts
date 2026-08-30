@@ -72,6 +72,7 @@ export class ProductsService {
       businessId,
       ...(q.activeOnly !== false ? { isActive: true } : {}),
       ...(q.categoryId ? { categories: { some: { id: q.categoryId } } } : {}),
+      ...(q.ids?.length ? { id: { in: q.ids } } : {}),
       ...(q.search
         ? {
             OR: [
@@ -84,7 +85,7 @@ export class ProductsService {
         : {}),
     };
 
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.product.findMany({
         where,
         skip: q.skip,

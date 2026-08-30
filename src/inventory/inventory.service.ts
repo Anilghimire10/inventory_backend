@@ -234,7 +234,7 @@ export class InventoryService {
         ? { product: { name: { contains: q.search, mode: 'insensitive' } } }
         : {}),
     };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.stockItem.findMany({
         where,
         skip: q.skip,
@@ -301,7 +301,7 @@ export class InventoryService {
       ...(q.storeId ? { storeId: q.storeId } : {}),
       ...(q.productId ? { productId: q.productId } : {}),
     };
-    const [data, total] = await this.prisma.$transaction([
+    const [data, total] = await Promise.all([
       this.prisma.stockMovement.findMany({
         where,
         skip: q.skip,
