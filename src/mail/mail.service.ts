@@ -3,7 +3,6 @@ import { ConfigService } from '@nestjs/config';
 
 interface SendArgs {
   to: string;
-  toName?: string;
   subject: string;
   html: string;
 }
@@ -45,7 +44,7 @@ export class MailService {
     };
   }
 
-  async send({ to, toName, subject, html }: SendArgs) {
+  async send({ to, subject, html }: SendArgs) {
     const { apiKey, from, fromName, url } = this.cfg();
 
     const res = await fetch(url, {
@@ -56,9 +55,12 @@ export class MailService {
         Accept: 'application/json',
       },
       body: JSON.stringify({
-        // Resend accepts a "Name <address>" string for both sender and recipient.
+        // Resend accepts a "Name <address>" string for the sender, but its
+        // sandbox-mode recipient allowlist check does a raw string match on
+        // `to` and doesn't parse "Name <address>" -- so the recipient must
+        // stay a bare address or a real allowed recipient silently 403s.
         from: `${fromName} <${from}>`,
-        to: [toName ? `${toName} <${to}>` : to],
+        to: [to],
         subject,
         html,
       }),
@@ -76,7 +78,6 @@ export class MailService {
   sendVerificationCode(to: string, name: string, code: string) {
     return this.send({
       to,
-      toName: name,
       subject: 'Verify your email',
       html: this.codeTemplate(
         name,
@@ -142,7 +143,6 @@ export class MailService {
 
     return this.send({
       to,
-      toName: data.customerName,
       subject: `Receipt ${data.receiptNo} — ${data.businessName}`,
       html,
     });
@@ -197,7 +197,6 @@ export class MailService {
 
     return this.send({
       to,
-      toName: name,
       subject: `Low stock: ${items.length} item${items.length === 1 ? '' : 's'} need restocking`,
       html,
     });
@@ -206,7 +205,6 @@ export class MailService {
   sendPasswordReset(to: string, name: string, code: string) {
     return this.send({
       to,
-      toName: name,
       subject: 'Reset your password',
       html: this.codeTemplate(
         name,
