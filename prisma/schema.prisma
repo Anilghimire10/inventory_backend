@@ -133,6 +133,7 @@ model Business {
   batches        Batch[]
   notifications  Notification[]
   auditLogs      AuditLog[]
+  shifts         Shift[]
 }
 
 model Store {
@@ -152,6 +153,7 @@ model Store {
   purchases      Purchase[]
   sales          Sale[]
   batches        Batch[]
+  shifts         Shift[]
 
   @@index([businessId])
 }
@@ -177,6 +179,7 @@ model User {
   stockMovements StockMovement[]
   emailTokens    EmailToken[]
   auditLogs      AuditLog[]
+  shifts         Shift[]
 
   @@index([businessId])
 }
@@ -278,7 +281,7 @@ model StockItem {
   store        Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
   productId    String
   product      Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  quantity     Int      @default(0)
+  quantity     Decimal  @default(0) @db.Decimal(12, 3) // fractional: weighed goods (kg/L)
   reorderLevel Int      @default(0) // overrides product.reorderLevel when > 0
   updatedAt    DateTime @updatedAt
 
@@ -297,7 +300,7 @@ model Batch {
   product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
   batchNumber String?
   expiryDate  DateTime?
-  quantity    Int       @default(0)
+  quantity    Decimal   @default(0) @db.Decimal(12, 3)
   costPrice   Decimal?  @db.Decimal(12, 2)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -318,7 +321,7 @@ model StockMovement {
   userId     String?
   user       User?             @relation(fields: [userId], references: [id])
   type       StockMovementType
-  quantity   Int // positive = in, negative = out
+  quantity   Decimal           @db.Decimal(12, 3) // positive = in, negative = out
   reason     AdjustmentReason?
   note       String?
   reference  String? // related saleId / purchaseId
@@ -380,7 +383,8 @@ model PurchaseItem {
   purchase    Purchase  @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
   productId   String
   product     Product   @relation(fields: [productId], references: [id])
-  quantity    Int
+  quantity    Decimal   @db.Decimal(12, 3)
+  returnedQty Decimal   @default(0) @db.Decimal(12, 3) // sent back to the supplier
   costPrice   Decimal   @db.Decimal(12, 2)
   batchNumber String?
   expiryDate  DateTime?
@@ -419,6 +423,8 @@ model Sale {
   user            User?         @relation(fields: [userId], references: [id])
   customerId      String?
   customer        Customer?     @relation(fields: [customerId], references: [id])
+  shiftId         String? // till session this sale was rung up in
+  shift           Shift?        @relation(fields: [shiftId], references: [id])
   receiptNo       String
   status          SaleStatus    @default(COMPLETED)
   subtotal        Decimal       @default(0) @db.Decimal(12, 2)
@@ -437,6 +443,7 @@ model Sale {
   @@unique([businessId, receiptNo])
   @@index([businessId])
   @@index([storeId])
+  @@index([shiftId])
   @@index([createdAt])
 }
 
@@ -447,15 +454,47 @@ model SaleItem {
   productId   String
   product     Product  @relation(fields: [productId], references: [id])
   name        String // snapshot of product name at sale time
-  quantity    Int
+  quantity    Decimal  @db.Decimal(12, 3)
   unitPrice   Decimal  @db.Decimal(12, 2)
   unitCost    Decimal  @default(0) @db.Decimal(12, 2) // snapshot of cost at sale time (for accurate profit)
   discount    Decimal  @default(0) @db.Decimal(12, 2)
   taxRate     Decimal  @default(0) @db.Decimal(5, 2)
   lineTotal   Decimal  @db.Decimal(12, 2)
-  returnedQty Int      @default(0)
+  returnedQty Decimal  @default(0) @db.Decimal(12, 3)
 
   @@index([saleId])
+}
+
+// ---------- Till sessions ----------
+
+// A cashier's drawer session. Sales rung up while it is open carry its
+// shiftId, so closing can compare the cash the drawer *should* hold with
+// what was physically counted.
+model Shift {
+  id           String    @id @default(cuid())
+  businessId   String
+  business     Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  storeId      String
+  store        Store     @relation(fields: [storeId], references: [id])
+  userId       String
+  user         User      @relation(fields: [userId], references: [id])
+  openedAt     DateTime  @default(now())
+  closedAt     DateTime?
+  openingFloat Decimal   @default(0) @db.Decimal(12, 2)
+  countedCash  Decimal?  @db.Decimal(12, 2) // what the cashier physically counted at close
+  expectedCash Decimal?  @db.Decimal(12, 2) // snapshot: float + cash in - cash refunds
+  variance     Decimal?  @db.Decimal(12, 2) // counted - expected
+  note         String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sales Sale[]
+
+  // "One open shift per user" is enforced by a partial unique index on
+  // (userId) WHERE "closedAt" IS NULL — Prisma can't express partial
+  // indexes, so it lives in the migration SQL only.
+  @@index([businessId, openedAt])
+  @@index([userId, closedAt])
 }
 
 // ---------- Notifications ----------

@@ -3,9 +3,9 @@ import { Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
-  IsInt,
+  IsNumber,
+  IsPositive,
   IsString,
-  Min,
   ValidateNested,
 } from 'class-validator';
 
@@ -15,8 +15,8 @@ export class ReturnItemDto {
   saleItemId: string;
 
   @ApiProperty({ example: 1, description: 'Quantity to return' })
-  @IsInt()
-  @Min(1)
+  @IsNumber({ maxDecimalPlaces: 3 })
+  @IsPositive()
   quantity: number;
 }
 

@@ -2,6 +2,7 @@ import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { InventoryService } from './inventory.service';
 import { AdjustStockDto, SetReorderLevelDto } from './dto/adjust-stock.dto';
+import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
   ExpiringDto,
   QueryMovementsDto,
@@ -48,5 +49,26 @@ export class InventoryController {
   @Post('reorder-level')
   setReorderLevel(@CurrentUser() u: AuthUser, @Body() dto: SetReorderLevelDto) {
     return this.inventory.setReorderLevel(u.businessId, dto);
+  }
+
+  /** Move stock between two stores (one reference links both legs). */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
+  @Post('transfer')
+  transfer(@CurrentUser() u: AuthUser, @Body() dto: TransferStockDto) {
+    return this.inventory.transfer(u.businessId, u.userId, dto);
+  }
+
+  /** Current stock for every active product, for a printable count sheet. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
+  @Get('count-sheet')
+  countSheet(@CurrentUser() u: AuthUser, @Query('storeId') storeId: string) {
+    return this.inventory.countSheet(u.businessId, storeId);
+  }
+
+  /** Post a physical count; `preview: true` returns the variances only. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
+  @Post('stock-take')
+  stockTake(@CurrentUser() u: AuthUser, @Body() dto: StockTakeDto) {
+    return this.inventory.stockTake(u.businessId, u.userId, dto);
   }
 }

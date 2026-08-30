@@ -28,6 +28,7 @@ import { CustomersModule } from './customers/customers.module';
 import { SalesModule } from './sales/sales.module';
 import { ReportsModule } from './reports/reports.module';
 import { CreditModule } from './credit/credit.module';
+import { ShiftsModule } from './shifts/shifts.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { CreditModule } from './credit/credit.module';
     SalesModule,
     ReportsModule,
     CreditModule,
+    ShiftsModule,
   ],
   controllers: [HealthController],
   providers: [

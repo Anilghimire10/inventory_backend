@@ -5,8 +5,8 @@ import {
   IsArray,
   IsBoolean,
   IsDateString,
-  IsInt,
   IsNumber,
+  IsPositive,
   IsOptional,
   IsString,
   Min,
@@ -18,9 +18,9 @@ export class PurchaseItemDto {
   @IsString()
   productId: string;
 
-  @ApiProperty({ example: 100 })
-  @IsInt()
-  @Min(1)
+  @ApiProperty({ example: 100, description: 'May be fractional for weighed goods' })
+  @IsNumber({ maxDecimalPlaces: 3 })
+  @IsPositive()
   quantity: number;
 
   @ApiProperty({ example: 0.5 })

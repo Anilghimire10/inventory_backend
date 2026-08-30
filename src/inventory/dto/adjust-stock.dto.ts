@@ -3,6 +3,7 @@ import { AdjustmentReason } from '@prisma/client';
 import {
   IsEnum,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   NotEquals,
@@ -21,7 +22,7 @@ export class AdjustStockDto {
     description: 'Signed change: +10 to add, -3 to remove',
     example: -3,
   })
-  @IsInt()
+  @IsNumber({ maxDecimalPlaces: 3 })
   @NotEquals(0)
   delta: number;
 

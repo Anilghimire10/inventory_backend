@@ -12,10 +12,13 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
+import { ReturnPurchaseDto } from './dto/return-purchase.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+/** Quantities are numeric(12,3) — keep float arithmetic on that grid. */
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
 
 @Injectable()
 export class PurchasesService {
@@ -98,10 +101,17 @@ export class PurchasesService {
     if (existing.status === PurchaseStatus.CANCELLED) {
       throw new BadRequestException('A cancelled purchase cannot be edited');
     }
+    // Editing reverses the original lines, which no longer match what is on
+    // the shelf once part of them has gone back to the supplier.
+    if (existing.items.some((i) => Number(i.returnedQty) > 0)) {
+      throw new BadRequestException(
+        'A purchase with a supplier return cannot be edited',
+      );
+    }
 
     const items = dto.items ?? existing.items.map((i) => ({
       productId: i.productId,
-      quantity: i.quantity,
+      quantity: Number(i.quantity),
       costPrice: Number(i.costPrice),
       batchNumber: i.batchNumber ?? undefined,
       expiryDate: i.expiryDate ? i.expiryDate.toISOString() : undefined,
@@ -143,7 +153,7 @@ export class PurchasesService {
               storeId: existing.storeId,
               productId: item.productId,
               type: StockMovementType.PURCHASE,
-              quantity: -item.quantity,
+              quantity: -Number(item.quantity),
               reference: existing.id,
               note: 'Purchase edited — original stock reversed',
             });
@@ -251,7 +261,7 @@ export class PurchasesService {
           storeId: purchase.storeId,
           productId: item.productId,
           type: StockMovementType.PURCHASE,
-          quantity: item.quantity,
+          quantity: Number(item.quantity),
           reference: purchase.id,
         });
         await this.createBatchIfNeeded(tx, businessId, purchase.storeId, item);
@@ -264,6 +274,107 @@ export class PurchasesService {
         where: { id },
         include: { items: true },
       });
+    }, TX_OPTS);
+  }
+
+  /**
+   * Send goods back to the supplier (debit note). Mirrors the sales return:
+   * per-line returnedQty, partial returns allowed, stock out through the same
+   * choke point (as RETURN_OUT), and the purchase's own total shrinks so the
+   * payable on the Credit page drops by the same amount.
+   *
+   * Money already paid is left alone, so returning goods on a fully-paid
+   * purchase leaves `outstanding` negative — that is the supplier owing a
+   * refund, which is exactly what a debit note means.
+   */
+  async returnItems(
+    businessId: string,
+    userId: string,
+    id: string,
+    dto: ReturnPurchaseDto,
+  ) {
+    const purchase = await this.prisma.purchase.findFirst({
+      where: { id, businessId },
+      include: { items: true },
+    });
+    if (!purchase) throw new NotFoundException('Purchase not found');
+    if (purchase.status !== PurchaseStatus.RECEIVED) {
+      throw new BadRequestException(
+        'Only a received purchase can be returned to the supplier',
+      );
+    }
+
+    const itemMap = new Map(purchase.items.map((it) => [it.id, it]));
+    let value = 0;
+    for (const r of dto.items) {
+      const item = itemMap.get(r.purchaseItemId);
+      if (!item) throw new BadRequestException('Invalid purchase item');
+      const returnable = round3(
+        Number(item.quantity) - Number(item.returnedQty),
+      );
+      if (r.quantity > returnable) {
+        throw new BadRequestException(
+          `Cannot return ${r.quantity} of this line (only ${returnable} left)`,
+        );
+      }
+      value += Number(item.costPrice) * r.quantity;
+    }
+    value = round2(value);
+    const newSubtotal = round2(Number(purchase.subtotal) - value);
+    const newTotal = round2(Number(purchase.total) - value);
+
+    return this.prisma.$transaction(async (tx) => {
+      // Guarded: stock cannot go negative, so goods already sold on cannot be
+      // returned to the supplier from an empty shelf.
+      await this.inventory.applyMovementsBatch(
+        tx,
+        dto.items.map((r) => {
+          const item = itemMap.get(r.purchaseItemId)!;
+          return {
+            businessId,
+            storeId: purchase.storeId,
+            productId: item.productId,
+            type: StockMovementType.RETURN_OUT,
+            quantity: -r.quantity,
+            userId,
+            note: dto.note ?? 'Returned to supplier',
+            reference: purchase.id,
+          };
+        }),
+      );
+
+      for (const r of dto.items) {
+        const item = itemMap.get(r.purchaseItemId)!;
+        await tx.purchaseItem.update({
+          where: { id: item.id },
+          data: { returnedQty: { increment: r.quantity } },
+        });
+        await this.reverseBatchIfNeeded(tx, purchase.storeId, {
+          productId: item.productId,
+          quantity: r.quantity,
+          batchNumber: item.batchNumber,
+          expiryDate: item.expiryDate,
+        });
+      }
+
+      const updated = await tx.purchase.update({
+        where: { id: purchase.id },
+        data: {
+          subtotal: newSubtotal,
+          total: newTotal,
+          note: dto.note ?? purchase.note,
+        },
+        include: { items: true },
+      });
+      return {
+        purchase: {
+          ...updated,
+          outstanding: round2(
+            Number(updated.total) - Number(updated.amountPaid),
+          ),
+        },
+        returnedValue: value,
+      };
     }, TX_OPTS);
   }
 
@@ -375,7 +486,7 @@ export class PurchasesService {
     storeId: string,
     item: {
       productId: string;
-      quantity: number;
+      quantity: Prisma.Decimal | number;
       costPrice: Prisma.Decimal;
       batchNumber: string | null;
       expiryDate: Date | null;
@@ -427,7 +538,7 @@ export class PurchasesService {
     storeId: string,
     item: {
       productId: string;
-      quantity: number;
+      quantity: Prisma.Decimal | number;
       batchNumber: string | null;
       expiryDate: Date | null;
     },
@@ -442,8 +553,8 @@ export class PurchasesService {
       },
     });
     if (!existing) return; // nothing tracked to reverse
-    if (existing.quantity < item.quantity) {
-      throw new BadRequestException('Cannot edit: batch stock already sold or moved');
+    if (Number(existing.quantity) < Number(item.quantity)) {
+      throw new BadRequestException('That batch stock has already been sold or moved');
     }
     await tx.batch.update({
       where: { id: existing.id },

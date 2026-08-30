@@ -61,7 +61,7 @@ export class LowStockCron {
     const items = low.map((it) => ({
       productName: it.product.name,
       sku: it.product.sku,
-      quantity: it.quantity,
+      quantity: Number(it.quantity),
       reorderLevel: it.effectiveReorderLevel ?? it.reorderLevel,
       storeName: it.store?.name ?? null,
     }));

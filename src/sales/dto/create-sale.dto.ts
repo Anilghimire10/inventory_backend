@@ -5,8 +5,8 @@ import {
   ArrayMinSize,
   IsArray,
   IsEnum,
-  IsInt,
   IsNumber,
+  IsPositive,
   IsOptional,
   IsString,
   Min,
@@ -18,9 +18,9 @@ export class SaleItemDto {
   @IsString()
   productId: string;
 
-  @ApiProperty({ example: 2 })
-  @IsInt()
-  @Min(1)
+  @ApiProperty({ example: 2, description: 'May be fractional for weighed goods' })
+  @IsNumber({ maxDecimalPlaces: 3 })
+  @IsPositive()
   quantity: number;
 
   @ApiPropertyOptional({ description: 'Defaults to the product selling price' })

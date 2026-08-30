@@ -30,6 +30,8 @@ interface SaleLinesInput {
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+/** Quantities are numeric(12,3) — keep float arithmetic on that grid. */
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
 
 @Injectable()
 export class SalesService {
@@ -56,7 +58,7 @@ export class SalesService {
       currency: sale.business?.currency ?? 'USD',
       items: sale.items.map((i) => ({
         name: i.name,
-        quantity: i.quantity,
+        quantity: Number(i.quantity),
         unitPrice: Number(i.unitPrice),
         lineTotal: Number(i.lineTotal),
       })),
@@ -74,11 +76,16 @@ export class SalesService {
     if (!storeId) {
       throw new BadRequestException('No store specified for this sale');
     }
-    const { lines, subtotal, tax, billDiscount, total } = await this.buildLines(
-      businessId,
-      storeId,
-      dto,
-    );
+    // Priced-out cart and the cashier's open till session (if any) — the
+    // sale is stamped with it so the shift's Z report can reconcile cash.
+    const [{ lines, subtotal, tax, billDiscount, total }, openShift] =
+      await Promise.all([
+        this.buildLines(businessId, storeId, dto),
+        this.prisma.shift.findFirst({
+          where: { businessId, userId: user.userId, closedAt: null },
+          select: { id: true },
+        }),
+      ]);
 
     const requestedMethod = dto.paymentMethod ?? PaymentMethod.CASH;
     // How much is actually paid now. A CREDIT sale defaults to nothing paid;
@@ -111,6 +118,7 @@ export class SalesService {
           storeId,
           userId: user.userId,
           customerId: dto.customerId,
+          shiftId: openShift?.id ?? null,
           receiptNo,
           status: SaleStatus.COMPLETED,
           subtotal,
@@ -276,7 +284,7 @@ export class SalesService {
         const currentPrice = Number(i.product.sellingPrice);
         return {
           product: i.product,
-          quantity: i.quantity,
+          quantity: Number(i.quantity),
           unitPrice: unitPrice !== currentPrice ? unitPrice : undefined,
           discount: Number(i.discount) || undefined,
         };
@@ -310,13 +318,14 @@ export class SalesService {
     for (const r of dto.items) {
       const item = itemMap.get(r.saleItemId);
       if (!item) throw new BadRequestException('Invalid sale item');
-      const returnable = item.quantity - item.returnedQty;
+      const quantity = Number(item.quantity);
+      const returnable = round3(quantity - Number(item.returnedQty));
       if (r.quantity > returnable) {
         throw new BadRequestException(
           `Cannot return ${r.quantity} of "${item.name}" (only ${returnable} left)`,
         );
       }
-      const perUnit = Number(item.lineTotal) / item.quantity;
+      const perUnit = Number(item.lineTotal) / quantity;
       refund += perUnit * r.quantity;
     }
     refund = round2(refund);
@@ -545,11 +554,13 @@ export class SalesService {
       const productBatches = batchesByProduct.get(item.productId) ?? [];
       for (const batch of productBatches) {
         if (remaining <= 0) break;
-        if (batch.quantity <= 0) continue;
-        const take = Math.min(batch.quantity, remaining);
-        batch.quantity -= take;
-        finalQtyByBatchId.set(batch.id, batch.quantity);
-        remaining -= take;
+        const available = Number(batch.quantity);
+        if (available <= 0) continue;
+        const take = round3(Math.min(available, remaining));
+        const left = round3(available - take);
+        batch.quantity = new Prisma.Decimal(left);
+        finalQtyByBatchId.set(batch.id, left);
+        remaining = round3(remaining - take);
       }
       // If batches don't cover it, StockItem remains the source of truth; we
       // don't block the sale on batch bookkeeping.
@@ -557,11 +568,11 @@ export class SalesService {
 
     if (finalQtyByBatchId.size === 0) return;
     const updateIds = [...finalQtyByBatchId.keys()];
-    const updateQtys = updateIds.map((id) => finalQtyByBatchId.get(id)!);
+    const updateQtys = updateIds.map((id) => String(finalQtyByBatchId.get(id)!));
     await tx.$executeRaw`
       UPDATE "Batch" AS b
-      SET quantity = v.qty
-      FROM (SELECT * FROM UNNEST(${updateIds}::text[], ${updateQtys}::int[])) AS v(id, qty)
+      SET quantity = v.qty::numeric
+      FROM (SELECT * FROM UNNEST(${updateIds}::text[], ${updateQtys}::text[])) AS v(id, qty)
       WHERE b.id = v.id
     `;
   }

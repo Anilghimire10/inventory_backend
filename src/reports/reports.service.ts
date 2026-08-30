@@ -243,12 +243,12 @@ export class ReportsService {
             const prevCost = prevItems.reduce(
               (s, it) =>
                 s +
-                (it.quantity - it.returnedQty) *
+                (Number(it.quantity) - Number(it.returnedQty)) *
                   (Number(it.unitCost) || Number(it.product.costPrice)),
               0,
             );
             const prevRevenue = prevItems.reduce(
-              (s, it) => s + (it.quantity - it.returnedQty) * Number(it.unitPrice),
+              (s, it) => s + (Number(it.quantity) - Number(it.returnedQty)) * Number(it.unitPrice),
               0,
             );
             return {
@@ -267,7 +267,7 @@ export class ReportsService {
       { productId: string; name: string; quantitySold: number; revenue: number; cost: number; profit: number }
     >();
     for (const it of items) {
-      const soldQty = it.quantity - it.returnedQty;
+      const soldQty = Number(it.quantity) - Number(it.returnedQty);
       if (soldQty <= 0) continue;
       const revenue = soldQty * Number(it.unitPrice);
       // Prefer the cost snapshotted at sale time; fall back to current cost
@@ -307,13 +307,13 @@ export class ReportsService {
     for (const it of items) {
       const day = it.sale.createdAt.toISOString().slice(0, 10);
       const bucket = byDayMap[day];
-      if (bucket) bucket.units += it.quantity - it.returnedQty;
+      if (bucket) bucket.units += Number(it.quantity) - Number(it.returnedQty);
     }
 
     // Sales by category (net of returns), attributed to the first category
     const catMap = new Map<string, { category: string; revenue: number; units: number }>();
     for (const it of items) {
-      const soldQty = it.quantity - it.returnedQty;
+      const soldQty = Number(it.quantity) - Number(it.returnedQty);
       if (soldQty <= 0) continue;
       const category = it.product.categories[0]?.name ?? 'Uncategorized';
       const cur = catMap.get(category) ?? { category, revenue: 0, units: 0 };
@@ -340,7 +340,7 @@ export class ReportsService {
     }
     for (const it of items) {
       const h = it.sale.createdAt.getHours();
-      hours[h].units += it.quantity - it.returnedQty;
+      hours[h].units += Number(it.quantity) - Number(it.returnedQty);
     }
 
     // Payment methods with % share
@@ -451,12 +451,12 @@ export class ReportsService {
     let grossSales = 0;
 
     for (const it of items) {
-      const soldQty = it.quantity - it.returnedQty;
+      const soldQty = Number(it.quantity) - Number(it.returnedQty);
       if (soldQty <= 0) continue;
       const rate = Number(it.taxRate);
       // Net of the per-unit discount, scaled to the non-returned quantity.
       const perUnitNet =
-        Number(it.unitPrice) - Number(it.discount) / (it.quantity || 1);
+        Number(it.unitPrice) - Number(it.discount) / (Number(it.quantity) || 1);
       const lineNet = perUnitNet * soldQty;
       const lineTax = round2((lineNet * rate) / 100);
       taxableAmount += lineNet;
@@ -492,7 +492,7 @@ export class ReportsService {
       select: { quantity: true, product: { select: { costPrice: true } } },
     });
     const value = items.reduce(
-      (sum, it) => sum + it.quantity * Number(it.product.costPrice),
+      (sum, it) => sum + Number(it.quantity) * Number(it.product.costPrice),
       0,
     );
     return Math.round(value * 100) / 100;
@@ -511,7 +511,7 @@ export class ReportsService {
     return grouped.map((g) => ({
       productId: g.productId,
       name: g.name,
-      quantitySold: g._sum.quantity ?? 0,
+      quantitySold: Number(g._sum.quantity ?? 0),
     }));
   }
 
@@ -560,14 +560,14 @@ export class ReportsService {
       }),
     ]);
 
-    const soldMap = new Map(sold.map((s) => [s.productId, s._sum.quantity ?? 0]));
+    const soldMap = new Map(sold.map((s) => [s.productId, Number(s._sum.quantity ?? 0)]));
     return products
       .map((p) => ({
         productId: p.id,
         name: p.name,
         costPrice: Number(p.costPrice),
         quantitySold: soldMap.get(p.id) ?? 0,
-        inStock: p.stockItems.reduce((s, si) => s + si.quantity, 0),
+        inStock: p.stockItems.reduce((s, si) => s + Number(si.quantity), 0),
       }))
       .sort((a, b) => a.quantitySold - b.quantitySold || b.inStock - a.inStock)
       .slice(0, take);
@@ -683,7 +683,7 @@ export class ReportsService {
     for (const m of movements) {
       const day = m.createdAt.toISOString().slice(0, 10);
       const bucket = byDay.get(day) ?? { date: day, purchases: 0, sales: 0, adjustments: 0 };
-      const qty = m.quantity;
+      const qty = Number(m.quantity);
       if (m.type === StockMovementType.PURCHASE) bucket.purchases += qty;
       else if (m.type === StockMovementType.SALE) bucket.sales += -qty;
       else bucket.adjustments += qty;
