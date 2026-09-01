@@ -25,7 +25,7 @@ export class UsersController {
 
   @Post()
   create(@CurrentUser() u: AuthUser, @Body() dto: CreateUserDto) {
-    return this.users.create(u.businessId, dto, u.role);
+    return this.users.create(u.businessId, dto, u.role, u.storeId);
   }
 
   @Get()

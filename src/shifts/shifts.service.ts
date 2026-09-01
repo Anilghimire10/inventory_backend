@@ -21,7 +21,15 @@ export class ShiftsService {
 
   /** Start a till session. One open shift per user, enforced by the DB. */
   async open(user: AuthUser, dto: OpenShiftDto) {
-    const storeId = dto.storeId ?? user.storeId;
+    let storeId = dto.storeId ?? user.storeId;
+    if (!storeId) {
+      const stores = await this.prisma.store.findMany({
+        where: { businessId: user.businessId },
+        select: { id: true },
+        take: 2,
+      });
+      if (stores.length === 1) storeId = stores[0].id;
+    }
     if (!storeId) throw new BadRequestException('No store specified for this shift');
     const store = await this.prisma.store.findFirst({
       where: { id: storeId, businessId: user.businessId },

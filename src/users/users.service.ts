@@ -34,13 +34,23 @@ const SAFE_SELECT = {
 export class UsersService {
   constructor(private prisma: PrismaService) {}
 
-  async create(businessId: string, dto: CreateUserDto, actingRole: UserRole) {
+  async create(
+    businessId: string,
+    dto: CreateUserDto,
+    actingRole: UserRole,
+    actingStoreId?: string | null,
+  ) {
     this.assertCanAssignRole(actingRole, dto.role);
 
     const email = normalizeEmail(dto.email);
     const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) throw new ConflictException('Email already in use');
     if (dto.storeId) await this.assertStore(businessId, dto.storeId);
+
+    // No store picked explicitly -> default a new hire to the store the
+    // creating owner/manager themselves works out of, so a cashier can
+    // start ringing up sales immediately instead of landing store-less.
+    const storeId = dto.storeId ?? actingStoreId ?? undefined;
 
     const passwordHash = await argon2.hash(dto.password);
     return this.prisma.user.create({
@@ -49,7 +59,7 @@ export class UsersService {
         email,
         name: dto.name,
         role: dto.role,
-        storeId: dto.storeId,
+        storeId,
         passwordHash,
       },
       select: SAFE_SELECT,
