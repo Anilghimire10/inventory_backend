@@ -109,7 +109,12 @@ export class UsersService {
       name: dto.name,
       role: dto.role,
       isActive: dto.isActive,
-      store: dto.storeId ? { connect: { id: dto.storeId } } : undefined,
+      store:
+        dto.storeId === null
+          ? { disconnect: true }
+          : dto.storeId
+            ? { connect: { id: dto.storeId } }
+            : undefined,
     };
     if (dto.password) data.passwordHash = await argon2.hash(dto.password);
 

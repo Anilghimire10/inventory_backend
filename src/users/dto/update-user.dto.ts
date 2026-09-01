@@ -26,10 +26,10 @@ export class UpdateUserDto {
   @IsEnum(UserRole)
   role?: UserRole;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ description: 'Pass null to unassign the store' })
   @IsOptional()
   @IsString()
-  storeId?: string;
+  storeId?: string | null;
 
   @ApiPropertyOptional()
   @IsOptional()
