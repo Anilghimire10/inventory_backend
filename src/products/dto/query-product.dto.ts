@@ -24,4 +24,19 @@ export class QueryProductDto extends PaginationDto {
   @IsArray()
   @IsString({ each: true })
   ids?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Only the variants of this product',
+  })
+  @IsOptional()
+  @IsString()
+  parentId?: string;
+
+  @ApiPropertyOptional({
+    description: 'Hide variant rows, listing only standalone products and parents',
+  })
+  @IsOptional()
+  @Transform(({ value }) => value === 'true' || value === true)
+  @IsBoolean()
+  excludeVariants?: boolean;
 }

@@ -37,6 +37,16 @@ export class PurchaseItemDto {
   @IsOptional()
   @IsDateString()
   expiryDate?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Serial/IMEI numbers, one per unit. Required for serialised products, and only when the purchase is received.',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serials?: string[];
 }
 
 export class CreatePurchaseDto {

@@ -1,9 +1,10 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
   IsNumber,
+  IsOptional,
   IsPositive,
   IsString,
   ValidateNested,
@@ -18,6 +19,16 @@ export class ReturnItemDto {
   @IsNumber({ maxDecimalPlaces: 3 })
   @IsPositive()
   quantity: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Which serialised units came back. Defaults to the oldest units sold on this sale.',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serials?: string[];
 }
 
 export class ReturnSaleDto {

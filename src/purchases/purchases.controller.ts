@@ -7,13 +7,19 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiProperty, ApiTags } from '@nestjs/swagger';
-import { IsNumber, Min } from 'class-validator';
+import {
+  ApiBearerAuth,
+  ApiProperty,
+  ApiPropertyOptional,
+  ApiTags,
+} from '@nestjs/swagger';
+import { IsNumber, IsOptional, IsString, Min } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { PurchasesService } from './purchases.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { ReturnPurchaseDto } from './dto/return-purchase.dto';
+import { ReceivePurchaseDto } from './dto/receive-purchase.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
@@ -24,6 +30,18 @@ export class PayPurchaseDto {
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0.01)
   amount: number;
+}
+
+export class ReorderDraftDto {
+  @ApiPropertyOptional({ description: 'Only this store' })
+  @IsOptional()
+  @IsString()
+  storeId?: string;
+
+  @ApiPropertyOptional({ description: 'Only this supplier' })
+  @IsOptional()
+  @IsString()
+  supplierId?: string;
 }
 
 @ApiTags('purchases')
@@ -47,9 +65,14 @@ export class PurchasesController {
     return this.purchases.update(u.businessId, id, dto);
   }
 
+  /** Receive a draft; serialised lines carry their scanned serials/IMEIs. */
   @Post(':id/receive')
-  receive(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.purchases.receive(u.businessId, id);
+  receive(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: ReceivePurchaseDto,
+  ) {
+    return this.purchases.receive(u.businessId, id, dto);
   }
 
   /** Send goods back to the supplier (debit note); shrinks stock and payable. */
@@ -71,6 +94,21 @@ export class PurchasesController {
     @Body() dto: PayPurchaseDto,
   ) {
     return this.purchases.recordPayment(u.businessId, id, dto.amount);
+  }
+
+  /** Suggested reorder quantities, grouped into one draft order per supplier. */
+  @Get('reorder-suggestions')
+  reorderSuggestions(
+    @CurrentUser() u: AuthUser,
+    @Query('storeId') storeId?: string,
+  ) {
+    return this.purchases.reorderSuggestions(u.businessId, storeId);
+  }
+
+  /** Create the suggested orders as DRAFT purchases (nothing received/paid). */
+  @Post('reorder-drafts')
+  reorderDrafts(@CurrentUser() u: AuthUser, @Body() dto: ReorderDraftDto) {
+    return this.purchases.createReorderDrafts(u.businessId, dto);
   }
 
   @Get()

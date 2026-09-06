@@ -9,20 +9,26 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
+import { GenerateVariantsDto } from './dto/generate-variants.dto';
 import { paginate } from '../common/dto/pagination.dto';
+
+const DETAIL_INCLUDE = {
+  categories: { select: { id: true, name: true } },
+  tax: { select: { id: true, name: true, rate: true } },
+} satisfies Prisma.ProductInclude;
+
+type ProductDetail = Prisma.ProductGetPayload<{ include: typeof DETAIL_INCLUDE }>;
 
 @Injectable()
 export class ProductsService {
   constructor(private prisma: PrismaService) {}
 
-  private readonly detailInclude = {
-    categories: { select: { id: true, name: true } },
-    tax: { select: { id: true, name: true, rate: true } },
-  } satisfies Prisma.ProductInclude;
+  private readonly detailInclude = DETAIL_INCLUDE;
 
   async create(businessId: string, dto: CreateProductDto) {
     const { categoryIds, expiryDate, taxId, ...rest } = dto;
     await this.assertCategories(businessId, categoryIds);
+    if (dto.parentId) await this.assertParent(businessId, dto.parentId);
     const taxRate = await this.resolveTaxRate(businessId, taxId);
     try {
       const product = await this.prisma.product.create({
@@ -73,6 +79,8 @@ export class ProductsService {
       ...(q.activeOnly !== false ? { isActive: true } : {}),
       ...(q.categoryId ? { categories: { some: { id: q.categoryId } } } : {}),
       ...(q.ids?.length ? { id: { in: q.ids } } : {}),
+      ...(q.parentId ? { parentId: q.parentId } : {}),
+      ...(q.excludeVariants ? { parentId: null } : {}),
       ...(q.search
         ? {
             OR: [
@@ -104,6 +112,20 @@ export class ProductsService {
       include: {
         ...this.detailInclude,
         stockItems: { select: { storeId: true, quantity: true } },
+        variants: {
+          where: { isActive: true },
+          select: {
+            id: true,
+            name: true,
+            variantName: true,
+            attributes: true,
+            sku: true,
+            barcode: true,
+            sellingPrice: true,
+            costPrice: true,
+          },
+          orderBy: { name: 'asc' },
+        },
       },
     });
     if (!product) throw new NotFoundException('Product not found');
@@ -149,6 +171,116 @@ export class ProductsService {
     }
   }
 
+  // ---- Variants ----
+
+  /**
+   * Create one child product per combination of the supplied options
+   * ("Colour: Red, Blue" x "Size: S, M" -> four rows). Each variant is a
+   * normal product -- own SKU, price and stock -- so nothing downstream
+   * needs to know variants exist. Combinations that already exist under
+   * this parent are skipped, so the endpoint is safe to re-run when a new
+   * colour is added.
+   */
+  async generateVariants(
+    businessId: string,
+    parentId: string,
+    dto: GenerateVariantsDto,
+  ) {
+    const parent = await this.prisma.product.findFirst({
+      where: { id: parentId, businessId },
+      include: { categories: { select: { id: true } } },
+    });
+    if (!parent) throw new NotFoundException('Product not found');
+    if (parent.parentId) {
+      throw new BadRequestException('A variant cannot have variants of its own');
+    }
+
+    // Cartesian product of the option values, in the order given.
+    const combos = dto.options.reduce<Record<string, string>[]>(
+      (acc, opt) =>
+        acc.flatMap((row) =>
+          opt.values.map((v) => ({ ...row, [opt.name]: v })),
+        ),
+      [{}],
+    );
+    if (combos.length > 200) {
+      throw new BadRequestException(
+        `That would create ${combos.length} variants; keep it under 200`,
+      );
+    }
+
+    const existing = await this.prisma.product.findMany({
+      where: { parentId, businessId },
+      select: { variantName: true },
+    });
+    const taken = new Set(existing.map((e) => e.variantName));
+
+    const created: ProductDetail[] = [];
+    for (const combo of combos) {
+      const label = Object.values(combo).join(' / ');
+      if (taken.has(label)) continue;
+      const suffix = Object.values(combo)
+        .map((v) => v.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())
+        .join('-');
+      const product = await this.prisma.product.create({
+        data: {
+          businessId,
+          parentId,
+          variantName: label,
+          attributes: combo,
+          name: `${parent.name} - ${label}`,
+          // A variant needs its own SKU; without one on the parent there is
+          // nothing to derive it from, so it is left blank to be filled in.
+          sku: parent.sku ? `${parent.sku}-${suffix}` : null,
+          description: parent.description,
+          brand: parent.brand,
+          imageUrl: parent.imageUrl,
+          unit: parent.unit,
+          costPrice: dto.costPrice ?? parent.costPrice,
+          sellingPrice: dto.sellingPrice ?? parent.sellingPrice,
+          taxId: parent.taxId,
+          taxRate: parent.taxRate,
+          isTaxable: parent.isTaxable,
+          isRxRequired: parent.isRxRequired,
+          trackBatches: parent.trackBatches,
+          trackSerials: parent.trackSerials,
+          reorderLevel: parent.reorderLevel,
+          ...(parent.categories.length
+            ? { categories: { connect: parent.categories.map((c) => ({ id: c.id })) } }
+            : {}),
+        },
+        include: this.detailInclude,
+      });
+      await this.seedStockRows(businessId, product.id);
+      created.push(product);
+    }
+    return { created: created.length, skipped: combos.length - created.length, variants: created };
+  }
+
+  /** The variants of one style, with their per-store stock. */
+  async listVariants(businessId: string, parentId: string) {
+    await this.findOne(businessId, parentId);
+    return this.prisma.product.findMany({
+      where: { parentId, businessId },
+      orderBy: { name: 'asc' },
+      include: {
+        ...this.detailInclude,
+        stockItems: { select: { storeId: true, quantity: true } },
+      },
+    });
+  }
+
+  private async assertParent(businessId: string, parentId: string) {
+    const parent = await this.prisma.product.findFirst({
+      where: { id: parentId, businessId },
+      select: { parentId: true },
+    });
+    if (!parent) throw new BadRequestException('Invalid parent product');
+    if (parent.parentId) {
+      throw new BadRequestException('Variants cannot be nested');
+    }
+  }
+
   // ---- Bulk import / export ----
 
   /** Flattened product rows for CSV export. */
@@ -168,6 +300,8 @@ export class ProductsService {
       sellingPrice: Number(p.sellingPrice),
       taxRate: Number(p.taxRate),
       reorderLevel: p.reorderLevel,
+      variantOf: p.parentId ?? '',
+      variantName: p.variantName ?? '',
       categories: p.categories.map((c) => c.name).join('|'),
       isActive: p.isActive,
     }));
@@ -229,7 +363,13 @@ export class ProductsService {
 
   async remove(businessId: string, id: string) {
     await this.findOne(businessId, id);
-    // Soft delete keeps sales/purchase history intact.
+    // Soft delete keeps sales/purchase history intact. Retiring a style
+    // retires its variants too -- leaving them sellable under a deleted
+    // parent is never what was meant.
+    await this.prisma.product.updateMany({
+      where: { parentId: id, businessId },
+      data: { isActive: false },
+    });
     return this.prisma.product.update({
       where: { id },
       data: { isActive: false },

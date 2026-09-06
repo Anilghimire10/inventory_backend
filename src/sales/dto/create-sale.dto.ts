@@ -34,6 +34,16 @@ export class SaleItemDto {
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
   discount?: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Serial/IMEI of each unit being sold. Required for serialised products at checkout (a held cart may omit them).',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serials?: string[];
 }
 
 export class CreateSaleDto {

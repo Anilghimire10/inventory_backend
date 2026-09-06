@@ -1,6 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Min } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, Min } from 'class-validator';
+import { SerialStatus } from '@prisma/client';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
 export class QueryStockDto extends PaginationDto {
@@ -34,4 +35,22 @@ export class ExpiringDto {
   @IsOptional()
   @IsString()
   storeId?: string;
+}
+
+/** Serial/IMEI lookup: "where is this unit?" and "what does this store hold?" */
+export class QuerySerialsDto extends PaginationDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  productId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  storeId?: string;
+
+  @ApiPropertyOptional({ enum: SerialStatus })
+  @IsOptional()
+  @IsEnum(SerialStatus)
+  status?: SerialStatus;
 }

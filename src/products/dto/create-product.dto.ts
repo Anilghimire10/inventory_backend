@@ -5,6 +5,7 @@ import {
   IsBoolean,
   IsDateString,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
   Min,
@@ -113,4 +114,32 @@ export class CreateProductDto {
   @IsOptional()
   @IsBoolean()
   trackBatches?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Track every unit by serial/IMEI. Purchases and sales of this product must then carry one serial per unit.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  trackSerials?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Make this a variant of another product (usually created via POST /products/:id/variants)',
+  })
+  @IsOptional()
+  @IsString()
+  parentId?: string;
+
+  @ApiPropertyOptional({ description: 'Variant label, e.g. "Red / XL"' })
+  @IsOptional()
+  @IsString()
+  variantName?: string;
+
+  @ApiPropertyOptional({
+    description: 'Options behind the label, e.g. { "Colour": "Red", "Size": "XL" }',
+  })
+  @IsOptional()
+  @IsObject()
+  attributes?: Record<string, string>;
 }

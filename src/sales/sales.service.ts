@@ -87,6 +87,26 @@ export class SalesService {
         }),
       ]);
 
+    // Serialised goods: one scanned serial per unit, checked before the
+    // transaction so a bad scan never half-writes a sale.
+    const serialLines = lines
+      .filter((l) => l.trackSerials)
+      .map((l) => ({
+        productId: l.productId,
+        serials: InventoryService.checkSerials(
+          { name: l.name, trackSerials: true },
+          l.quantity,
+          l.serials,
+        ),
+      }));
+    for (const l of lines.filter((l) => !l.trackSerials)) {
+      InventoryService.checkSerials(
+        { name: l.name, trackSerials: false },
+        l.quantity,
+        l.serials,
+      );
+    }
+
     const requestedMethod = dto.paymentMethod ?? PaymentMethod.CASH;
     // How much is actually paid now. A CREDIT sale defaults to nothing paid;
     // otherwise the full total unless the caller passes a smaller amount.
@@ -166,6 +186,15 @@ export class SalesService {
           storeId,
           batchTracked.map((l) => ({ productId: l.productId, quantity: l.quantity })),
         );
+      }
+      for (const l of serialLines) {
+        await this.inventory.sellSerials(tx, {
+          businessId,
+          storeId,
+          productId: l.productId,
+          saleId: sale.id,
+          serials: l.serials,
+        });
       }
 
       // Any unpaid remainder -> add to the customer's outstanding balance
@@ -314,6 +343,18 @@ export class SalesService {
     }
 
     const itemMap = new Map(sale.items.map((it) => [it.id, it]));
+    const serialised = new Set(
+      (
+        await this.prisma.product.findMany({
+          where: {
+            id: { in: sale.items.map((i) => i.productId) },
+            businessId,
+            trackSerials: true,
+          },
+          select: { id: true },
+        })
+      ).map((p) => p.id),
+    );
     let refund = 0;
     for (const r of dto.items) {
       const item = itemMap.get(r.saleItemId);
@@ -356,6 +397,16 @@ export class SalesService {
           where: { id: item.id },
           data: { returnedQty: { increment: r.quantity } },
         });
+        if (serialised.has(item.productId)) {
+          await this.inventory.returnSerialsToStock(tx, {
+            businessId,
+            storeId: sale.storeId,
+            productId: item.productId,
+            saleId: sale.id,
+            quantity: r.quantity,
+            serials: r.serials,
+          });
+        }
       }
 
       // Fully vs partially returned?
@@ -496,6 +547,9 @@ export class SalesService {
       where: { id, businessId },
       include: {
         items: true,
+        // Serialised units that went out on this sale -- printed on the bill
+        // and used for warranty lookups.
+        serials: { select: { productId: true, serialNumber: true, status: true } },
         customer: true,
         user: { select: { id: true, name: true } },
         store: { select: { id: true, name: true, address: true, phone: true } },
@@ -648,6 +702,8 @@ export class SalesService {
         lineTax,
         lineTotal: round2(lineNet + lineTax),
         trackBatches: product.trackBatches,
+        trackSerials: product.trackSerials,
+        serials: i.serials,
       };
     });
 

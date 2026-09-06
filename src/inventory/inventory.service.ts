@@ -7,6 +7,7 @@ import {
   AdjustmentReason,
   Prisma,
   PrismaClient,
+  SerialStatus,
   StockMovementType,
 } from '@prisma/client';
 import { randomUUID } from 'crypto';
@@ -16,6 +17,7 @@ import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
   ExpiringDto,
   QueryMovementsDto,
+  QuerySerialsDto,
   QueryStockDto,
 } from './dto/query-inventory.dto';
 import { paginate } from '../common/dto/pagination.dto';
@@ -270,7 +272,9 @@ export class InventoryService {
     const items = await this.prisma.stockItem.findMany({
       where: { businessId, ...(storeId ? { storeId } : {}) },
       include: {
-        product: { select: { id: true, name: true, sku: true, reorderLevel: true } },
+        product: {
+          select: { id: true, name: true, sku: true, unit: true, costPrice: true, reorderLevel: true },
+        },
         store: { select: { id: true, name: true } },
       },
     });
@@ -284,6 +288,327 @@ export class InventoryService {
           it.effectiveReorderLevel > 0 &&
           Number(it.quantity) <= it.effectiveReorderLevel,
       );
+  }
+
+  // ---- Serial / IMEI tracking ----
+  //
+  // Serial rows say *which* units are on the shelf; StockItem still owns the
+  // count. The two are kept in step on every path that knows about specific
+  // units (receive, sell, both kinds of return, transfer).
+  //
+  // ponytail: a manual adjustment or a stock take moves the count without
+  // naming units, so those leave the serial list untouched and it can drift
+  // from the StockItem balance. Reconcile against this list if that turns
+  // into a real problem in the shop.
+
+  /**
+   * Validate the serials supplied for one line against its quantity and hand
+   * back the cleaned list. A product that is not serialised must carry none.
+   */
+  static checkSerials(
+    product: { name: string; trackSerials: boolean },
+    quantity: number,
+    serials: string[] | undefined,
+  ): string[] {
+    const cleaned = (serials ?? []).map((v) => v.trim()).filter(Boolean);
+    if (!product.trackSerials) {
+      if (cleaned.length) {
+        throw new BadRequestException(
+          `"${product.name}" is not tracked by serial number`,
+        );
+      }
+      return [];
+    }
+    if (!Number.isInteger(quantity)) {
+      throw new BadRequestException(
+        `"${product.name}" is sold by the unit — its quantity must be a whole number`,
+      );
+    }
+    if (new Set(cleaned).size !== cleaned.length) {
+      throw new BadRequestException(
+        `Duplicate serial numbers for "${product.name}"`,
+      );
+    }
+    if (cleaned.length !== quantity) {
+      throw new BadRequestException(
+        `"${product.name}" needs ${quantity} serial number(s), got ${cleaned.length}`,
+      );
+    }
+    return cleaned;
+  }
+
+  /** Book received units into stock. Rejects a serial already on file. */
+  async receiveSerials(
+    db: Db,
+    input: {
+      businessId: string;
+      storeId: string;
+      productId: string;
+      purchaseId: string;
+      serials: string[];
+    },
+  ) {
+    if (!input.serials.length) return;
+    const known = await db.serial.findMany({
+      where: {
+        businessId: input.businessId,
+        serialNumber: { in: input.serials },
+      },
+      select: { id: true, serialNumber: true, status: true },
+    });
+    // A unit sent back to the supplier can legitimately come back (a repaired
+    // swap, a re-delivery); anything still in stock or sold is a mis-scan.
+    const live = known.find((k) => k.status !== SerialStatus.RETURNED_TO_SUPPLIER);
+    if (live) {
+      throw new BadRequestException(
+        `Serial number "${live.serialNumber}" is already on file`,
+      );
+    }
+    if (known.length) {
+      await db.serial.updateMany({
+        where: { id: { in: known.map((k) => k.id) } },
+        data: {
+          status: SerialStatus.IN_STOCK,
+          storeId: input.storeId,
+          productId: input.productId,
+          purchaseId: input.purchaseId,
+          saleId: null,
+          soldAt: null,
+        },
+      });
+    }
+    const fresh = new Set(known.map((k) => k.serialNumber));
+    const toCreate = input.serials.filter((n) => !fresh.has(n));
+    if (!toCreate.length) return;
+    await db.serial.createMany({
+      data: toCreate.map((serialNumber) => ({
+        businessId: input.businessId,
+        productId: input.productId,
+        storeId: input.storeId,
+        purchaseId: input.purchaseId,
+        serialNumber,
+      })),
+    });
+  }
+
+  /**
+   * Mark units sold. The IN_STOCK guard is what stops the same handset being
+   * rung up twice: a second checkout matches zero rows and is rejected.
+   */
+  async sellSerials(
+    db: Db,
+    input: {
+      businessId: string;
+      storeId: string;
+      productId: string;
+      saleId: string;
+      serials: string[];
+    },
+  ) {
+    if (!input.serials.length) return;
+    const res = await db.serial.updateMany({
+      where: {
+        businessId: input.businessId,
+        productId: input.productId,
+        storeId: input.storeId,
+        serialNumber: { in: input.serials },
+        status: SerialStatus.IN_STOCK,
+      },
+      data: {
+        status: SerialStatus.SOLD,
+        saleId: input.saleId,
+        soldAt: new Date(),
+      },
+    });
+    if (res.count !== input.serials.length) {
+      throw new BadRequestException(
+        'One or more serial numbers are not in stock at this store',
+      );
+    }
+  }
+
+  /**
+   * Customer return: put units back on the shelf. Named serials must belong
+   * to this sale; when none are named the oldest sold units on the sale are
+   * taken, so a return can be processed without re-scanning.
+   */
+  async returnSerialsToStock(
+    db: Db,
+    input: {
+      businessId: string;
+      storeId: string;
+      productId: string;
+      saleId: string;
+      quantity: number;
+      serials?: string[];
+    },
+  ) {
+    const ids = await this.pickSerials(db, {
+      businessId: input.businessId,
+      productId: input.productId,
+      status: SerialStatus.SOLD,
+      saleId: input.saleId,
+      quantity: input.quantity,
+      serials: input.serials,
+    });
+    if (!ids.length) return;
+    await db.serial.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        status: SerialStatus.IN_STOCK,
+        storeId: input.storeId,
+        soldAt: null,
+      },
+    });
+  }
+
+  /** Supplier return: take units off the shelf for good. */
+  async returnSerialsToSupplier(
+    db: Db,
+    input: {
+      businessId: string;
+      productId: string;
+      purchaseId: string;
+      quantity: number;
+      serials?: string[];
+    },
+  ) {
+    const ids = await this.pickSerials(db, {
+      businessId: input.businessId,
+      productId: input.productId,
+      status: SerialStatus.IN_STOCK,
+      purchaseId: input.purchaseId,
+      quantity: input.quantity,
+      serials: input.serials,
+    });
+    if (!ids.length) return;
+    await db.serial.updateMany({
+      where: { id: { in: ids } },
+      data: { status: SerialStatus.RETURNED_TO_SUPPLIER, storeId: null },
+    });
+  }
+
+  /** Follow a store transfer with the units themselves. */
+  async moveSerials(
+    db: Db,
+    input: {
+      businessId: string;
+      productId: string;
+      fromStoreId: string;
+      toStoreId: string;
+      quantity: number;
+    },
+  ) {
+    const units = await db.serial.findMany({
+      where: {
+        businessId: input.businessId,
+        productId: input.productId,
+        storeId: input.fromStoreId,
+        status: SerialStatus.IN_STOCK,
+      },
+      select: { id: true },
+      orderBy: { createdAt: 'asc' },
+      take: input.quantity,
+    });
+    if (units.length < input.quantity) {
+      throw new BadRequestException(
+        'Not enough serialised units in the source store for this transfer',
+      );
+    }
+    await db.serial.updateMany({
+      where: { id: { in: units.map((u) => u.id) } },
+      data: { storeId: input.toStoreId },
+    });
+  }
+
+  /**
+   * Resolve which units a return applies to: the ones the caller named, or
+   * the oldest matching units when they named none.
+   */
+  private async pickSerials(
+    db: Db,
+    input: {
+      businessId: string;
+      productId: string;
+      status: SerialStatus;
+      saleId?: string;
+      purchaseId?: string;
+      quantity: number;
+      serials?: string[];
+    },
+  ) {
+    const scope = {
+      businessId: input.businessId,
+      productId: input.productId,
+      status: input.status,
+      ...(input.saleId ? { saleId: input.saleId } : {}),
+      ...(input.purchaseId ? { purchaseId: input.purchaseId } : {}),
+    };
+    const named = (input.serials ?? []).map((v) => v.trim()).filter(Boolean);
+    if (named.length) {
+      if (named.length !== input.quantity) {
+        throw new BadRequestException(
+          `Returning ${input.quantity} unit(s) needs ${input.quantity} serial number(s), got ${named.length}`,
+        );
+      }
+      const found = await db.serial.findMany({
+        where: { ...scope, serialNumber: { in: named } },
+        select: { id: true },
+      });
+      if (found.length !== named.length) {
+        throw new BadRequestException(
+          'One or more serial numbers do not belong to this transaction',
+        );
+      }
+      return found.map((f) => f.id);
+    }
+    const oldest = await db.serial.findMany({
+      where: scope,
+      select: { id: true },
+      orderBy: { createdAt: 'asc' },
+      take: input.quantity,
+    });
+    if (oldest.length < input.quantity) {
+      throw new BadRequestException(
+        'Not enough serialised units to return; supply the serial numbers explicitly',
+      );
+    }
+    return oldest.map((o) => o.id);
+  }
+
+  /** Where is unit X? Search by serial, or list what a product/store holds. */
+  async listSerials(businessId: string, q: QuerySerialsDto) {
+    const where: Prisma.SerialWhereInput = {
+      businessId,
+      ...(q.productId ? { productId: q.productId } : {}),
+      ...(q.storeId ? { storeId: q.storeId } : {}),
+      ...(q.status ? { status: q.status } : {}),
+      ...(q.search
+        ? { serialNumber: { contains: q.search, mode: 'insensitive' } }
+        : {}),
+    };
+    const [data, total] = await Promise.all([
+      this.prisma.serial.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        include: {
+          product: { select: { id: true, name: true, sku: true } },
+          store: { select: { id: true, name: true } },
+          sale: {
+            select: {
+              id: true,
+              receiptNo: true,
+              createdAt: true,
+              customer: { select: { id: true, name: true, phone: true } },
+            },
+          },
+        },
+        orderBy: { updatedAt: 'desc' },
+      }),
+      this.prisma.serial.count({ where }),
+    ]);
+    return paginate(data, total, q.page, q.limit);
   }
 
   async expiringBatches(businessId: string, q: ExpiringDto) {
@@ -344,7 +669,7 @@ export class InventoryService {
       this.prisma.store.findFirst({ where: { id: dto.toStoreId, businessId } }),
       this.prisma.product.findMany({
         where: { id: { in: productIds }, businessId },
-        select: { id: true, name: true, trackBatches: true },
+        select: { id: true, name: true, trackBatches: true, trackSerials: true },
       }),
     ]);
     if (!from) throw new NotFoundException('Source store not found');
@@ -354,6 +679,9 @@ export class InventoryService {
     }
     const tracked = new Set(
       products.filter((p) => p.trackBatches).map((p) => p.id),
+    );
+    const serialised = new Set(
+      products.filter((p) => p.trackSerials).map((p) => p.id),
     );
     const reference = `TRF-${randomUUID()}`;
 
@@ -386,6 +714,17 @@ export class InventoryService {
           },
         ]),
       );
+      // Serialised goods: the units themselves follow the quantity, so a
+      // later sale at the destination store can still find them in stock.
+      for (const i of dto.items.filter((i) => serialised.has(i.productId))) {
+        await this.moveSerials(tx, {
+          businessId,
+          productId: i.productId,
+          fromStoreId: dto.fromStoreId,
+          toStoreId: dto.toStoreId,
+          quantity: i.quantity,
+        });
+      }
       const batchLines = dto.items.filter((i) => tracked.has(i.productId));
       if (batchLines.length) {
         await this.moveBatchesFEFO(

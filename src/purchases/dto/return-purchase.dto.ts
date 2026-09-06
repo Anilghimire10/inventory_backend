@@ -19,6 +19,16 @@ export class ReturnPurchaseItemDto {
   @IsNumber({ maxDecimalPlaces: 3 })
   @IsPositive()
   quantity: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Which serialised units are going back. Defaults to the oldest units this purchase brought in.',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serials?: string[];
 }
 
 /** Purchase return / debit note: goods going back to the supplier. */

@@ -13,6 +13,7 @@ import { InventoryService } from '../inventory/inventory.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { ReturnPurchaseDto } from './dto/return-purchase.dto';
+import { ReceivePurchaseDto } from './dto/receive-purchase.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 
@@ -51,6 +52,24 @@ export class PurchasesService {
     // Paid in full by default; pass a smaller amountPaid to buy on credit.
     const amountPaid = Math.min(Math.max(dto.amountPaid ?? total, 0), total);
     const receiveNow = dto.receiveNow !== false;
+
+    // Serials only make sense for goods actually arriving; a draft order
+    // captures them later, on POST /purchases/:id/receive.
+    if (!receiveNow) {
+      if (dto.items.some((i) => i.serials?.length)) {
+        throw new BadRequestException(
+          'Serial numbers are captured when the purchase is received',
+        );
+      }
+    } else {
+      for (const i of dto.items) {
+        InventoryService.checkSerials(
+          productMap.get(i.productId)!,
+          i.quantity,
+          i.serials,
+        );
+      }
+    }
 
     return this.prisma.$transaction(async (tx) => {
       const purchase = await tx.purchase.create({
@@ -106,6 +125,18 @@ export class PurchasesService {
     if (existing.items.some((i) => Number(i.returnedQty) > 0)) {
       throw new BadRequestException(
         'A purchase with a supplier return cannot be edited',
+      );
+    }
+    // ponytail: editing rebuilds the lines, which would orphan the units this
+    // purchase booked in (some may already be sold). Blocked rather than
+    // reconciled — return to the supplier or adjust instead. Revisit if shops
+    // start editing serialised purchases often.
+    const serialCount = await this.prisma.serial.count({
+      where: { purchaseId: id },
+    });
+    if (serialCount > 0) {
+      throw new BadRequestException(
+        'A purchase with serial numbers cannot be edited — return the units to the supplier instead',
       );
     }
 
@@ -227,8 +258,11 @@ export class PurchasesService {
     }, TX_OPTS);
   }
 
-  /** Receive a draft purchase: add stock, create batches, update cost. */
-  async receive(businessId: string, id: string) {
+  /**
+   * Receive a draft purchase: add stock, create batches, update cost. Lines
+   * for serialised products must carry one scanned serial/IMEI per unit.
+   */
+  async receive(businessId: string, id: string, dto: ReceivePurchaseDto = {}) {
     const purchase = await this.prisma.purchase.findFirst({
       where: { id, businessId },
       include: { items: true },
@@ -240,6 +274,26 @@ export class PurchasesService {
     if (purchase.status === PurchaseStatus.CANCELLED) {
       throw new BadRequestException('Purchase was cancelled');
     }
+
+    // Validate every line's serials before any stock moves.
+    const products = await this.prisma.product.findMany({
+      where: { id: { in: purchase.items.map((i) => i.productId) }, businessId },
+      select: { id: true, name: true, trackSerials: true },
+    });
+    const productMap = new Map(products.map((p) => [p.id, p]));
+    const scanned = new Map(
+      (dto.items ?? []).map((i) => [i.purchaseItemId, i.serials]),
+    );
+    const serialsByItem = new Map(
+      purchase.items.map((item) => [
+        item.id,
+        InventoryService.checkSerials(
+          productMap.get(item.productId)!,
+          Number(item.quantity),
+          scanned.get(item.id),
+        ),
+      ]),
+    );
 
     return this.prisma.$transaction(async (tx) => {
       // Atomically claim the DRAFT -> RECEIVED transition before touching
@@ -265,6 +319,13 @@ export class PurchasesService {
           reference: purchase.id,
         });
         await this.createBatchIfNeeded(tx, businessId, purchase.storeId, item);
+        await this.inventory.receiveSerials(tx, {
+          businessId,
+          storeId: purchase.storeId,
+          productId: item.productId,
+          purchaseId: purchase.id,
+          serials: serialsByItem.get(item.id) ?? [],
+        });
         await tx.product.update({
           where: { id: item.productId },
           data: { costPrice: item.costPrice },
@@ -305,6 +366,18 @@ export class PurchasesService {
     }
 
     const itemMap = new Map(purchase.items.map((it) => [it.id, it]));
+    const serialised = new Set(
+      (
+        await this.prisma.product.findMany({
+          where: {
+            id: { in: purchase.items.map((i) => i.productId) },
+            businessId,
+            trackSerials: true,
+          },
+          select: { id: true },
+        })
+      ).map((p) => p.id),
+    );
     let value = 0;
     for (const r of dto.items) {
       const item = itemMap.get(r.purchaseItemId);
@@ -355,6 +428,15 @@ export class PurchasesService {
           batchNumber: item.batchNumber,
           expiryDate: item.expiryDate,
         });
+        if (serialised.has(item.productId)) {
+          await this.inventory.returnSerialsToSupplier(tx, {
+            businessId,
+            productId: item.productId,
+            purchaseId: purchase.id,
+            quantity: r.quantity,
+            serials: r.serials,
+          });
+        }
       }
 
       const updated = await tx.purchase.update({
@@ -447,6 +529,131 @@ export class PurchasesService {
     };
   }
 
+  /**
+   * Items at or below their reorder level, grouped into one draft order per
+   * (store, supplier). Supplier is the one on that product's most recent
+   * purchase -- products never bought land in the "no supplier" group. Cost is
+   * the last price paid, falling back to the product's cost price.
+   */
+  async reorderSuggestions(businessId: string, storeId?: string) {
+    const low = await this.inventory.lowStock(businessId, storeId);
+    if (!low.length) return [];
+
+    // Newest first, so the first row seen for a product is its last purchase.
+    const history = await this.prisma.purchaseItem.findMany({
+      where: {
+        productId: { in: low.map((it) => it.productId) },
+        purchase: { businessId },
+      },
+      select: {
+        productId: true,
+        costPrice: true,
+        purchase: {
+          select: {
+            createdAt: true,
+            supplier: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { purchase: { createdAt: 'desc' } },
+    });
+    const last = new Map<string, (typeof history)[number]>();
+    for (const h of history) if (!last.has(h.productId)) last.set(h.productId, h);
+
+    type Group = {
+      storeId: string;
+      storeName: string;
+      supplierId: string | null;
+      supplierName: string | null;
+      items: {
+        productId: string;
+        name: string;
+        sku: string | null;
+        unit: string;
+        onHand: number;
+        reorderLevel: number;
+        quantity: number;
+        costPrice: number;
+        lastPurchasedAt: Date | null;
+      }[];
+      total: number;
+    };
+    const groups = new Map<string, Group>();
+
+    for (const it of low) {
+      const prev = last.get(it.productId);
+      const supplier = prev?.purchase.supplier ?? null;
+      const key = `${it.storeId}|${supplier?.id ?? ''}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          storeId: it.storeId,
+          storeName: it.store.name,
+          supplierId: supplier?.id ?? null,
+          supplierName: supplier?.name ?? null,
+          items: [],
+          total: 0,
+        };
+        groups.set(key, g);
+      }
+      const onHand = Number(it.quantity);
+      // ponytail: par level = 2x the reorder point. Swap for demand-based
+      // forecasting if turnover varies a lot between products.
+      const quantity = round3(
+        Math.max(it.effectiveReorderLevel * 2 - onHand, 1),
+      );
+      const costPrice = round2(
+        Number(prev?.costPrice ?? it.product.costPrice),
+      );
+      g.items.push({
+        productId: it.productId,
+        name: it.product.name,
+        sku: it.product.sku,
+        unit: it.product.unit,
+        onHand,
+        reorderLevel: it.effectiveReorderLevel,
+        quantity,
+        costPrice,
+        lastPurchasedAt: prev?.purchase.createdAt ?? null,
+      });
+      g.total = round2(g.total + quantity * costPrice);
+    }
+    return [...groups.values()];
+  }
+
+  /**
+   * Turn the suggestions above into real DRAFT purchases (nothing is received
+   * and nothing is paid). Narrow with storeId/supplierId to draft just one.
+   */
+  async createReorderDrafts(
+    businessId: string,
+    opts: { storeId?: string; supplierId?: string },
+  ) {
+    const groups = (await this.reorderSuggestions(businessId, opts.storeId))
+      .filter((g) => !opts.supplierId || g.supplierId === opts.supplierId);
+    if (!groups.length) {
+      throw new BadRequestException('Nothing is below its reorder level');
+    }
+    const drafts: Awaited<ReturnType<typeof this.create>>[] = [];
+    for (const g of groups) {
+      drafts.push(
+        await this.create(businessId, {
+          storeId: g.storeId,
+          supplierId: g.supplierId ?? undefined,
+          note: 'Auto-generated from low stock',
+          receiveNow: false,
+          amountPaid: 0,
+          items: g.items.map((i) => ({
+            productId: i.productId,
+            quantity: i.quantity,
+            costPrice: i.costPrice,
+          })),
+        }),
+      );
+    }
+    return drafts;
+  }
+
   // ---- helpers ----
 
   private async receiveItems(
@@ -472,6 +679,13 @@ export class PurchasesService {
         costPrice: new Prisma.Decimal(item.costPrice),
         batchNumber: item.batchNumber ?? null,
         expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
+      });
+      await this.inventory.receiveSerials(tx, {
+        businessId,
+        storeId,
+        productId: item.productId,
+        purchaseId,
+        serials: item.serials ?? [],
       });
       await tx.product.update({
         where: { id: item.productId },

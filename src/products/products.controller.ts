@@ -18,6 +18,7 @@ import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
+import { GenerateVariantsDto } from './dto/generate-variants.dto';
 import {
   PRODUCT_PUBLIC_PREFIX,
   productImageMulterOptions,
@@ -82,6 +83,23 @@ export class ProductsController {
   @Get(':id')
   findOne(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.products.findOne(u.businessId, id);
+  }
+
+  /** The variants of one style (size/colour rows under a parent product). */
+  @Get(':id/variants')
+  variants(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.products.listVariants(u.businessId, id);
+  }
+
+  /** Bulk-create variants: one product per combination of the given options. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
+  @Post(':id/variants')
+  generateVariants(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: GenerateVariantsDto,
+  ) {
+    return this.products.generateVariants(u.businessId, id, dto);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)

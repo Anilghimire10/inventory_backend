@@ -6,6 +6,7 @@ import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
   ExpiringDto,
   QueryMovementsDto,
+  QuerySerialsDto,
   QueryStockDto,
 } from './dto/query-inventory.dto';
 import { UserRole } from '@prisma/client';
@@ -32,6 +33,12 @@ export class InventoryController {
   @Get('expiring')
   expiring(@CurrentUser() u: AuthUser, @Query() q: ExpiringDto) {
     return this.inventory.expiringBatches(u.businessId, q);
+  }
+
+  /** Serial/IMEI register: search a serial, or list a product's/store's units. */
+  @Get('serials')
+  serials(@CurrentUser() u: AuthUser, @Query() q: QuerySerialsDto) {
+    return this.inventory.listSerials(u.businessId, q);
   }
 
   @Get('movements')
