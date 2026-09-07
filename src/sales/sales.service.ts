@@ -210,13 +210,12 @@ export class SalesService {
   }
 
   /**
-   * nextReceiptNo() derives the next number from a plain COUNT with no
-   * locking, so two checkouts for the same business at the same instant can
-   * compute the same receipt number -- the second's insert then hits the
-   * (businessId, receiptNo) unique constraint. Rather than lock/serialize
-   * every checkout for that, just retry: recomputing the count and
-   * re-running the transaction on the rare collision is cheap and keeps the
-   * common case fully concurrent.
+   * nextReceiptNo() reads the current max with no locking, so two checkouts
+   * for the same business at the same instant can compute the same receipt
+   * number -- the second's insert then hits the (businessId, receiptNo)
+   * unique constraint. Rather than lock/serialize every checkout for that,
+   * just retry: recomputing the max and re-running the transaction on the
+   * rare collision is cheap and keeps the common case fully concurrent.
    */
   private async createWithReceiptRetry<T>(run: () => Promise<T>): Promise<T> {
     const MAX_ATTEMPTS = 5;
@@ -569,10 +568,25 @@ export class SalesService {
 
   // ---- helpers ----
 
-  /** Per-business sequential receipt number, e.g. INV-000042. */
+  /**
+   * Per-business sequential receipt number, e.g. INV-000042.
+   *
+   * Derived from the highest INV- number actually issued, not a row count --
+   * a plain count drifts from the real sequence as soon as any row that
+   * isn't a real receipt is created and later deleted (a held sale is a Sale
+   * row too, and discarding/resuming one deletes it), permanently wedging
+   * every future checkout on a repeatable unique-constraint collision.
+   * Fixed-width zero-padding keeps lexicographic (`orderBy`) and numeric
+   * order the same up to 999999 receipts.
+   */
   private async nextReceiptNo(tx: Prisma.TransactionClient, businessId: string) {
-    const count = await tx.sale.count({ where: { businessId } });
-    return `INV-${String(count + 1).padStart(6, '0')}`;
+    const last = await tx.sale.findFirst({
+      where: { businessId, receiptNo: { startsWith: 'INV-' } },
+      orderBy: { receiptNo: 'desc' },
+      select: { receiptNo: true },
+    });
+    const next = last ? Number(last.receiptNo.slice(4)) + 1 : 1;
+    return `INV-${String(next).padStart(6, '0')}`;
   }
 
   /**

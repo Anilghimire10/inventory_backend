@@ -15,6 +15,7 @@ import { paginate } from '../common/dto/pagination.dto';
 const DETAIL_INCLUDE = {
   categories: { select: { id: true, name: true } },
   tax: { select: { id: true, name: true, rate: true } },
+  _count: { select: { variants: { where: { isActive: true } } } },
 } satisfies Prisma.ProductInclude;
 
 type ProductDetail = Prisma.ProductGetPayload<{ include: typeof DETAIL_INCLUDE }>;
@@ -261,7 +262,7 @@ export class ProductsService {
   async listVariants(businessId: string, parentId: string) {
     await this.findOne(businessId, parentId);
     return this.prisma.product.findMany({
-      where: { parentId, businessId },
+      where: { parentId, businessId, isActive: true },
       orderBy: { name: 'asc' },
       include: {
         ...this.detailInclude,

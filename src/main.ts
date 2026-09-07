@@ -12,6 +12,13 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const config = app.get(ConfigService);
 
+  // Without this, PrismaService.onModuleDestroy() never fires on SIGTERM/SIGINT
+  // (including the restart `nest start --watch` does on every save), so each
+  // restart leaks its old Prisma connections instead of releasing them --
+  // against Supabase's session-mode pooler (hard-capped at 15 clients), that
+  // adds up fast and starves everyone else with "max clients reached".
+  app.enableShutdownHooks();
+
   // Allow larger JSON bodies for bulk product imports (default is ~100kb).
   const bodyLimit = config.get<string>("BODY_LIMIT") ?? "8mb";
   app.use(json({ limit: bodyLimit }));
