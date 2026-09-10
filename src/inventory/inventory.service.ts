@@ -22,6 +22,7 @@ import {
 } from './dto/query-inventory.dto';
 import { paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+import { allowsFraction } from '../common/units';
 
 /** Quantities are numeric(12,3); keep JS float arithmetic on that grid. */
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
@@ -47,6 +48,39 @@ export class InventoryService {
   constructor(private prisma: PrismaService) {}
 
   /**
+   * Discrete goods (pcs, box, pair) must move in whole numbers; measured ones
+   * (kg, l, m) may move in fractions. Enforced here rather than in each DTO
+   * because every stock change in the app routes through applyMovement or
+   * applyMovementsBatch, so sales, purchases, transfers, adjustments and stock
+   * takes all inherit it from one place.
+   *
+   * Costs nothing on the common path: a movement of whole units is valid
+   * whatever the product's unit is, so the lookup only happens once a fraction
+   * actually shows up.
+   */
+  private async assertFractionsAllowed(db: Db, inputs: MovementInput[]) {
+    const fractional = inputs.filter(
+      (i) => !Number.isInteger(round3(i.quantity)),
+    );
+    if (fractional.length === 0) return;
+
+    const products = await db.product.findMany({
+      where: { id: { in: [...new Set(fractional.map((i) => i.productId))] } },
+      select: { id: true, name: true, unit: true },
+    });
+    const byId = new Map(products.map((p) => [p.id, p]));
+
+    for (const inp of fractional) {
+      const product = byId.get(inp.productId);
+      if (product && !allowsFraction(product.unit)) {
+        throw new BadRequestException(
+          `"${product.name}" is sold by the ${product.unit} — its quantity must be a whole number`,
+        );
+      }
+    }
+  }
+
+  /**
    * The single source of truth for every stock change. Updates the
    * per-store StockItem balance and writes an audit StockMovement row.
    * Accepts a transaction client so callers (sales, purchases) can make
@@ -59,6 +93,7 @@ export class InventoryService {
   ) {
     const { businessId, storeId, productId, quantity } = input;
     const allowNegative = opts.allowNegative ?? false;
+    await this.assertFractionsAllowed(db, [input]);
 
     // Make sure the row exists (upsert is atomic against concurrent
     // creates -- the DB unique constraint on storeId+productId resolves
@@ -122,6 +157,9 @@ export class InventoryService {
     inputs: MovementInput[],
     opts: { allowNegative?: boolean } = {},
   ) {
+    if (inputs.length === 0) return;
+    await this.assertFractionsAllowed(db, inputs);
+
     const keyOf = (storeId: string, productId: string) => `${storeId}:${productId}`;
 
     // Net delta per (store, product) -- a sale can list the same product on

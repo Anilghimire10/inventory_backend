@@ -257,7 +257,7 @@ model Product {
   brand        String?
   imageUrl     String? // path to a locally-stored image, e.g. /api/uploads/products/<file>
   expiryDate   DateTime? // product-level expiry (separate from per-batch expiry)
-  unit         String     @default("pcs")
+  unit         String     @default("pcs") // canonical set, DB CHECK Product_unit_check; kg/g/l/ml/m/ft sell fractionally, the rest whole
   costPrice    Decimal    @default(0) @db.Decimal(12, 2)
   sellingPrice Decimal    @default(0) @db.Decimal(12, 2)
   taxRate      Decimal    @default(0) @db.Decimal(5, 2)
