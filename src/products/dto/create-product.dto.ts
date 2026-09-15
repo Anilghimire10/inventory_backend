@@ -1,9 +1,11 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import {
   ArrayUnique,
   IsArray,
   IsBoolean,
   IsDateString,
+  IsIn,
   IsNumber,
   IsObject,
   IsOptional,
@@ -11,6 +13,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
+import { UNITS, normalizeUnit } from '../../common/units';
 
 export class CreateProductDto {
   @ApiProperty()
@@ -60,9 +63,18 @@ export class CreateProductDto {
   @IsDateString()
   expiryDate?: string;
 
-  @ApiPropertyOptional({ default: 'pcs' })
+  @ApiPropertyOptional({
+    default: 'pcs',
+    enum: UNITS,
+    description:
+      'Unit of sale. Discrete units (pcs, box, pkt, dozen, pair) may only be ' +
+      'sold in whole numbers; measured ones (kg, g, l, ml, m, ft) accept ' +
+      'fractions to 3 decimal places. Common spellings such as "Kg" or ' +
+      '"litre" are accepted and stored canonical.',
+  })
   @IsOptional()
-  @IsString()
+  @Transform(({ value }) => normalizeUnit(value) ?? value)
+  @IsIn(UNITS)
   unit?: string;
 
   @ApiPropertyOptional({ default: 0 })

@@ -11,6 +11,7 @@ import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { GenerateVariantsDto } from './dto/generate-variants.dto';
 import { paginate } from '../common/dto/pagination.dto';
+import { normalizeUnit } from '../common/units';
 
 const DETAIL_INCLUDE = {
   categories: { select: { id: true, name: true } },
@@ -335,7 +336,7 @@ export class ProductsService {
           name,
           barcode: str(it.barcode) || null,
           brand: str(it.brand) || null,
-          unit: str(it.unit) || 'pcs',
+          unit: normalizeUnit(it.unit) ?? 'pcs',
           costPrice: num(it.costPrice),
           sellingPrice: num(it.sellingPrice),
           taxRate: num(it.taxRate),

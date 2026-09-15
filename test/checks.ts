@@ -14,6 +14,7 @@ import { PurchasesService } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
+import { allowsFraction, normalizeUnit } from '../src/common/units';
 
 const stub = <T>(impl: unknown) => impl as T;
 const user: AuthUser = {
@@ -275,12 +276,73 @@ async function serialRulesGuardEveryUnit() {
   );
 }
 
+/**
+ * Discrete goods must move in whole numbers, measured ones may not. The guard
+ * lives in the shared movement path, so this covers sales, purchases,
+ * transfers, adjustments and stock takes at once.
+ */
+async function unitsGovernFractionalQuantities() {
+  // Spellings people actually type fold onto the canonical set.
+  assert.strictEqual(normalizeUnit(' Kg '), 'kg');
+  assert.strictEqual(normalizeUnit('litre'), 'l');
+  assert.strictEqual(normalizeUnit('pieces'), 'pcs');
+  // Anything unreadable is not silently treated as a weight.
+  assert.strictEqual(normalizeUnit('sack'), null);
+  assert.strictEqual(allowsFraction('sack'), false);
+  assert.strictEqual(allowsFraction('kg'), true);
+  assert.strictEqual(allowsFraction('pcs'), false);
+
+  const products = [
+    { id: 'rice', name: 'Rice', unit: 'kg' },
+    { id: 'phone', name: 'Phone', unit: 'pcs' },
+  ];
+  const prisma = stub<PrismaService>({
+    product: {
+      findMany: async ({ where }: any) =>
+        products.filter((p) => where.id.in.includes(p.id)),
+    },
+    stockItem: { upsert: async () => ({}), createMany: async () => ({}) },
+    stockMovement: { create: async () => ({}), createMany: async () => ({}) },
+    $queryRaw: async () => [
+      { storeId: 's1', productId: 'rice', quantity: 10 as any },
+    ],
+  });
+  const inventory = new InventoryService(prisma);
+  const line = (productId: string, quantity: number) => ({
+    businessId: 'b1',
+    storeId: 's1',
+    productId,
+    type: 'SALE' as any,
+    quantity,
+  });
+
+  // 0.5 kg of rice is a sale; 0.5 of a phone is a bug.
+  await inventory.applyMovement(prisma as any, line('rice', -0.5));
+  await assert.rejects(
+    inventory.applyMovement(prisma as any, line('phone', -0.5)),
+    /whole number/,
+    'a discrete product cannot move in fractions',
+  );
+
+  // The batch path nets deltas per product before writing, so it has to
+  // validate the raw lines: 0.5 + 0.5 of a phone nets to a passing 1.
+  await assert.rejects(
+    inventory.applyMovementsBatch(prisma as any, [
+      line('phone', -0.5),
+      line('phone', -0.5),
+    ]),
+    /whole number/,
+    'two fractional lines that net to a whole number are still rejected',
+  );
+}
+
 async function main() {
   await shiftReportBalancesTheDrawer();
   await stockTakePreviewComputesVariances();
   await reorderSuggestionsGroupBySupplier();
   await variantGenerationCoversEveryCombination();
   await serialRulesGuardEveryUnit();
+  await unitsGovernFractionalQuantities();
   console.log('checks passed');
 }
 
