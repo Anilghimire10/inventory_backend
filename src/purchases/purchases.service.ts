@@ -10,7 +10,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
-import { CreatePurchaseDto } from './dto/create-purchase.dto';
+import { CreatePurchaseDto, PurchaseItemDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { ReturnPurchaseDto } from './dto/return-purchase.dto';
 import { ReceivePurchaseDto } from './dto/receive-purchase.dto';
@@ -140,7 +140,7 @@ export class PurchasesService {
       );
     }
 
-    const items = dto.items ?? existing.items.map((i) => ({
+    const items: PurchaseItemDto[] = dto.items ?? existing.items.map((i) => ({
       productId: i.productId,
       quantity: Number(i.quantity),
       costPrice: Number(i.costPrice),
@@ -189,7 +189,12 @@ export class PurchasesService {
               note: 'Purchase edited — original stock reversed',
             });
             await this.reverseBatchIfNeeded(tx, existing.storeId, item);
-          } catch {
+          } catch (err) {
+            // Only an insufficient-stock rejection means "already sold or
+            // moved". A bare `catch {}` here relabelled *every* failure --
+            // a dropped connection, a constraint violation -- as that, which
+            // sent people hunting for stock movements that never happened.
+            if (!(err instanceof BadRequestException)) throw err;
             throw new BadRequestException(
               'Cannot edit: some of this purchase’s stock has already been sold or moved',
             );
@@ -395,6 +400,15 @@ export class PurchasesService {
     value = round2(value);
     const newSubtotal = round2(Number(purchase.subtotal) - value);
     const newTotal = round2(Number(purchase.total) - value);
+    // Returning goods shrinks what is owed, but the money already handed over
+    // doesn't shrink with it. Without clamping, a return against a fully-paid
+    // purchase left amountPaid above total and `outstanding` went negative --
+    // a nonsense balance that reads as "the supplier owes us" everywhere it
+    // is displayed. Clamp it, and report the excess as what it is: money the
+    // supplier now owes back, which is settled outside this record.
+    const paidBefore = Number(purchase.amountPaid);
+    const newAmountPaid = round2(Math.min(paidBefore, Math.max(newTotal, 0)));
+    const refundDueFromSupplier = round2(paidBefore - newAmountPaid);
 
     return this.prisma.$transaction(async (tx) => {
       // Guarded: stock cannot go negative, so goods already sold on cannot be
@@ -418,10 +432,24 @@ export class PurchasesService {
 
       for (const r of dto.items) {
         const item = itemMap.get(r.purchaseItemId)!;
-        await tx.purchaseItem.update({
-          where: { id: item.id },
-          data: { returnedQty: { increment: r.quantity } },
-        });
+        // Guarded increment — same reasoning as the sale-return path: the
+        // returnable check above ran against a snapshot read before this
+        // transaction, so two concurrent returns of the same line would both
+        // pass it and over-return the line. The `<= quantity` test here is
+        // evaluated against the locked row, so the second one matches nothing.
+        const delta = String(round3(r.quantity));
+        const bumped = await tx.$queryRaw<{ id: string }[]>`
+          UPDATE "PurchaseItem"
+          SET "returnedQty" = "returnedQty" + ${delta}::numeric
+          WHERE id = ${item.id}
+            AND "returnedQty" + ${delta}::numeric <= quantity
+          RETURNING id
+        `;
+        if (bumped.length === 0) {
+          throw new BadRequestException(
+            'Cannot return this line — it was returned by someone else just now',
+          );
+        }
         await this.reverseBatchIfNeeded(tx, purchase.storeId, {
           productId: item.productId,
           quantity: r.quantity,
@@ -444,6 +472,7 @@ export class PurchasesService {
         data: {
           subtotal: newSubtotal,
           total: newTotal,
+          amountPaid: newAmountPaid,
           note: dto.note ?? purchase.note,
         },
         include: { items: true },
@@ -456,6 +485,7 @@ export class PurchasesService {
           ),
         },
         returnedValue: value,
+        refundDueFromSupplier,
       };
     }, TX_OPTS);
   }
@@ -662,7 +692,7 @@ export class PurchasesService {
     storeId: string,
     purchaseId: string,
     dto: CreatePurchaseDto,
-    productMap: Map<string, { id: string }>,
+    _productMap: Map<string, { id: string }>,
   ) {
     for (const item of dto.items) {
       await this.inventory.applyMovement(tx, {

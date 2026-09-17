@@ -8,8 +8,8 @@ import { AuthUser } from '../types/auth-user';
  */
 export const CurrentUser = createParamDecorator(
   (data: keyof AuthUser | undefined, ctx: ExecutionContext) => {
-    const request = ctx.switchToHttp().getRequest();
-    const user: AuthUser = request.user;
+    const request = ctx.switchToHttp().getRequest<{ user?: AuthUser }>();
+    const user = request.user;
     return data ? user?.[data] : user;
   },
 );

@@ -73,7 +73,9 @@ export class CreateProductDto {
       '"litre" are accepted and stored canonical.',
   })
   @IsOptional()
-  @Transform(({ value }) => normalizeUnit(value) ?? value)
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? (normalizeUnit(value) ?? value) : value,
+  )
   @IsIn(UNITS)
   unit?: string;
 

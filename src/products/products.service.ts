@@ -321,7 +321,16 @@ export class ProductsService {
       const n = Number(v);
       return Number.isFinite(n) && n >= 0 ? n : 0;
     };
-    const str = (v: unknown) => (v == null ? '' : String(v).trim());
+    // Objects/arrays have no sensible cell value -- String() would silently
+    // stringify them to "[object Object]" and import that as the product name.
+    // Treated as blank so the row fails validation and is reported instead.
+    const str = (v: unknown) => {
+      if (typeof v === 'string') return v.trim();
+      if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint') {
+        return String(v);
+      }
+      return '';
+    };
 
     let created = 0;
     let updated = 0;

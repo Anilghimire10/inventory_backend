@@ -530,8 +530,19 @@ async function main() {
             ? `RX-${10000 + Math.floor(rand() * 90000)}`
             : null,
         note: status === SaleStatus.HELD ? 'Held at counter — customer will return.' : null,
+        // A RETURNED sale has to say so on its lines too, not just in `status`.
+        // The reports net returns at line level (quantity - returnedQty), so a
+        // sale flagged RETURNED with returnedQty still 0 gets counted as fully
+        // sold by the tax and analytics reports while the sale-level figures
+        // treat it as fully refunded -- the two disagree about the same sale.
+        refundedTotal: status === SaleStatus.RETURNED ? total : 0,
         createdAt,
-        items: { create: saleItems },
+        items: {
+          create: saleItems.map((it) => ({
+            ...it,
+            returnedQty: status === SaleStatus.RETURNED ? it.quantity : 0,
+          })),
+        },
       },
     });
 

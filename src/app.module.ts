@@ -7,6 +7,7 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { PrismaModule } from './prisma/prisma.module';
 import { HealthController } from './health.controller';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
+import { validateEnv } from './common/env.validation';
 import { RolesGuard } from './common/guards/roles.guard';
 
 import { AuditModule } from './audit/audit.module';
@@ -32,7 +33,7 @@ import { ShiftsModule } from './shifts/shifts.module';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
+    ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
     // Cron scheduling (daily low-stock digest, etc.)
     ScheduleModule.forRoot(),
     // Global rate limiting — tune for prod via THROTTLE_TTL (ms) / THROTTLE_LIMIT.

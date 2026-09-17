@@ -44,7 +44,22 @@ export class MailService {
     };
   }
 
+  /**
+   * Where mail goes. 'log' writes the message to the application log and
+   * sends nothing — the point of it is local development, where Resend's
+   * sandbox 403s every recipient that isn't the account owner's own address,
+   * so a signup or reset for any test address fills the log with failures and
+   * the code never arrives. validateEnv() refuses this value in production.
+   */
+  private transport() {
+    return (this.config.get<string>('MAIL_TRANSPORT') ?? 'resend').toLowerCase();
+  }
+
   async send({ to, subject, html }: SendArgs) {
+    if (this.transport() === 'log') {
+      this.logger.log(`[mail:log] to=${to} subject="${subject}" (not sent)`);
+      return;
+    }
     const { apiKey, from, fromName, url } = this.cfg();
 
     const res = await fetch(url, {

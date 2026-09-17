@@ -29,15 +29,22 @@ export class AuditInterceptor implements NestInterceptor {
   constructor(private audit: AuditService) {}
 
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
-    const req = context.switchToHttp().getRequest();
-    const method: string = req.method;
+    const req = context.switchToHttp().getRequest<{
+      method: string;
+      user?: AuthUser;
+      path?: string;
+      url?: string;
+      params?: { id?: string };
+      ip?: string;
+    }>();
+    const method = req.method;
     if (!MUTATING.has(method)) return next.handle();
 
-    const user = req.user as AuthUser | undefined;
+    const user = req.user;
     if (!user?.businessId) return next.handle();
 
     // e.g. "/api/products/abc" -> segments ["products", "abc"]
-    const path: string = req.path ?? req.url ?? '';
+    const path = req.path ?? req.url ?? '';
     const segments = path.replace(/^\/api\/?/, '').split('/').filter(Boolean);
     const entity = segments[0] ?? 'unknown';
 

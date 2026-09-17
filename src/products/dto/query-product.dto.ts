@@ -20,7 +20,9 @@ export class QueryProductDto extends PaginationDto {
     description: 'Return exactly these product IDs (e.g. a POS favorites grid)',
   })
   @IsOptional()
-  @Transform(({ value }) => (Array.isArray(value) ? value : [value]))
+  @Transform(({ value }: { value: unknown }) =>
+    Array.isArray(value) ? (value as string[]) : [value],
+  )
   @IsArray()
   @IsString({ each: true })
   ids?: string[];

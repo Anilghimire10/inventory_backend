@@ -18,7 +18,7 @@ import { CreateSaleDto, SaleItemDto } from './dto/create-sale.dto';
 import { HoldSaleDto } from './dto/hold-sale.dto';
 import { ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
-import { PaginationDto, paginate } from '../common/dto/pagination.dto';
+import { paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 
 /** Fields `create()` and `hold()` share to price out a cart. */
@@ -392,10 +392,26 @@ export class SalesService {
       );
       for (const r of dto.items) {
         const item = itemMap.get(r.saleItemId)!;
-        await tx.saleItem.update({
-          where: { id: item.id },
-          data: { returnedQty: { increment: r.quantity } },
-        });
+        // Guarded increment, same shape as the stock path: the
+        // `returnedQty + delta <= quantity` test is evaluated against the
+        // row's live, locked value at UPDATE time. The check above ran on a
+        // snapshot read before the transaction, so two cashiers returning the
+        // last unit of the same line at once would both pass it and the line
+        // would end up over-returned -- stock back in twice, refunded twice.
+        // Matching zero rows here means the other one got there first.
+        const delta = String(round3(r.quantity));
+        const bumped = await tx.$queryRaw<{ id: string }[]>`
+          UPDATE "SaleItem"
+          SET "returnedQty" = "returnedQty" + ${delta}::numeric
+          WHERE id = ${item.id}
+            AND "returnedQty" + ${delta}::numeric <= quantity
+          RETURNING id
+        `;
+        if (bumped.length === 0) {
+          throw new BadRequestException(
+            `Cannot return ${r.quantity} of "${item.name}" — it was returned by someone else just now`,
+          );
+        }
         if (serialised.has(item.productId)) {
           await this.inventory.returnSerialsToStock(tx, {
             businessId,
@@ -409,11 +425,16 @@ export class SalesService {
       }
 
       // Fully vs partially returned?
+      // Both columns are numeric(12,3), so Prisma hands them back as Decimal.
+      // Comparing those with >= compares their valueOf(), which is a *string*
+      // -- "2" >= "10" is true -- so a part return silently flagged the whole
+      // sale RETURNED, dropping it out of every revenue report and blocking
+      // any further return on it. Compare as numbers.
       const updatedItems = await tx.saleItem.findMany({
         where: { saleId: sale.id },
       });
       const fullyReturned = updatedItems.every(
-        (it) => it.returnedQty >= it.quantity,
+        (it) => Number(it.returnedQty) >= Number(it.quantity),
       );
 
       // A refund first cancels whatever the customer still owes on this sale
@@ -440,6 +461,9 @@ export class SalesService {
           ...(creditReduction > 0
             ? { amountPaid: { increment: creditReduction } }
             : {}),
+          // Revenue is total - refundedTotal, so this is what keeps a part
+          // return out of the books without discarding the part that sold.
+          refundedTotal: { increment: refund },
           status: fullyReturned
             ? SaleStatus.RETURNED
             : SaleStatus.PARTIALLY_RETURNED,
@@ -503,9 +527,10 @@ export class SalesService {
           }
         : {}),
       ...(q.search ? { receiptNo: { contains: q.search, mode: 'insensitive' } } : {}),
-      status: {
-        notIn: [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED, SaleStatus.HELD],
-      },
+      // Only a held cart is not a sale. Returned and part-returned sales stay
+      // in and are netted below via refundedTotal -- dropping them outright
+      // made a sale with one item returned count as zero revenue.
+      status: { notIn: [SaleStatus.HELD] },
     };
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
@@ -513,9 +538,7 @@ export class SalesService {
       businessId,
       ...(q.storeId ? { storeId: q.storeId } : {}),
       createdAt: { gte: startOfToday },
-      status: {
-        notIn: [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED, SaleStatus.HELD],
-      },
+      status: { notIn: [SaleStatus.HELD] },
     };
 
     const [data, total, agg, today] = await Promise.all([
@@ -533,19 +556,27 @@ export class SalesService {
       this.prisma.sale.count({ where }),
       this.prisma.sale.aggregate({
         where: revenueWhere,
-        _sum: { total: true },
+        _sum: { total: true, refundedTotal: true },
         _count: true,
       }),
-      this.prisma.sale.aggregate({ where: todayWhere, _sum: { total: true }, _count: true }),
+      this.prisma.sale.aggregate({
+        where: todayWhere,
+        _sum: { total: true, refundedTotal: true },
+        _count: true,
+      }),
     ]);
     const result = paginate(data, total, q.page, q.limit);
-    result.meta.revenue = Number(agg._sum.total ?? 0);
+    /** What was rung up, less what was handed back on returns. */
+    const netOf = (a: {
+      _sum: { total: Prisma.Decimal | null; refundedTotal: Prisma.Decimal | null };
+    }) => round2(Number(a._sum.total ?? 0) - Number(a._sum.refundedTotal ?? 0));
+    result.meta.revenue = netOf(agg);
     // The number of sales that `revenue` is the sum of. Not the same as
     // meta.total, which counts whatever the list is showing -- returned and
     // held sales included. Without it an average sale value can't be worked
     // out from this response.
     result.meta.revenueCount = agg._count;
-    result.meta.todayRevenue = Number(today._sum.total ?? 0);
+    result.meta.todayRevenue = netOf(today);
     result.meta.todayCount = today._count;
     return result;
   }

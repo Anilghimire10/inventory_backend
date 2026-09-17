@@ -47,6 +47,8 @@ async function bootstrap() {
   // The Capacitor mobile app runs from these fixed WebView origins, so they are
   // always allowed (otherwise a strict production allowlist would block the app):
   //   Android -> https://localhost   iOS -> capacitor://localhost
+  // CORS_ORIGIN is mandatory in production (enforced at boot by validateEnv),
+  // so the reflect-any-origin fallback below can only ever be reached in dev.
   const mobileOrigins = ["https://localhost", "capacitor://localhost"];
   const corsOrigin = config.get<string>("CORS_ORIGIN");
   app.enableCors({
@@ -72,19 +74,29 @@ async function bootstrap() {
     }),
   );
 
-  // Swagger API docs at /docs
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle("Inventory Management API")
-    .setDescription("Multi-business inventory, POS, and reporting API")
-    .setVersion("0.1.0")
-    .addBearerAuth()
-    .build();
-  const document = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup("docs", app, document);
+  // Swagger API docs at /docs. Off in production by default: it publishes
+  // every route, DTO shape and validation rule in the app, which is a map for
+  // anyone probing the API. Set ENABLE_SWAGGER=true to turn it back on for a
+  // staging deploy.
+  const isProd = config.get<string>("NODE_ENV") === "production";
+  const swaggerEnabled =
+    config.get<string>("ENABLE_SWAGGER") === "true" || !isProd;
+  if (swaggerEnabled) {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle("Inventory Management API")
+      .setDescription("Multi-business inventory, POS, and reporting API")
+      .setVersion("0.1.0")
+      .addBearerAuth()
+      .build();
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup("docs", app, document);
+  }
 
   const port = config.get<number>("PORT") ?? 3000;
   await app.listen(port);
-  // eslint-disable-next-line no-console
-  console.log(`API running on http://localhost:${port}/api  (docs: /docs)`);
+  console.log(
+    `API running on http://localhost:${port}/api` +
+      (swaggerEnabled ? "  (docs: /docs)" : "  (docs disabled)"),
+  );
 }
-bootstrap();
+void bootstrap();

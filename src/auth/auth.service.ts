@@ -8,7 +8,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { BusinessType, EmailTokenType, UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
-import { createHash } from 'crypto';
+import { createHash, randomInt } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { AuditService } from '../audit/audit.service';
@@ -23,8 +23,16 @@ import {
 import { TX_OPTS } from '../common/prisma-tx';
 import { AuthUser } from '../common/types/auth-user';
 import { normalizeEmail } from '../common/email';
+import { PrincipalCache } from '../common/principal-cache';
 
 const CODE_TTL_MS = 15 * 60 * 1000; // verify/reset codes live 15 minutes
+/**
+ * Wrong guesses allowed per issued code before it is burned. A 6-digit code
+ * is 1-in-a-million per try, so this is what makes guessing it infeasible --
+ * the per-IP throttle alone doesn't, since an attacker can spread the
+ * attempts across addresses.
+ */
+const MAX_CODE_ATTEMPTS = 5;
 
 @Injectable()
 export class AuthService {
@@ -35,6 +43,7 @@ export class AuthService {
     private jwt: JwtService,
     private mail: MailService,
     private audit: AuditService,
+    private principals: PrincipalCache,
   ) {}
 
   /**
@@ -218,10 +227,16 @@ export class AuthService {
     if (!ok) throw new BadRequestException('Invalid or expired code');
 
     const passwordHash = await argon2.hash(dto.password);
+    // Bumping tokenVersion signs out every session that was already running —
+    // the whole point of a reset is that whoever else had the old password
+    // (or a token minted under it) loses access now, not in seven days.
     await this.prisma.user.update({
       where: { id: user.id },
-      data: { passwordHash },
+      data: { passwordHash, tokenVersion: { increment: 1 } },
     });
+    // The cached principal still carries the old tokenVersion; leaving it
+    // would let the just-retired token keep matching it until the TTL lapsed.
+    this.principals.evict(user.id);
     return { message: 'Password updated. You can now sign in.' };
   }
 
@@ -233,11 +248,18 @@ export class AuthService {
     if (!valid) throw new BadRequestException('Current password is incorrect');
 
     const passwordHash = await argon2.hash(dto.newPassword);
-    await this.prisma.user.update({
+    // Same invalidation as a reset: every other session this user had is now
+    // dead. Their *current* one would be too, so hand back a fresh token
+    // minted at the new version for the client to swap in.
+    const updated = await this.prisma.user.update({
       where: { id: userId },
-      data: { passwordHash },
+      data: { passwordHash, tokenVersion: { increment: 1 } },
     });
-    return { message: 'Password changed.' };
+    this.principals.evict(userId);
+    return {
+      message: 'Password changed.',
+      ...this.issueToken(updated.id, updated.businessId, updated),
+    };
   }
 
   /**
@@ -245,7 +267,7 @@ export class AuthService {
    * session to destroy — the client simply discards its token. We record an
    * audit event to mirror `auth.login`.
    */
-  async logout(user: AuthUser) {
+  logout(user: AuthUser) {
     void this.audit.record({
       businessId: user.businessId,
       userId: user.userId,
@@ -289,7 +311,9 @@ export class AuthService {
 
   /** Generate a 6-digit code, invalidate prior unused ones, and persist its hash. */
   private async issueCode(userId: string, type: EmailTokenType) {
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    // randomInt, not Math.random: this guards password resets, and Math.random
+    // is a predictable PRNG that is explicitly not for anything security-bearing.
+    const code = String(randomInt(100000, 1000000));
     await this.prisma.emailToken.updateMany({
       where: { userId, type, consumedAt: null },
       data: { consumedAt: new Date() },
@@ -302,39 +326,72 @@ export class AuthService {
         expiresAt: new Date(Date.now() + CODE_TTL_MS),
       },
     });
+    // Outside production, put the code where a developer can actually read it.
+    // Only the hash is stored, so with no deliverable mailbox there is
+    // otherwise no way to complete a verify/reset flow locally. Guarded hard:
+    // logging a live credential on a real deployment is not a trade worth
+    // making, and hosted log aggregators keep these lines for a long time.
+    if (process.env.NODE_ENV !== 'production') {
+      this.logger.warn(`[dev] ${type} code for user ${userId}: ${code}`);
+    }
     return code;
   }
 
-  /** Validate a code and mark it consumed. Returns false if invalid/expired. */
+  /**
+   * Validate a code and mark it consumed. Returns false if invalid/expired.
+   *
+   * The consume is a conditional updateMany rather than a find-then-update:
+   * the `consumedAt: null` guard is evaluated against the row's live, locked
+   * value at UPDATE time, so two requests racing with the same code produce
+   * one winner (count 1) and one loser (count 0) instead of both succeeding.
+   *
+   * A wrong guess is counted against the outstanding code, and the code is
+   * burned once MAX_CODE_ATTEMPTS is reached — otherwise the only limit on
+   * guessing 6 digits is a per-IP throttle.
+   */
   private async consumeCode(
     userId: string,
     type: EmailTokenType,
     code: string,
   ) {
-    const token = await this.prisma.emailToken.findFirst({
+    const now = new Date();
+    const claimed = await this.prisma.emailToken.updateMany({
       where: {
         userId,
         type,
         codeHash: this.hash(code),
         consumedAt: null,
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: now },
+        attempts: { lt: MAX_CODE_ATTEMPTS },
       },
-      orderBy: { createdAt: 'desc' },
+      data: { consumedAt: now },
     });
-    if (!token) return false;
-    await this.prisma.emailToken.update({
-      where: { id: token.id },
-      data: { consumedAt: new Date() },
+    if (claimed.count > 0) return true;
+
+    // Wrong (or already-spent) code: charge the attempt to whatever live code
+    // this user currently holds, so repeated guessing burns it.
+    await this.prisma.emailToken.updateMany({
+      where: {
+        userId,
+        type,
+        consumedAt: null,
+        expiresAt: { gt: now },
+      },
+      data: { attempts: { increment: 1 } },
     });
-    return true;
+    return false;
   }
 
   private issueToken(
     userId: string,
     businessId: string,
-    user: { email: string; name: string; role: UserRole },
+    user: { email: string; name: string; role: UserRole; tokenVersion: number },
   ) {
-    const accessToken = this.jwt.sign({ sub: userId, businessId });
+    const accessToken = this.jwt.sign({
+      sub: userId,
+      businessId,
+      tv: user.tokenVersion,
+    });
     return {
       accessToken,
       user: { id: userId, email: user.email, name: user.name, role: user.role },

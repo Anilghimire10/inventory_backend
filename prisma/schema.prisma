@@ -181,6 +181,11 @@ model User {
   role          UserRole @default(CASHIER)
   isActive      Boolean  @default(true)
   emailVerified Boolean  @default(false)
+  // Bumped whenever the password changes. Access tokens carry the value they
+  // were minted with, so raising it invalidates every token issued before —
+  // without it, a stolen token outlived the reset meant to kill it by up to
+  // JWT_EXPIRES_IN (7 days).
+  tokenVersion  Int      @default(0)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -202,6 +207,7 @@ model EmailToken {
   codeHash   String // sha256 of the emailed code — never store it in the clear
   expiresAt  DateTime
   consumedAt DateTime?
+  attempts   Int            @default(0) // wrong guesses; the code dies after MAX_CODE_ATTEMPTS
   createdAt  DateTime       @default(now())
 
   @@index([userId, type])
@@ -351,6 +357,7 @@ model StockMovement {
   @@index([businessId])
   @@index([storeId, productId])
   @@index([createdAt])
+  @@index([businessId, createdAt])
 }
 
 // One physical unit of a serialised product (phone IMEI, appliance serial).
@@ -484,6 +491,10 @@ model Sale {
   discount        Decimal       @default(0) @db.Decimal(12, 2)
   tax             Decimal       @default(0) @db.Decimal(12, 2)
   total           Decimal       @default(0) @db.Decimal(12, 2)
+  // Money handed back on returns against this sale. Revenue is
+  // `total - refundedTotal`, which is why a part return no longer has to
+  // exclude the whole sale from the books to avoid overstating it.
+  refundedTotal   Decimal       @default(0) @db.Decimal(12, 2)
   paymentMethod   PaymentMethod @default(CASH)
   amountPaid      Decimal       @default(0) @db.Decimal(12, 2)
   prescriptionRef String? // pharmacy: prescription reference
@@ -499,6 +510,9 @@ model Sale {
   @@index([storeId])
   @@index([shiftId])
   @@index([createdAt])
+  // Every sale list filters on businessId and sorts/ranges on createdAt;
+  // the two single-column indexes above can't serve that as one lookup.
+  @@index([businessId, createdAt])
 }
 
 model SaleItem {

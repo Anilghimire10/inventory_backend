@@ -7,14 +7,20 @@
  * an integration suite.
  */
 import assert from 'assert';
-import { PaymentMethod } from '@prisma/client';
+import { PaymentMethod, Prisma, SaleStatus } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
+import { SalesService } from '../src/sales/sales.service';
+import { MailService } from '../src/mail/mail.service';
 import { InventoryService } from '../src/inventory/inventory.service';
 import { PurchasesService } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
 import { allowsFraction, normalizeUnit } from '../src/common/units';
+import { validateEnv } from '../src/common/env.validation';
+import { PrincipalCache } from '../src/common/principal-cache';
+import { JwtStrategy } from '../src/auth/strategies/jwt.strategy';
+import { ConfigService } from '@nestjs/config';
 
 const stub = <T>(impl: unknown) => impl as T;
 const user: AuthUser = {
@@ -336,6 +342,332 @@ async function unitsGovernFractionalQuantities() {
   );
 }
 
+/**
+ * A part return must leave the sale PARTIALLY_RETURNED, not RETURNED.
+ *
+ * Quantities are numeric(12,3), so Prisma hands them back as Decimal, and
+ * Decimal.valueOf() is a *string* -- `>=` on two of them compares text, where
+ * "2" >= "10" is true. That flipped a 2-of-10 return to fully RETURNED, which
+ * drops the sale out of every revenue report (they exclude RETURNED) and
+ * blocks the remaining 8 from ever being returned. The Decimals here are the
+ * point of the check: with plain numbers it passes either way.
+ */
+async function partReturnLeavesTheSalePartiallyReturned() {
+  const dec = (v: string) => new Prisma.Decimal(v);
+  const item = {
+    id: 'si1',
+    productId: 'p1',
+    name: 'Rice',
+    quantity: dec('10.000'),
+    returnedQty: dec('0.000'),
+    lineTotal: dec('1000.00'),
+  };
+  const sale = {
+    id: 'sale1',
+    businessId: 'b1',
+    storeId: 's1',
+    customerId: null,
+    status: SaleStatus.COMPLETED,
+    total: dec('1000.00'),
+    amountPaid: dec('1000.00'),
+    items: [item],
+  };
+  let saved: any = null;
+  const prisma = stub<PrismaService>({
+    sale: { findFirst: async () => sale },
+    // nothing on this sale is serialised
+    product: { findMany: async () => [] },
+    $transaction: async (fn: any) =>
+      fn({
+        saleItem: {
+          findMany: async () => [item],
+          // Unguarded, like a plain Prisma increment — see the race check below.
+          update: async ({ data }: any) => {
+            item.returnedQty = item.returnedQty.plus(data.returnedQty.increment);
+            return item;
+          },
+        },
+        // The service bumps returnedQty through a guarded raw UPDATE so a
+        // racing return can't over-return a line. Model the guard here:
+        // apply it only while it stays within the line quantity, and report
+        // the row count the way RETURNING does.
+        $queryRaw: async (_sql: any, ...params: any[]) => {
+          const delta = new Prisma.Decimal(params[0]);
+          if (item.returnedQty.plus(delta).greaterThan(item.quantity)) return [];
+          item.returnedQty = item.returnedQty.plus(delta);
+          return [{ id: item.id }];
+        },
+        sale: {
+          update: async ({ data }: any) => {
+            saved = data;
+            return { ...sale, ...data };
+          },
+        },
+        customer: { update: async () => ({}) },
+      }),
+  });
+  const inventory = stub<InventoryService>({
+    applyMovementsBatch: async () => undefined,
+    returnSerialsToStock: async () => undefined,
+  });
+  const service = new SalesService(prisma, inventory, stub<MailService>({}));
+
+  const first: any = await service.returnItems(user, 'sale1', {
+    items: [{ saleItemId: 'si1', quantity: 2 }],
+  } as any);
+  assert.strictEqual(first.refund, 200, '2 of 10 units on a 1000 line');
+  assert.strictEqual(
+    saved.status,
+    SaleStatus.PARTIALLY_RETURNED,
+    '2 of 10 returned is a part return, not a full one',
+  );
+
+  // The remaining 8 must still be returnable, and close the sale out.
+  const second: any = await service.returnItems(user, 'sale1', {
+    items: [{ saleItemId: 'si1', quantity: 8 }],
+  } as any);
+  assert.strictEqual(second.refund, 800, 'the rest of the line');
+  assert.strictEqual(
+    saved.status,
+    SaleStatus.RETURNED,
+    'every unit back on the shelf closes the sale out',
+  );
+
+  // Nothing is left to return. Refused twice over: the snapshot check sees
+  // nothing returnable, and behind it the guarded increment would match zero
+  // rows anyway -- which is the half that also holds when the competing
+  // return lands after this one read the sale.
+  await assert.rejects(
+    service.returnItems(user, 'sale1', {
+      items: [{ saleItemId: 'si1', quantity: 1 }],
+    } as any),
+    /only 0 left|returned by someone else/,
+    'a line cannot be returned past the quantity sold',
+  );
+}
+
+/**
+ * The race the guarded increment exists for: two returns for the last unit of
+ * a line, both reading the sale before either commits. The snapshot check
+ * passes for both -- it is reading a value that is already stale -- so the
+ * only thing standing between them and a double refund (stock back in twice,
+ * money out twice) is the `returnedQty + delta <= quantity` test the UPDATE
+ * itself applies against the locked row.
+ */
+async function aStaleReadCannotOverReturnALine() {
+  const dec = (v: string) => new Prisma.Decimal(v);
+  // What the database actually holds: the competing return already landed.
+  const committed = { id: 'si1', returnedQty: dec('1.000'), quantity: dec('1.000') };
+  // What this request read a moment earlier, before that happened.
+  const stale = {
+    id: 'si1',
+    productId: 'p1',
+    name: 'Rice',
+    quantity: dec('1.000'),
+    returnedQty: dec('0.000'),
+    lineTotal: dec('100.00'),
+  };
+  const prisma = stub<PrismaService>({
+    sale: {
+      findFirst: async () => ({
+        id: 'sale1',
+        businessId: 'b1',
+        storeId: 's1',
+        customerId: null,
+        status: SaleStatus.COMPLETED,
+        total: dec('100.00'),
+        amountPaid: dec('100.00'),
+        items: [stale],
+      }),
+    },
+    product: { findMany: async () => [] },
+    $transaction: async (fn: any) =>
+      fn({
+        saleItem: {
+          findMany: async () => [committed],
+          // Deliberately present and UNguarded, mirroring what a plain
+          // Prisma increment does. If the service ever goes back to this
+          // path the race reopens silently, and the assertion below is what
+          // notices -- so the stub has to let it happen rather than crash.
+          update: async ({ data }: any) => {
+            committed.returnedQty = committed.returnedQty.plus(
+              data.returnedQty.increment,
+            );
+            return committed;
+          },
+        },
+        $queryRaw: async (_sql: any, ...params: any[]) => {
+          const delta = new Prisma.Decimal(params[0]);
+          if (committed.returnedQty.plus(delta).greaterThan(committed.quantity)) {
+            return [];
+          }
+          committed.returnedQty = committed.returnedQty.plus(delta);
+          return [{ id: committed.id }];
+        },
+        sale: { update: async ({ data }: any) => data },
+        customer: { update: async () => ({}) },
+      }),
+  });
+  const inventory = stub<InventoryService>({
+    applyMovementsBatch: async () => undefined,
+    returnSerialsToStock: async () => undefined,
+  });
+  const service = new SalesService(prisma, inventory, stub<MailService>({}));
+
+  await assert.rejects(
+    service.returnItems(user, 'sale1', {
+      items: [{ saleItemId: 'si1', quantity: 1 }],
+    } as any),
+    /returned by someone else/,
+    'the guard refuses even though the pre-transaction check passed',
+  );
+  assert.strictEqual(
+    committed.returnedQty.toString(),
+    '1',
+    'the line is not returned twice',
+  );
+}
+
+/**
+ * The boot-time env gate. JWT_SECRET used to fall back to the literal
+ * 'dev-secret', so a deploy that simply forgot the variable came up healthy
+ * with every token in the system forgeable. These assert that the ways that
+ * can happen are all refused.
+ */
+function envValidationRefusesUnsafeConfig() {
+  const ok = {
+    DATABASE_URL: 'postgresql://localhost:5432/db',
+    JWT_SECRET: 'x'.repeat(48),
+    CORS_ORIGIN: 'https://app.example.com',
+    NODE_ENV: 'production',
+  };
+  assert.doesNotThrow(() => validateEnv({ ...ok }), 'a complete config passes');
+
+  // Dev needs no CORS allowlist -- that fallback is what lets a phone on the
+  // LAN reach the API without configuration.
+  assert.doesNotThrow(
+    () => validateEnv({ ...ok, NODE_ENV: 'development', CORS_ORIGIN: '' }),
+    'CORS_ORIGIN is only mandatory in production',
+  );
+  assert.throws(
+    () => validateEnv({ ...ok, CORS_ORIGIN: '' }),
+    /CORS_ORIGIN/,
+    'production without an allowlist would reflect any origin',
+  );
+
+  for (const [label, secret] of [
+    ['missing', ''],
+    ['the old hardcoded fallback', 'dev-secret'],
+    ['the .env.example placeholder', 'change-me-to-a-long-random-string'],
+    ['too short to be worth anything', 'short'],
+  ] as const) {
+    assert.throws(
+      () => validateEnv({ ...ok, JWT_SECRET: secret }),
+      /JWT_SECRET/,
+      `a JWT_SECRET that is ${label} must not boot`,
+    );
+  }
+
+  assert.throws(
+    () => validateEnv({ ...ok, DATABASE_URL: '' }),
+    /DATABASE_URL/,
+    'no database URL must not boot',
+  );
+
+  // The log transport is a local-development convenience that delivers
+  // nothing. Reaching production with it set would break verification and
+  // password resets invisibly, since both endpoints report success regardless.
+  assert.doesNotThrow(
+    () => validateEnv({ ...ok, NODE_ENV: 'development', MAIL_TRANSPORT: 'log' }),
+    'the log transport is fine in development',
+  );
+  assert.throws(
+    () => validateEnv({ ...ok, MAIL_TRANSPORT: 'log' }),
+    /MAIL_TRANSPORT=log/,
+    'the log transport must not reach production',
+  );
+  assert.throws(
+    () => validateEnv({ ...ok, MAIL_TRANSPORT: 'smtp' }),
+    /MAIL_TRANSPORT/,
+    'an unknown transport is a typo, not a silent fallback',
+  );
+}
+
+/**
+ * The principal cache must never be the thing that decides a token's fate.
+ *
+ * It caches the tokenVersion a user had when the entry was written. Right
+ * after a password change that value is stale by one, so treating a mismatch
+ * as "reject" inverts the whole control: the just-retired token still matches
+ * the stale entry and sails through, while the freshly-minted replacement
+ * does not and gets a 401. Both of those were observed against the running
+ * API before this was fixed. A mismatch must fall through to the database,
+ * and AuthService must evict on the way past.
+ */
+async function principalCacheCannotResurrectARetiredToken() {
+  const cache = new PrincipalCache();
+  const principal = {
+    userId: 'u1',
+    businessId: 'b1',
+    storeId: 's1',
+    role: 'CASHIER' as AuthUser['role'],
+    email: 'staff@example.com',
+  };
+
+  let dbReads = 0;
+  const dbUser = {
+    id: 'u1',
+    businessId: 'b1',
+    storeId: 's1',
+    role: 'CASHIER',
+    email: 'staff@example.com',
+    isActive: true,
+    tokenVersion: 1,
+    business: { isSuspended: false, isSubscribed: true, subscribedTo: null },
+  };
+  const prisma = stub<PrismaService>({
+    user: {
+      findUnique: async () => {
+        dbReads++;
+        return dbUser;
+      },
+    },
+  });
+  const config = stub<ConfigService>({ getOrThrow: () => 'x'.repeat(48) });
+  const strategy = new JwtStrategy(config, prisma, cache);
+
+  // First call reads through and caches at version 1.
+  await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 1 });
+  assert.strictEqual(dbReads, 1);
+  // Second call at the same version is served from cache -- the point of it.
+  await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 1 });
+  assert.strictEqual(dbReads, 1, 'a matching version is served without a read');
+
+  // The password changes: the database moves to 2 and AuthService evicts.
+  dbUser.tokenVersion = 2;
+  cache.evict('u1');
+
+  // The retired token (tv=1) must be refused against the live value...
+  await assert.rejects(
+    strategy.validate({ sub: 'u1', businessId: 'b1', tv: 1 }),
+    /password was changed/,
+    'a token retired by a password change must not be accepted',
+  );
+  // ...and the replacement (tv=2) must be accepted.
+  const ok = await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 2 });
+  assert.strictEqual(ok.email, principal.email, 'the new token still works');
+
+  // Even with a stale entry left behind, a newer token must not be rejected
+  // on the strength of it -- the mismatch has to fall through to the database.
+  cache.set('u1', principal, 1);
+  const stillOk = await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 2 });
+  assert.strictEqual(
+    stillOk.email,
+    principal.email,
+    'a stale cache entry must not reject a valid newer token',
+  );
+}
+
 async function main() {
   await shiftReportBalancesTheDrawer();
   await stockTakePreviewComputesVariances();
@@ -343,6 +675,10 @@ async function main() {
   await variantGenerationCoversEveryCombination();
   await serialRulesGuardEveryUnit();
   await unitsGovernFractionalQuantities();
+  await partReturnLeavesTheSalePartiallyReturned();
+  await aStaleReadCannotOverReturnALine();
+  envValidationRefusesUnsafeConfig();
+  await principalCacheCannotResurrectARetiredToken();
   console.log('checks passed');
 }
 

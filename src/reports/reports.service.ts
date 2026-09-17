@@ -5,6 +5,22 @@ import { InventoryService } from '../inventory/inventory.service';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+/**
+ * Sales that count towards the books.
+ *
+ * Only HELD is excluded: a held cart is a parked basket, not a sale. Returned
+ * and part-returned sales stay IN, because the money that wasn't handed back
+ * is still revenue -- netting happens via `refundedTotal` (sale level) and
+ * `returnedQty` (line level), not by discarding the whole sale. Excluding them
+ * here is what made a 10,000 sale with one 200 item returned count as zero.
+ */
+const BOOKED: Prisma.EnumSaleStatusFilter = { notIn: [SaleStatus.HELD] };
+
+/** Revenue actually kept: what was rung up, less what was handed back. */
+const bookedRevenue = (agg: {
+  _sum: { total: Prisma.Decimal | null; refundedTotal: Prisma.Decimal | null };
+}) => round2(Number(agg._sum.total ?? 0) - Number(agg._sum.refundedTotal ?? 0));
+
 @Injectable()
 export class ReportsService {
   constructor(
@@ -34,16 +50,14 @@ export class ReportsService {
     // and returned sales, which are not revenue).
     const completedWhere = {
       ...saleWhere,
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+      status: BOOKED,
     };
 
     const [sales, lowStock, expiring, inventoryValue, topProducts, slowProducts] =
       await Promise.all([
         this.prisma.sale.aggregate({
           where: completedWhere,
-          _sum: { total: true },
+          _sum: { total: true, refundedTotal: true },
           _count: true,
         }),
         this.inventory.lowStock(businessId, storeId),
@@ -72,7 +86,7 @@ export class ReportsService {
       // Owner-only financial figures + charts.
       ...(includeFinancials
         ? {
-            totalSalesTotal: Number(sales._sum.total ?? 0),
+            totalSalesTotal: bookedRevenue(sales),
             inventoryValue,
             salesTrend,
             hourlyToday,
@@ -89,11 +103,7 @@ export class ReportsService {
     const where = {
       businessId,
       ...(opts.storeId ? { storeId: opts.storeId } : {}),
-      // Returned sales aren't revenue -- excluded everywhere a report sums
-      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+      status: BOOKED,
       ...(opts.from || opts.to
         ? {
             createdAt: {
@@ -106,7 +116,13 @@ export class ReportsService {
 
     const sales = await this.prisma.sale.findMany({
       where,
-      select: { total: true, tax: true, discount: true, createdAt: true },
+      select: {
+        total: true,
+        refundedTotal: true,
+        tax: true,
+        discount: true,
+        createdAt: true,
+      },
       orderBy: { createdAt: 'asc' },
     });
 
@@ -114,10 +130,11 @@ export class ReportsService {
     let revenue = 0;
     for (const s of sales) {
       const day = s.createdAt.toISOString().slice(0, 10);
+      const net = Number(s.total) - Number(s.refundedTotal);
       byDay[day] ??= { total: 0, count: 0 };
-      byDay[day].total = Math.round((byDay[day].total + Number(s.total)) * 100) / 100;
+      byDay[day].total = Math.round((byDay[day].total + net) * 100) / 100;
       byDay[day].count += 1;
-      revenue += Number(s.total);
+      revenue += net;
     }
 
     return {
@@ -143,11 +160,7 @@ export class ReportsService {
     const saleWhere: Prisma.SaleWhereInput = {
       businessId,
       ...(opts.storeId ? { storeId: opts.storeId } : {}),
-      // Returned sales aren't revenue -- excluded everywhere a report sums
-      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+      status: BOOKED,
       ...(from || to
         ? {
             createdAt: {
@@ -176,18 +189,18 @@ export class ReportsService {
     const [agg, byPaymentRaw, sales, items, prev] = await Promise.all([
       this.prisma.sale.aggregate({
         where: saleWhere,
-        _sum: { total: true },
+        _sum: { total: true, refundedTotal: true },
         _count: true,
       }),
       this.prisma.sale.groupBy({
         by: ['paymentMethod'],
         where: saleWhere,
-        _sum: { total: true },
+        _sum: { total: true, refundedTotal: true },
         _count: true,
       }),
       this.prisma.sale.findMany({
         where: saleWhere,
-        select: { total: true, createdAt: true },
+        select: { total: true, refundedTotal: true, createdAt: true },
         orderBy: { createdAt: 'asc' },
       }),
       this.prisma.saleItem.findMany({
@@ -214,11 +227,7 @@ export class ReportsService {
             const prevWhere: Prisma.SaleWhereInput = {
               businessId,
               ...(opts.storeId ? { storeId: opts.storeId } : {}),
-              // Returned sales aren't revenue -- excluded everywhere a report sums
-      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+              status: BOOKED,
               createdAt: {
                 gte: new Date(prevWindow.from),
                 lte: new Date(prevWindow.to),
@@ -227,7 +236,7 @@ export class ReportsService {
             const [prevAgg, prevItems] = await Promise.all([
               this.prisma.sale.aggregate({
                 where: prevWhere,
-                _sum: { total: true },
+                _sum: { total: true, refundedTotal: true },
                 _count: true,
               }),
               this.prisma.saleItem.findMany({
@@ -253,7 +262,7 @@ export class ReportsService {
               0,
             );
             return {
-              revenue: round2(Number(prevAgg._sum.total ?? 0)),
+              revenue: bookedRevenue(prevAgg),
               orders: prevAgg._count,
               netRevenue: round2(prevRevenue),
               profit: round2(prevRevenue - prevCost),
@@ -312,7 +321,9 @@ export class ReportsService {
     for (const s of sales) {
       const day = s.createdAt.toISOString().slice(0, 10);
       byDayMap[day] ??= { total: 0, count: 0, units: 0 };
-      byDayMap[day].total = round2(byDayMap[day].total + Number(s.total));
+      byDayMap[day].total = round2(
+        byDayMap[day].total + Number(s.total) - Number(s.refundedTotal),
+      );
       byDayMap[day].count += 1;
     }
     for (const it of items) {
@@ -346,7 +357,9 @@ export class ReportsService {
     const hours = Array.from({ length: 24 }, (_, hour) => ({ hour, total: 0, count: 0, units: 0 }));
     for (const s of sales) {
       const h = s.createdAt.getHours();
-      hours[h].total = round2(hours[h].total + Number(s.total));
+      hours[h].total = round2(
+        hours[h].total + Number(s.total) - Number(s.refundedTotal),
+      );
       hours[h].count += 1;
     }
     for (const it of items) {
@@ -355,13 +368,13 @@ export class ReportsService {
     }
 
     // Payment methods with % share
-    const payTotal = byPaymentRaw.reduce((s, p) => s + Number(p._sum.total ?? 0), 0) || 1;
+    const payTotal = byPaymentRaw.reduce((s, p) => s + bookedRevenue(p), 0) || 1;
     const byPaymentMethod = byPaymentRaw
       .map((p) => ({
         method: p.paymentMethod,
-        total: round2(Number(p._sum.total ?? 0)),
+        total: bookedRevenue(p),
         count: p._count,
-        share: round2((Number(p._sum.total ?? 0) / payTotal) * 100),
+        share: round2((bookedRevenue(p) / payTotal) * 100),
       }))
       .sort((a, b) => b.total - a.total);
 
@@ -382,7 +395,7 @@ export class ReportsService {
     return {
       totals: {
         transactions: agg._count,
-        grossSales: round2(Number(agg._sum.total ?? 0)),
+        grossSales: bookedRevenue(agg),
         netRevenue,
         cost,
         profit,
@@ -430,11 +443,7 @@ export class ReportsService {
       where: {
         sale: {
           businessId,
-          // Returned sales aren't revenue -- excluded everywhere a report sums
-      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+          status: BOOKED,
           ...(opts.storeId ? { storeId: opts.storeId } : {}),
           ...(opts.from || opts.to
             ? {
@@ -618,14 +627,10 @@ export class ReportsService {
       where: {
         businessId,
         ...(storeId ? { storeId } : {}),
-        // Returned sales aren't revenue -- excluded everywhere a report sums
-      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+        status: BOOKED,
         createdAt: { gte: start },
       },
-      select: { total: true, createdAt: true },
+      select: { total: true, refundedTotal: true, createdAt: true },
     });
 
     const byDay = new Map<string, { total: number; count: number }>();
@@ -638,7 +643,9 @@ export class ReportsService {
       const key = s.createdAt.toISOString().slice(0, 10);
       const bucket = byDay.get(key);
       if (bucket) {
-        bucket.total = round2(bucket.total + Number(s.total));
+        bucket.total = round2(
+          bucket.total + Number(s.total) - Number(s.refundedTotal),
+        );
         bucket.count += 1;
       }
     }
@@ -655,14 +662,10 @@ export class ReportsService {
       where: {
         businessId,
         ...(storeId ? { storeId } : {}),
-        // Returned sales aren't revenue -- excluded everywhere a report sums
-      // sale.total, so every screen (dashboard, summaries, trends, tax) agrees.
-      status: {
-        notIn: [SaleStatus.HELD, SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED],
-      },
+        status: BOOKED,
         createdAt: { gte: startOfToday },
       },
-      select: { total: true, createdAt: true },
+      select: { total: true, refundedTotal: true, createdAt: true },
     });
 
     const hours = Array.from({ length: 24 }, (_, hour) => ({
@@ -672,7 +675,9 @@ export class ReportsService {
     }));
     for (const s of sales) {
       const h = s.createdAt.getHours();
-      hours[h].total = round2(hours[h].total + Number(s.total));
+      hours[h].total = round2(
+        hours[h].total + Number(s.total) - Number(s.refundedTotal),
+      );
       hours[h].count += 1;
     }
     return hours;

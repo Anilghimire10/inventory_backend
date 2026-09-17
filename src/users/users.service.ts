@@ -61,6 +61,13 @@ export class UsersService {
         role: dto.role,
         storeId,
         passwordHash,
+        // Verified on creation. The emailVerified gate exists to prove a
+        // self-signup controls the address they registered with; a staff
+        // account is created by an owner/manager who sets the password and
+        // hands it over in person, so there is nothing to prove. Leaving it
+        // false locked every new hire out of login with no way to clear it
+        // (the code-entry screen only exists in the signup flow).
+        emailVerified: true,
       },
       select: SAFE_SELECT,
     });

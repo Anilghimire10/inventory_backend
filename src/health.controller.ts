@@ -9,27 +9,27 @@ import { PrismaService } from './prisma/prisma.service';
 export class HealthController {
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Liveness + DB readiness. Unauthenticated so load balancers can poll it. */
+  /**
+   * Liveness + DB readiness. Unauthenticated so load balancers can poll it,
+   * which is exactly why it says nothing about the infrastructure behind it:
+   * it used to return the database name, its host and the total user count,
+   * all to anonymous callers. `SELECT 1` proves the connection is alive
+   * without describing what is on the other end of it.
+   */
   @Public()
   @SkipThrottle()
   @Get()
   async check() {
-    // ponytail: `db`/`users` are deploy-debugging aids (which database is this
-    // instance actually talking to?). Drop them once the deploy is settled.
-    // Host only -- never the credentials in DATABASE_URL.
-    const [row] = await this.prisma.$queryRaw<{ db: string; users: bigint }[]>`
-      SELECT current_database() AS db, (SELECT count(*) FROM "User") AS users
-    `;
-    let host = 'unknown';
+    let database: 'up' | 'down' = 'up';
     try {
-      host = new URL(process.env.DATABASE_URL ?? '').host;
+      await this.prisma.$queryRaw`SELECT 1`;
     } catch {
-      /* DATABASE_URL unset or malformed -- leave as 'unknown' */
+      database = 'down';
     }
     return {
-      status: 'ok',
+      status: database === 'up' ? 'ok' : 'degraded',
       uptime: process.uptime(),
-      db: { name: row.db, host, users: Number(row.users) },
+      database,
     };
   }
 }
