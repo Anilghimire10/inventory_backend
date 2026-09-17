@@ -202,6 +202,7 @@ export class ReportsService {
           sale: { select: { createdAt: true } },
           product: {
             select: {
+              name: true,
               costPrice: true,
               categories: { select: { name: true } },
             },
@@ -276,7 +277,17 @@ export class ReportsService {
       const cost = soldQty * unitCost;
       const cur =
         map.get(it.productId) ??
-        { productId: it.productId, name: it.name, quantitySold: 0, revenue: 0, cost: 0, profit: 0 };
+        {
+          productId: it.productId,
+          // The catalog's current name, not `it.name`, which is the snapshot
+          // taken at sale time -- otherwise a renamed product reads one way
+          // here and another on the dashboard, which groups by product.
+          name: it.product.name,
+          quantitySold: 0,
+          revenue: 0,
+          cost: 0,
+          profit: 0,
+        };
       cur.quantitySold += soldQty;
       cur.revenue += revenue;
       cur.cost += cost;
@@ -498,9 +509,17 @@ export class ReportsService {
     return Math.round(value * 100) / 100;
   }
 
+  /**
+   * Best sellers by units. Grouped by product alone: `SaleItem.name` is the
+   * name snapshotted at sale time, so grouping by it as well split a renamed
+   * product into one row per name it has ever been sold under -- understating
+   * each, taking two of the `take` slots, and handing the dashboard duplicate
+   * React keys. Names come from the product itself so the list shows what the
+   * catalog calls it today.
+   */
   private async topProducts(businessId: string, storeId: string | undefined, take: number) {
     const grouped = await this.prisma.saleItem.groupBy({
-      by: ['productId', 'name'],
+      by: ['productId'],
       where: {
         sale: { businessId, ...(storeId ? { storeId } : {}) },
       },
@@ -508,9 +527,21 @@ export class ReportsService {
       orderBy: { _sum: { quantity: 'desc' } },
       take,
     });
+
+    const names = new Map(
+      (
+        await this.prisma.product.findMany({
+          where: { id: { in: grouped.map((g) => g.productId) } },
+          select: { id: true, name: true },
+        })
+      ).map((p) => [p.id, p.name]),
+    );
+
     return grouped.map((g) => ({
       productId: g.productId,
-      name: g.name,
+      // Products are soft-deleted and SaleItem.product is required, so the row
+      // is always there; the fallback only guards against a blank name.
+      name: names.get(g.productId) || 'Unknown product',
       quantitySold: Number(g._sum.quantity ?? 0),
     }));
   }
