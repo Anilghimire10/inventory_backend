@@ -531,11 +531,20 @@ export class SalesService {
         orderBy: { createdAt: 'desc' },
       }),
       this.prisma.sale.count({ where }),
-      this.prisma.sale.aggregate({ where: revenueWhere, _sum: { total: true } }),
+      this.prisma.sale.aggregate({
+        where: revenueWhere,
+        _sum: { total: true },
+        _count: true,
+      }),
       this.prisma.sale.aggregate({ where: todayWhere, _sum: { total: true }, _count: true }),
     ]);
     const result = paginate(data, total, q.page, q.limit);
     result.meta.revenue = Number(agg._sum.total ?? 0);
+    // The number of sales that `revenue` is the sum of. Not the same as
+    // meta.total, which counts whatever the list is showing -- returned and
+    // held sales included. Without it an average sale value can't be worked
+    // out from this response.
+    result.meta.revenueCount = agg._count;
     result.meta.todayRevenue = Number(today._sum.total ?? 0);
     result.meta.todayCount = today._count;
     return result;

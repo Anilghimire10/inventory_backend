@@ -38,6 +38,8 @@ export interface Paginated<T> {
     pages: number;
     /** Optional aggregate (e.g. summed revenue) for the matching rows. */
     revenue?: number;
+    /** How many rows `revenue` was summed over — not always `total`. */
+    revenueCount?: number;
     /** Optional today-only aggregates (completed sales made today). */
     todayRevenue?: number;
     todayCount?: number;
