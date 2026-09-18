@@ -315,6 +315,10 @@ model StockItem {
   @@unique([storeId, productId])
   @@index([businessId])
   @@index([storeId])
+  // Both indexes above lead with storeId, so a lookup by product alone could
+  // use neither — "which stores carry this product" and the variant seeding
+  // that follows a parent's stores both scan the table without this.
+  @@index([productId])
 }
 
 model Batch {

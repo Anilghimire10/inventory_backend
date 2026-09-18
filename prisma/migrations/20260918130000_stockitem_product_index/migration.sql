@@ -1,0 +1,12 @@
+-- Index StockItem by product.
+--
+-- StockItem already had ("storeId","productId") and ("storeId"), both leading
+-- with the store. Queries that ask "which stores carry this product" -- setting
+-- a product's stores, and seeding a variant into its parent's stores -- filter
+-- on productId alone and so could use neither, scanning the whole table.
+--
+-- Plain CREATE INDEX, not CONCURRENTLY: Prisma runs each migration inside a
+-- transaction and CONCURRENTLY cannot. The table is small enough that the
+-- brief lock is immaterial; if it ever grows large, build the index by hand
+-- outside a migration instead.
+CREATE INDEX IF NOT EXISTS "StockItem_productId_idx" ON "StockItem"("productId");
