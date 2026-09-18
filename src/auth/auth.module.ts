@@ -22,5 +22,6 @@ import { PrincipalCache } from '../common/principal-cache';
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy, PrincipalCache],
+  exports: [PrincipalCache],
 })
 export class AuthModule {}

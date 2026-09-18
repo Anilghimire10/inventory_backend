@@ -558,9 +558,11 @@ model Shift {
 
   sales Sale[]
 
-  // "One open shift per user" is enforced by a partial unique index on
-  // (userId) WHERE "closedAt" IS NULL — Prisma can't express partial
-  // indexes, so it lives in the migration SQL only.
+  // "One open shift per user PER STORE" is enforced by a partial unique index
+  // on (userId, storeId) WHERE "closedAt" IS NULL — Prisma can't express
+  // partial indexes, so it lives in the migration SQL only. Per store rather
+  // than per user so an owner can run a till at more than one branch at once:
+  // each store reconciles its own drawer, and the sessions never mix.
   @@index([businessId, openedAt])
   @@index([userId, closedAt])
 }

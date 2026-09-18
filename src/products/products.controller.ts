@@ -7,13 +7,14 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Query,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiTags } from '@nestjs/swagger';
-import { IsArray } from 'class-validator';
+import { ArrayNotEmpty, ArrayUnique, IsArray, IsString } from 'class-validator';
 import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -28,6 +29,16 @@ import { UserRole } from '@prisma/client';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
+import { scopeToStore } from '../common/store-scope';
+
+export class SetProductStoresDto {
+  @ApiProperty({ type: [String], description: 'The stores that carry this product' })
+  @IsArray()
+  @ArrayNotEmpty()
+  @ArrayUnique()
+  @IsString({ each: true })
+  storeIds: string[];
+}
 
 export class ImportProductsDto {
   @ApiProperty({ type: [Object], description: 'Rows parsed from a CSV/Excel file' })
@@ -72,6 +83,9 @@ export class ProductsController {
 
   @Get()
   findAll(@CurrentUser() u: AuthUser, @Query() q: QueryProductDto) {
+    // Assigned in place rather than spread: QueryProductDto carries prototype
+    // getters (PaginationDto's `skip`) that a spread would silently drop.
+    q.storeId = scopeToStore(u, q.storeId);
     return this.products.findAll(u.businessId, q);
   }
 
@@ -83,6 +97,20 @@ export class ProductsController {
   @Get(':id')
   findOne(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.products.findOne(u.businessId, id);
+  }
+
+  /**
+   * Set which stores carry this product (and its variants).
+   * Management-level: it is what decides whether a branch stocks an item.
+   */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Put(':id/stores')
+  setStores(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: SetProductStoresDto,
+  ) {
+    return this.products.setStores(u.businessId, id, dto.storeIds);
   }
 
   /** The variants of one style (size/colour rows under a parent product). */

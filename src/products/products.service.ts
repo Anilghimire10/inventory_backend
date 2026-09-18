@@ -28,7 +28,9 @@ export class ProductsService {
   private readonly detailInclude = DETAIL_INCLUDE;
 
   async create(businessId: string, dto: CreateProductDto) {
-    const { categoryIds, expiryDate, taxId, ...rest } = dto;
+    // storeIds is availability, not a product column — it must not reach
+    // Prisma via ...rest.
+    const { categoryIds, expiryDate, taxId, storeIds, ...rest } = dto;
     await this.assertCategories(businessId, categoryIds);
     if (dto.parentId) await this.assertParent(businessId, dto.parentId);
     const taxRate = await this.resolveTaxRate(businessId, taxId);
@@ -45,7 +47,7 @@ export class ProductsService {
         },
         include: this.detailInclude,
       });
-      await this.seedStockRows(businessId, product.id);
+      await this.seedStockRows(businessId, product.id, storeIds);
       return product;
     } catch (e) {
       throw this.handleUnique(e);
@@ -53,16 +55,32 @@ export class ProductsService {
   }
 
   /**
-   * Give a brand-new product a zero-quantity StockItem in every store so it
-   * shows up on the stock page immediately (the stock list reads StockItem
-   * rows, not products). Without this it stays invisible until the first
-   * purchase/adjustment creates a row.
+   * Give a brand-new product a zero-quantity StockItem in each store that
+   * carries it, so it shows up on the stock page immediately (the stock list
+   * reads StockItem rows, not products). Without this it stays invisible until
+   * the first purchase/adjustment creates a row.
+   *
+   * A StockItem row *is* the record that a store carries the product -- there
+   * is no separate availability table -- so seeding only the chosen stores is
+   * what keeps a multi-branch catalog per-store. Omitting `storeIds` stocks
+   * every store, which is the right default for the single-store businesses
+   * that are most of them.
    */
-  private async seedStockRows(businessId: string, productId: string) {
+  private async seedStockRows(
+    businessId: string,
+    productId: string,
+    storeIds?: string[],
+  ) {
     const stores = await this.prisma.store.findMany({
-      where: { businessId },
+      where: {
+        businessId,
+        ...(storeIds?.length ? { id: { in: storeIds } } : {}),
+      },
       select: { id: true },
     });
+    if (storeIds?.length && stores.length !== new Set(storeIds).size) {
+      throw new BadRequestException('One or more stores are invalid');
+    }
     if (!stores.length) return;
     await this.prisma.stockItem.createMany({
       data: stores.map((s) => ({
@@ -78,6 +96,8 @@ export class ProductsService {
   async findAll(businessId: string, q: QueryProductDto) {
     const where: Prisma.ProductWhereInput = {
       businessId,
+      // A store carries a product exactly when it has a StockItem row for it.
+      ...(q.storeId ? { stockItems: { some: { storeId: q.storeId } } } : {}),
       ...(q.activeOnly !== false ? { isActive: true } : {}),
       ...(q.categoryId ? { categories: { some: { id: q.categoryId } } } : {}),
       ...(q.ids?.length ? { id: { in: q.ids } } : {}),
@@ -106,6 +126,107 @@ export class ProductsService {
       this.prisma.product.count({ where }),
     ]);
     return paginate(data, total, q.page, q.limit);
+  }
+
+  /**
+   * Set which stores carry a product — the multi-branch catalog control.
+   *
+   * There is no availability table: a zero-quantity StockItem row *is* the
+   * record that a store carries the item, which is why adding a store seeds a
+   * row and dropping one deletes it. A drop is refused while that branch still
+   * holds stock, batches or serials, because deleting the row would take the
+   * quantity with it and silently write the stock off.
+   *
+   * Variants move with their parent. A style carried at one branch whose
+   * variants lived at another would put a size on a shelf that does not stock
+   * the style.
+   */
+  async setStores(businessId: string, productId: string, storeIds: string[]) {
+    const wanted = [...new Set(storeIds)];
+    if (!wanted.length) {
+      throw new BadRequestException(
+        'Pick at least one store — a product carried nowhere is invisible',
+      );
+    }
+    const product = await this.prisma.product.findFirst({
+      where: { id: productId, businessId },
+      select: { id: true, name: true },
+    });
+    if (!product) throw new NotFoundException('Product not found');
+
+    const stores = await this.prisma.store.findMany({
+      where: { businessId, id: { in: wanted } },
+      select: { id: true, name: true },
+    });
+    if (stores.length !== wanted.length) {
+      throw new BadRequestException('One or more stores are invalid');
+    }
+
+    const variants = await this.prisma.product.findMany({
+      where: { parentId: productId, businessId },
+      select: { id: true },
+    });
+    const productIds = [product.id, ...variants.map((v) => v.id)];
+
+    const current = await this.prisma.stockItem.findMany({
+      where: { productId: { in: productIds } },
+      select: { storeId: true, productId: true, quantity: true },
+    });
+    const dropping = [...new Set(current.map((r) => r.storeId))].filter(
+      (id) => !wanted.includes(id),
+    );
+
+    if (dropping.length) {
+      const held = current.filter(
+        (r) => dropping.includes(r.storeId) && Number(r.quantity) !== 0,
+      );
+      const [batches, serials] = await Promise.all([
+        this.prisma.batch.findMany({
+          where: { productId: { in: productIds }, storeId: { in: dropping } },
+          select: { storeId: true },
+        }),
+        this.prisma.serial.findMany({
+          where: { productId: { in: productIds }, storeId: { in: dropping } },
+          select: { storeId: true },
+        }),
+      ]);
+      const blocked = new Set<string>([
+        ...held.map((r) => r.storeId),
+        ...batches.map((r) => r.storeId),
+        // Serial.storeId is nullable — an unassigned unit pins no store.
+        ...serials.flatMap((r) => (r.storeId ? [r.storeId] : [])),
+      ]);
+      if (blocked.size) {
+        const all = await this.prisma.store.findMany({
+          where: { id: { in: [...blocked] } },
+          select: { name: true },
+        });
+        throw new ConflictException(
+          `${product.name} still has stock at ${all
+            .map((s) => s.name)
+            .join(', ')}. Move or write it off before dropping the store.`,
+        );
+      }
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      if (dropping.length) {
+        await tx.stockItem.deleteMany({
+          where: { productId: { in: productIds }, storeId: { in: dropping } },
+        });
+      }
+      const have = new Set(current.map((r) => `${r.storeId}|${r.productId}`));
+      const rows = productIds.flatMap((pid) =>
+        wanted
+          .filter((sid) => !have.has(`${sid}|${pid}`))
+          .map((sid) => ({ businessId, storeId: sid, productId: pid, quantity: 0 })),
+      );
+      if (rows.length) {
+        await tx.stockItem.createMany({ data: rows, skipDuplicates: true });
+      }
+    });
+
+    return { id: product.id, storeIds: wanted, variantsUpdated: variants.length };
   }
 
   async findOne(businessId: string, id: string) {
@@ -145,7 +266,9 @@ export class ProductsService {
 
   async update(businessId: string, id: string, dto: UpdateProductDto) {
     await this.findOne(businessId, id);
-    const { categoryIds, expiryDate, taxId, ...rest } = dto;
+    // storeIds is availability, not a product column — it must not reach
+    // Prisma via ...rest.
+    const { categoryIds, expiryDate, taxId, storeIds, ...rest } = dto;
     await this.assertCategories(businessId, categoryIds);
     try {
       return await this.prisma.product.update({
@@ -217,6 +340,15 @@ export class ProductsService {
     });
     const taken = new Set(existing.map((e) => e.variantName));
 
+    // A variant is carried wherever its parent is: generating one into a
+    // store that does not stock the style would put it on that branch's shelf
+    // by itself.
+    const parentStores = await this.prisma.stockItem.findMany({
+      where: { productId: parentId },
+      select: { storeId: true },
+    });
+    const variantStoreIds = parentStores.map((r) => r.storeId);
+
     const created: ProductDetail[] = [];
     for (const combo of combos) {
       const label = Object.values(combo).join(' / ');
@@ -253,7 +385,7 @@ export class ProductsService {
         },
         include: this.detailInclude,
       });
-      await this.seedStockRows(businessId, product.id);
+      await this.seedStockRows(businessId, product.id, variantStoreIds);
       created.push(product);
     }
     return { created: created.length, skipped: combos.length - created.length, variants: created };
@@ -362,6 +494,8 @@ export class ProductsService {
           const product = await this.prisma.product.create({
             data: { businessId, sku, ...data },
           });
+          // A CSV row names no store, so an imported product is stocked
+          // everywhere; narrow it afterwards from the product's store list.
           await this.seedStockRows(businessId, product.id);
           created++;
         }

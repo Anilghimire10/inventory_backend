@@ -13,6 +13,7 @@ import { UserRole } from '@prisma/client';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
+import { scopeToStore } from '../common/store-scope';
 
 @ApiTags('inventory')
 @ApiBearerAuth()
@@ -22,27 +23,37 @@ export class InventoryController {
 
   @Get('stock')
   stock(@CurrentUser() u: AuthUser, @Query() q: QueryStockDto) {
+    // Assigned in place rather than spread: these query DTOs carry prototype
+    // getters (PaginationDto's `skip`) that a spread would silently drop.
+    q.storeId = scopeToStore(u, q.storeId);
     return this.inventory.listStock(u.businessId, q);
   }
 
   @Get('low-stock')
   lowStock(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
-    return this.inventory.lowStock(u.businessId, storeId);
+    return this.inventory.lowStock(u.businessId, scopeToStore(u, storeId));
   }
 
   @Get('expiring')
   expiring(@CurrentUser() u: AuthUser, @Query() q: ExpiringDto) {
+    q.storeId = scopeToStore(u, q.storeId);
     return this.inventory.expiringBatches(u.businessId, q);
   }
 
   /** Serial/IMEI register: search a serial, or list a product's/store's units. */
   @Get('serials')
   serials(@CurrentUser() u: AuthUser, @Query() q: QuerySerialsDto) {
+    // Assigned in place rather than spread: these query DTOs carry prototype
+    // getters (PaginationDto's `skip`) that a spread would silently drop.
+    q.storeId = scopeToStore(u, q.storeId);
     return this.inventory.listSerials(u.businessId, q);
   }
 
   @Get('movements')
   movements(@CurrentUser() u: AuthUser, @Query() q: QueryMovementsDto) {
+    // Assigned in place rather than spread: these query DTOs carry prototype
+    // getters (PaginationDto's `skip`) that a spread would silently drop.
+    q.storeId = scopeToStore(u, q.storeId);
     return this.inventory.movements(u.businessId, q);
   }
 

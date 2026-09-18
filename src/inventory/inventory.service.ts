@@ -682,6 +682,8 @@ export class InventoryService {
         include: {
           product: { select: { id: true, name: true } },
           user: { select: { id: true, name: true } },
+          // So an "all stores" view can say which branch each movement was at.
+          store: { select: { id: true, name: true } },
         },
         orderBy: { createdAt: 'desc' },
       }),

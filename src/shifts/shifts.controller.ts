@@ -6,6 +6,7 @@ import { CloseShiftDto, OpenShiftDto, QueryShiftDto } from './dto/shift.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
+import { scopeToStore } from '../common/store-scope';
 
 @ApiTags('shifts')
 @ApiBearerAuth()
@@ -23,8 +24,8 @@ export class ShiftsController {
   /** The caller's open shift with running totals, or null. */
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
   @Get('current')
-  current(@CurrentUser() u: AuthUser) {
-    return this.shifts.current(u);
+  current(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
+    return this.shifts.current(u, scopeToStore(u, storeId));
   }
 
   /** Shift history — owners and managers only. */

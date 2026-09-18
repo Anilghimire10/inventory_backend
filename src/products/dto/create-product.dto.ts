@@ -21,6 +21,17 @@ export class CreateProductDto {
   @MinLength(1)
   name: string;
 
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Stores that carry this product. Omit to stock it at every store.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsString({ each: true })
+  storeIds?: string[];
+
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()

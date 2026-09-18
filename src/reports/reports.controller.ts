@@ -5,6 +5,7 @@ import { ReportsService } from './reports.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
+import { scopeToStore } from '../common/store-scope';
 
 @ApiTags('reports')
 @ApiBearerAuth()
@@ -18,7 +19,11 @@ export class ReportsController {
     // management (owner/manager) only.
     const includeFinancials =
       u.role === UserRole.OWNER || u.role === UserRole.MANAGER;
-    return this.reports.dashboard(u.businessId, storeId, includeFinancials);
+    return this.reports.dashboard(
+      u.businessId,
+      scopeToStore(u, storeId),
+      includeFinancials,
+    );
   }
 
   // Financial reports & analytics are management-level.

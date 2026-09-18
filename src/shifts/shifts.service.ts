@@ -54,7 +54,7 @@ export class ShiftsService {
         err.code === 'P2002'
       ) {
         throw new BadRequestException(
-          'You already have an open shift — close it first',
+          'You already have an open shift at this store — close it first',
         );
       }
       throw err;
@@ -62,10 +62,23 @@ export class ShiftsService {
   }
 
   /** The caller's open shift plus its running totals, or null if none. */
-  async current(user: AuthUser) {
+  /**
+   * The caller's open till at a given store, or null.
+   *
+   * Scoped by store because a user may now have one open shift per store: an
+   * owner switching branch gets that branch's till, and the one they left
+   * stays open behind them rather than having to be closed first.
+   */
+  async current(user: AuthUser, storeId?: string) {
     const shift = await this.prisma.shift.findFirst({
-      where: { businessId: user.businessId, userId: user.userId, closedAt: null },
+      where: {
+        businessId: user.businessId,
+        userId: user.userId,
+        closedAt: null,
+        ...(storeId ? { storeId } : {}),
+      },
       select: { id: true },
+      orderBy: { openedAt: 'desc' },
     });
     return shift ? this.report(user.businessId, shift.id) : null;
   }

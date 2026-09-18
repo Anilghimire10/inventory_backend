@@ -5,11 +5,12 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueryCustomerDto } from './dto/query-customer.dto';
 import {
   CreateCustomerDto,
   UpdateCustomerDto,
 } from './customers.controller';
-import { PaginationDto, paginate } from '../common/dto/pagination.dto';
+import { paginate } from '../common/dto/pagination.dto';
 
 @Injectable()
 export class CustomersService {
@@ -19,9 +20,13 @@ export class CustomersService {
     return this.prisma.customer.create({ data: { businessId, ...dto } });
   }
 
-  async findAll(businessId: string, q: PaginationDto) {
+  async findAll(businessId: string, q: QueryCustomerDto) {
     const where: Prisma.CustomerWhereInput = {
       businessId,
+      // A customer belongs to the business, not a branch -- there is no
+      // Customer.storeId. "Customers of this store" therefore means the ones
+      // who have actually bought there.
+      ...(q.storeId ? { sales: { some: { storeId: q.storeId } } } : {}),
       ...(q.search
         ? {
             OR: [

@@ -11,6 +11,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { normalizeEmail } from '../common/email';
+import { PrincipalCache } from '../common/principal-cache';
 
 // Lower number = more privileged.
 const ROLE_RANK: Record<UserRole, number> = {
@@ -32,7 +33,10 @@ const SAFE_SELECT = {
 
 @Injectable()
 export class UsersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private principals: PrincipalCache,
+  ) {}
 
   async create(
     businessId: string,
@@ -111,6 +115,16 @@ export class UsersService {
     if (id === actingUserId && dto.isActive === false) {
       throw new BadRequestException('You cannot deactivate yourself');
     }
+    // Changing a password here retires every token minted under the old one.
+    // Done to yourself that includes the token making the request, and unlike
+    // AuthService.changePassword there is no fresh one to hand back -- you
+    // would simply be signed out mid-edit. That flow already exists and does
+    // it properly, so point at it instead.
+    if (id === actingUserId && dto.password) {
+      throw new BadRequestException(
+        'Use Settings → Change password to change your own password',
+      );
+    }
 
     const data: Prisma.UserUpdateInput = {
       name: dto.name,
@@ -123,9 +137,26 @@ export class UsersService {
             ? { connect: { id: dto.storeId } }
             : undefined,
     };
-    if (dto.password) data.passwordHash = await argon2.hash(dto.password);
+    if (dto.password) {
+      data.passwordHash = await argon2.hash(dto.password);
+      // An owner resetting a departing or compromised employee's password is
+      // the main reason to do it here, so the old sessions have to die with
+      // it. Without this bump their existing token stayed valid for the rest
+      // of JWT_EXPIRES_IN -- up to seven days after the reset meant to lock
+      // them out. AuthService does the same on a self-service change.
+      data.tokenVersion = { increment: 1 };
+    }
 
-    return this.prisma.user.update({ where: { id }, data, select: SAFE_SELECT });
+    const updated = await this.prisma.user.update({
+      where: { id },
+      data,
+      select: SAFE_SELECT,
+    });
+    // Always evict: the cached principal carries the role, the active flag and
+    // the tokenVersion this edit may have just changed, and would keep serving
+    // the stale copy for the rest of its TTL.
+    this.principals.evict(id);
+    return updated;
   }
 
   async remove(businessId: string, id: string, actingUserId: string) {
@@ -133,11 +164,77 @@ export class UsersService {
       throw new BadRequestException('You cannot delete yourself');
     }
     await this.findOne(businessId, id);
-    return this.prisma.user.update({
+    const deactivated = await this.prisma.user.update({
       where: { id },
       data: { isActive: false },
       select: SAFE_SELECT,
     });
+    // JwtStrategy refuses an inactive user, but only once it reaches the
+    // database -- a cached principal would keep them working until it expires.
+    this.principals.evict(id);
+    return deactivated;
+  }
+
+  /**
+   * Permanently delete a staff member. Deliberately narrow: the row only goes
+   * away when nothing in the business refers to it.
+   *
+   * Two gates, because the alternative is destroying the books:
+   *  - The account must already be deactivated. Deletion is the second step of
+   *    an offboarding that starts with `remove()`, never a one-click action on
+   *    a working account.
+   *  - They must have no sales, shifts or stock movements. Sale.userId and
+   *    StockMovement.userId are optional (onDelete defaults to SetNull), so a
+   *    delete here would silently blank out who rang up every sale rather than
+   *    fail loudly; Shift.userId is required, so the database would reject it
+   *    with a raw foreign-key error instead. Both outcomes are wrong, so we
+   *    check first and explain what to do instead.
+   *
+   * What remains is the case this is actually for: a typo'd or never-used
+   * account. EmailTokens cascade; the AuditLog rows recording the account's
+   * own creation survive with a null actor (onDelete: SetNull).
+   */
+  async destroy(businessId: string, id: string, actingUserId: string) {
+    if (id === actingUserId) {
+      throw new BadRequestException('You cannot delete yourself');
+    }
+    const target = await this.prisma.user.findFirst({
+      where: { id, businessId },
+      select: SAFE_SELECT,
+    });
+    if (!target) throw new NotFoundException('User not found');
+    if (target.isActive) {
+      throw new BadRequestException(
+        'Deactivate this staff member before deleting them permanently',
+      );
+    }
+
+    const [sales, shifts, movements] = await Promise.all([
+      this.prisma.sale.count({ where: { userId: id } }),
+      this.prisma.shift.count({ where: { userId: id } }),
+      this.prisma.stockMovement.count({ where: { userId: id } }),
+    ]);
+    const history = [
+      sales && `${sales} sale${sales === 1 ? '' : 's'}`,
+      shifts && `${shifts} shift${shifts === 1 ? '' : 's'}`,
+      movements &&
+        `${movements} stock movement${movements === 1 ? '' : 's'}`,
+    ].filter(Boolean);
+    if (history.length) {
+      throw new ConflictException(
+        `${target.name} has ${history.join(', ')} on record and cannot be deleted. ` +
+          'They stay deactivated so the history keeps its owner.',
+      );
+    }
+
+    const deleted = await this.prisma.user.delete({
+      where: { id },
+      select: SAFE_SELECT,
+    });
+    // The principal cache would otherwise keep serving this now-deleted user
+    // for the rest of its TTL.
+    this.principals.evict(id);
+    return deleted;
   }
 
   /**

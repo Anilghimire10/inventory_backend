@@ -8,11 +8,20 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 export class CreditService {
   constructor(private prisma: PrismaService) {}
 
-  /** Headline totals for the Credit dashboard (all computed server-side). */
-  async summary(businessId: string) {
+  /**
+   * Headline totals for the Credit dashboard (all computed server-side).
+   *
+   * `storeId` does not mean the same thing on both sides, and the flag below
+   * says so. Payables come from purchases, which carry a storeId, so they
+   * scope exactly. Receivables come from Customer.creditBalance -- one number
+   * per customer for the whole business, decremented by payCredit with no
+   * store attribution -- so a branch's share of it cannot be derived. Filtered
+   * by store it means "owed by customers who buy here", still in full.
+   */
+  async summary(businessId: string, storeId?: string) {
     const [receivables, payables] = await Promise.all([
-      this.receivables(businessId),
-      this.payables(businessId),
+      this.receivables(businessId, storeId),
+      this.payables(businessId, storeId),
     ]);
     const receivablesTotal = round2(
       receivables.reduce((s, c) => s + c.balance, 0),
@@ -26,6 +35,9 @@ export class CreditService {
       netPosition: round2(receivablesTotal - payablesTotal),
       customersOwing: receivables.length,
       suppliersOwed: payables.length,
+      /** True when receivablesTotal is a business-wide figure shown under a
+       *  store filter, so the UI can label it rather than imply a branch total. */
+      receivablesAreBusinessWide: !!storeId,
     };
   }
 
@@ -33,15 +45,25 @@ export class CreditService {
    * Money customers owe us. One entry per customer with a positive credit
    * balance, plus their credit-sale invoices for context.
    */
-  async receivables(businessId: string) {
+  async receivables(businessId: string, storeId?: string) {
+    const creditSale = {
+      paymentMethod: { in: [PaymentMethod.CREDIT, PaymentMethod.MIXED] },
+      ...(storeId ? { storeId } : {}),
+    };
     const customers = await this.prisma.customer.findMany({
-      where: { businessId, creditBalance: { gt: 0 } },
+      where: {
+        businessId,
+        creditBalance: { gt: 0 },
+        // Under a store filter this narrows *which* customers appear, never
+        // their balance: what they owe is owed to the business.
+        ...(storeId ? { sales: { some: creditSale } } : {}),
+      },
       orderBy: { creditBalance: 'desc' },
       include: {
         sales: {
-          where: {
-            paymentMethod: { in: [PaymentMethod.CREDIT, PaymentMethod.MIXED] },
-          },
+          // The invoice list is context for the balance, so it follows the
+          // filter even though the balance itself cannot.
+          where: creditSale,
           orderBy: { createdAt: 'desc' },
           take: 50,
           select: {
@@ -76,9 +98,14 @@ export class CreditService {
    * Money we owe suppliers. One entry per supplier (plus an "unassigned"
    * bucket for supplier-less purchases) with the outstanding purchase invoices.
    */
-  async payables(businessId: string) {
+  async payables(businessId: string, storeId?: string) {
     const purchases = await this.prisma.purchase.findMany({
-      where: { businessId, status: { not: PurchaseStatus.CANCELLED } },
+      // Purchases carry a storeId, so this side scopes exactly.
+      where: {
+        businessId,
+        status: { not: PurchaseStatus.CANCELLED },
+        ...(storeId ? { storeId } : {}),
+      },
       orderBy: { createdAt: 'desc' },
       include: { supplier: { select: { id: true, name: true } } },
     });

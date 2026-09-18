@@ -9,6 +9,7 @@ import { HealthController } from './health.controller';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { validateEnv } from './common/env.validation';
 import { RolesGuard } from './common/guards/roles.guard';
+import { StoreScopeGuard } from './common/guards/store-scope.guard';
 
 import { AuditModule } from './audit/audit.module';
 import { AuditInterceptor } from './audit/audit.interceptor';
@@ -75,6 +76,9 @@ import { ShiftsModule } from './shifts/shifts.module';
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     // Global role enforcement for routes that declare @Roles(...)
     { provide: APP_GUARD, useClass: RolesGuard },
+    // Pins cashiers/stock keepers to the store they are assigned to. Runs
+    // after RolesGuard so req.user is populated and the role is already known.
+    { provide: APP_GUARD, useClass: StoreScopeGuard },
     // Records successful state-changing requests into the audit log.
     { provide: APP_INTERCEPTOR, useClass: AuditInterceptor },
   ],

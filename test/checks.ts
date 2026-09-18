@@ -7,13 +7,17 @@
  * an integration suite.
  */
 import assert from 'assert';
-import { PaymentMethod, Prisma, SaleStatus } from '@prisma/client';
+import { PaymentMethod, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { SalesService } from '../src/sales/sales.service';
 import { MailService } from '../src/mail/mail.service';
 import { InventoryService } from '../src/inventory/inventory.service';
 import { PurchasesService } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
+import { UsersService } from '../src/users/users.service';
+import { StoreScopeGuard } from '../src/common/guards/store-scope.guard';
+import { scopeToStore } from '../src/common/store-scope';
+import { StoresService } from '../src/stores/stores.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
 import { allowsFraction, normalizeUnit } from '../src/common/units';
@@ -186,6 +190,7 @@ async function variantGenerationCoversEveryCombination() {
     categories: [{ id: 'c1' }],
   };
   const created: any[] = [];
+  const seeded: any[] = [];
   const prisma = stub<PrismaService>({
     product: {
       findFirst: async () => parent,
@@ -196,8 +201,24 @@ async function variantGenerationCoversEveryCombination() {
         return { ...data, id: `v${created.length}` };
       },
     },
-    store: { findMany: async () => [{ id: 's1' }, { id: 's2' }] },
-    stockItem: { createMany: async () => ({ count: 4 }) },
+    store: {
+      // Honours the id filter, so seedStockRows' "are these stores real?"
+      // check sees the same set it asked for.
+      findMany: async (args: any) => {
+        const all = [{ id: 's1' }, { id: 's2' }];
+        const ids: string[] | undefined = args?.where?.id?.in;
+        return ids ? all.filter((s) => ids.includes(s.id)) : all;
+      },
+    },
+    stockItem: {
+      // A variant is carried wherever its parent is: the parent stocks s1
+      // only, so every generated variant must land in s1 and not s2.
+      findMany: async () => [{ storeId: 's1' }],
+      createMany: async ({ data }: any) => {
+        seeded.push(...data);
+        return { count: data.length };
+      },
+    },
   });
   const service = new ProductsService(prisma);
 
@@ -222,6 +243,14 @@ async function variantGenerationCoversEveryCombination() {
   assert.strictEqual(Number(blueM.sellingPrice), 12, 'price override applies');
   assert.strictEqual(Number(blueM.costPrice), 3, 'cost falls back to the parent');
   assert.strictEqual(blueM.parentId, 'p1');
+
+  // The parent is carried at s1 only, so no variant may appear at s2 -- that
+  // would put a size on a shelf that does not stock the style.
+  assert.strictEqual(seeded.length, 3, 'one stock row per created variant');
+  assert.ok(
+    seeded.every((r) => r.storeId === 's1'),
+    'variants are stocked only where their parent is carried',
+  );
 }
 
 async function serialRulesGuardEveryUnit() {
@@ -668,6 +697,390 @@ async function principalCacheCannotResurrectARetiredToken() {
   );
 }
 
+/**
+ * Permanent staff deletion is the one irreversible action on the Staff screen,
+ * and the schema makes a careless one destructive: Sale.userId and
+ * StockMovement.userId are optional (SetNull), so deleting a user who sold
+ * things silently blanks out who sold them, while Shift.userId is required and
+ * would fail with a raw foreign-key error instead. Both gates are checked here.
+ */
+async function permanentDeleteRefusesToDestroyHistory() {
+  const evicted: string[] = [];
+  const principals = stub<PrincipalCache>({ evict: (id: string) => evicted.push(id) });
+  let deleted: string | null = null;
+
+  const makeService = (
+    target: { id: string; name: string; isActive: boolean } | null,
+    counts: { sales: number; shifts: number; movements: number },
+  ) =>
+    new UsersService(
+      stub<PrismaService>({
+        user: {
+          findFirst: async () => target,
+          delete: async (args: any) => {
+            deleted = args.where.id;
+            return target;
+          },
+        },
+        sale: { count: async () => counts.sales },
+        shift: { count: async () => counts.shifts },
+        stockMovement: { count: async () => counts.movements },
+      }),
+      principals,
+    );
+
+  const none = { sales: 0, shifts: 0, movements: 0 };
+
+  // You cannot delete yourself, whatever state the account is in.
+  await assert.rejects(
+    makeService({ id: 'u1', name: 'Me', isActive: false }, none).destroy('b1', 'u1', 'u1'),
+    /cannot delete yourself/,
+    'self-deletion must be refused',
+  );
+
+  // An active account has to be deactivated first -- delete is step two.
+  await assert.rejects(
+    makeService({ id: 'u2', name: 'Ana', isActive: true }, none).destroy('b1', 'u2', 'u1'),
+    /Deactivate this staff member/,
+    'an active staff member must not be deleted outright',
+  );
+
+  // Another business's user is invisible, so deletion cannot cross the tenant line.
+  await assert.rejects(
+    makeService(null, none).destroy('b1', 'other', 'u1'),
+    /User not found/,
+    'deletion must be scoped to the caller\'s business',
+  );
+
+  // History of any kind blocks the delete, and the message says what is there.
+  for (const [counts, expected] of [
+    [{ sales: 42, shifts: 0, movements: 0 }, /42 sales/],
+    [{ sales: 0, shifts: 1, movements: 0 }, /1 shift(?!s)/],
+    [{ sales: 0, shifts: 0, movements: 7 }, /7 stock movements/],
+  ] as const) {
+    await assert.rejects(
+      makeService({ id: 'u3', name: 'Ana', isActive: false }, counts).destroy('b1', 'u3', 'u1'),
+      expected,
+      `history (${JSON.stringify(counts)}) must block permanent deletion`,
+    );
+  }
+  assert.strictEqual(deleted, null, 'nothing may be deleted while history exists');
+
+  // The case it is actually for: a deactivated account that never did anything.
+  await makeService({ id: 'u4', name: 'Typo', isActive: false }, none).destroy('b1', 'u4', 'u1');
+  assert.strictEqual(deleted, 'u4', 'a clean deactivated account is deleted');
+  assert.ok(
+    evicted.includes('u4'),
+    'a deleted user must be evicted from the principal cache, not served from it',
+  );
+}
+
+/**
+ * `User.storeId` used to be only a default: services read it as a fallback and
+ * then checked the resulting store against the *business*, never against the
+ * caller. A cashier assigned to one branch could name another branch outright
+ * -- verified against a running API before this guard existed, where a cashier
+ * assigned to Main Store opened a till at a second branch and got a 201.
+ */
+function staffCannotReachAnotherStore() {
+  const guard = new StoreScopeGuard();
+  const ctx = (user: unknown, body: unknown = {}, query: unknown = {}) =>
+    ({ switchToHttp: () => ({ getRequest: () => ({ user, body, query }) }) }) as any;
+
+  const MINE = 'store-a';
+  const OTHER = 'store-b';
+  const cashier = { userId: 'u1', businessId: 'b1', storeId: MINE, role: 'CASHIER', email: 'c@x' };
+  const keeper = { ...cashier, role: 'STOCK_KEEPER' };
+  const roaming = { ...cashier, storeId: null };
+  const manager = { ...cashier, role: 'MANAGER' };
+  const owner = { ...cashier, role: 'OWNER' };
+
+  // Naming another store is refused, wherever the id rides.
+  for (const [who, label] of [[cashier, 'cashier'], [keeper, 'stock keeper']] as const) {
+    for (const field of ['storeId', 'fromStoreId', 'toStoreId']) {
+      assert.throws(
+        () => guard.canActivate(ctx(who, { [field]: OTHER })),
+        /only work on the store you are assigned to/,
+        `a ${label} must not act on another store via body.${field}`,
+      );
+      assert.throws(
+        () => guard.canActivate(ctx(who, {}, { [field]: OTHER })),
+        /only work on the store you are assigned to/,
+        `a ${label} must not read another store via query.${field}`,
+      );
+    }
+    // Their own store, and naming none at all, stay allowed.
+    assert.ok(guard.canActivate(ctx(who, { storeId: MINE })), 'own store is allowed');
+    assert.ok(guard.canActivate(ctx(who, {})), 'naming no store is allowed');
+    assert.ok(guard.canActivate(ctx(who, { storeId: '' })), 'the empty filter is allowed');
+    assert.ok(guard.canActivate(ctx(who, { storeId: null })), 'an explicit null is allowed');
+  }
+
+
+  // A transfer names two stores that must differ, so the two directions are
+  // judged separately: you may push stock out of your own branch to anywhere,
+  // but you may not pull from a branch you do not stand at.
+  assert.ok(
+    guard.canActivate(ctx(keeper, { fromStoreId: MINE, toStoreId: OTHER })),
+    'a stock keeper may send their own stock to another branch',
+  );
+  assert.throws(
+    () => guard.canActivate(ctx(keeper, { fromStoreId: OTHER, toStoreId: MINE })),
+    /only work on the store you are assigned to/,
+    'pulling stock out of another branch must still be refused',
+  );
+  assert.throws(
+    () => guard.canActivate(ctx(keeper, { fromStoreId: OTHER, toStoreId: 'store-c' })),
+    /only work on the store you are assigned to/,
+    'a transfer between two other branches must be refused',
+  );
+  // The exemption is tied to the source being theirs -- it must not leak into
+  // a plain toStoreId on some other kind of request.
+  assert.throws(
+    () => guard.canActivate(ctx(keeper, { toStoreId: OTHER })),
+    /only work on the store you are assigned to/,
+    'toStoreId alone, with no outbound source, stays pinned',
+  );
+
+  // Management moves between branches; so does staff with nothing assigned.
+  for (const [who, label] of [
+    [owner, 'owner'], [manager, 'manager'], [roaming, 'unassigned staff'],
+  ] as const) {
+    assert.ok(
+      guard.canActivate(ctx(who, { storeId: OTHER })),
+      `${label} must stay free to work across stores`,
+    );
+  }
+
+  // A @Public route has no principal to pin.
+  assert.ok(guard.canActivate(ctx(undefined, { storeId: OTHER })), 'public routes pass');
+
+  // The other half: an *unfiltered* list. The guard has nothing to compare
+  // when the field is absent, so pinned staff get scoped rather than shown
+  // every branch.
+  assert.strictEqual(scopeToStore(cashier as any, undefined), MINE, 'pinned staff are scoped');
+  assert.strictEqual(scopeToStore(cashier as any, ''), MINE, '"all stores" still means theirs');
+  assert.strictEqual(scopeToStore(keeper as any, MINE), MINE, 'their own filter survives');
+  assert.strictEqual(scopeToStore(owner as any, undefined), undefined, 'an owner sees every store');
+  assert.strictEqual(scopeToStore(manager as any, OTHER), OTHER, 'a manager may filter freely');
+  assert.strictEqual(scopeToStore(roaming as any, undefined), undefined, 'unassigned staff see all');
+}
+
+/**
+ * Per-store catalogs are encoded as StockItem rows: a store carries a product
+ * exactly when a row exists for it. Dropping a store therefore deletes a row,
+ * which would take any quantity on it with it -- so a branch still holding
+ * stock, batches or serials must block the drop rather than silently write it
+ * off. Variants move with their parent.
+ */
+async function productStoresCannotSilentlyWriteOffStock() {
+  const make = (opts: {
+    stock: { storeId: string; productId: string; quantity: number }[];
+    batches?: { storeId: string }[];
+    serials?: { storeId: string | null }[];
+    variants?: { id: string }[];
+  }) => {
+    const deleted: unknown[] = [];
+    const created: unknown[] = [];
+    const svc = new ProductsService(
+      stub<PrismaService>({
+        product: {
+          findFirst: async () => ({ id: 'p1', name: 'Rice 5kg' }),
+          findMany: async () => opts.variants ?? [],
+        },
+        store: {
+          findMany: async (args: any) => {
+            const ids: string[] = args?.where?.id?.in ?? ['s1', 's2'];
+            return ids.map((id) => ({ id, name: id.toUpperCase() }));
+          },
+        },
+        stockItem: {
+          findMany: async () => opts.stock,
+          deleteMany: async (a: unknown) => { deleted.push(a); return { count: 1 }; },
+          createMany: async (a: unknown) => { created.push(a); return { count: 1 }; },
+        },
+        batch: { findMany: async () => opts.batches ?? [] },
+        serial: { findMany: async () => opts.serials ?? [] },
+        $transaction: async (fn: any) =>
+          fn({
+            stockItem: {
+              deleteMany: async (a: unknown) => { deleted.push(a); return { count: 1 }; },
+              createMany: async (a: unknown) => { created.push(a); return { count: 1 }; },
+            },
+          }),
+      }),
+    );
+    return { svc, deleted, created };
+  };
+
+  // A product carried nowhere is invisible everywhere.
+  await assert.rejects(
+    make({ stock: [] }).svc.setStores('b1', 'p1', []),
+    /at least one store/,
+    'an empty store list must be refused',
+  );
+
+  // Dropping a branch that still holds units.
+  await assert.rejects(
+    make({ stock: [{ storeId: 's2', productId: 'p1', quantity: 4 }] })
+      .svc.setStores('b1', 'p1', ['s1']),
+    /still has stock at/,
+    'a branch holding quantity must not be dropped',
+  );
+
+  // ...or batches, or serials -- each blocks on its own.
+  await assert.rejects(
+    make({
+      stock: [{ storeId: 's2', productId: 'p1', quantity: 0 }],
+      batches: [{ storeId: 's2' }],
+    }).svc.setStores('b1', 'p1', ['s1']),
+    /still has stock at/,
+    'a branch holding batches must not be dropped',
+  );
+  await assert.rejects(
+    make({
+      stock: [{ storeId: 's2', productId: 'p1', quantity: 0 }],
+      serials: [{ storeId: 's2' }],
+    }).svc.setStores('b1', 'p1', ['s1']),
+    /still has stock at/,
+    'a branch holding serials must not be dropped',
+  );
+
+  // An unassigned serial pins no store, so it must not block anything.
+  const loose = make({
+    stock: [{ storeId: 's2', productId: 'p1', quantity: 0 }],
+    serials: [{ storeId: null }],
+  });
+  await loose.svc.setStores('b1', 'p1', ['s1']);
+  assert.strictEqual(loose.deleted.length, 1, 'an empty branch is dropped');
+
+  // Variants follow their parent.
+  const withVariants = make({
+    stock: [{ storeId: 's1', productId: 'p1', quantity: 0 }],
+    variants: [{ id: 'v1' }, { id: 'v2' }],
+  });
+  const res = await withVariants.svc.setStores('b1', 'p1', ['s1', 's2']);
+  assert.strictEqual(res.variantsUpdated, 2, 'variants move with the parent');
+  const rows = (withVariants.created[0] as any).data as any[];
+  assert.ok(
+    rows.some((r) => r.productId === 'v1' && r.storeId === 's2'),
+    'a newly carried store gets a row for each variant too',
+  );
+  assert.ok(
+    rows.every((r) => Number(r.quantity) === 0),
+    'a newly carried store starts at zero, never inheriting a quantity',
+  );
+}
+
+/**
+ * A password reset by an owner has to kill the target's sessions as hard as a
+ * self-service change does. It did not: AuthService bumped tokenVersion and
+ * evicted, UsersService.update only rewrote the hash -- so an owner resetting
+ * a departing employee's password left that employee's token working for the
+ * rest of JWT_EXPIRES_IN, up to seven days past the reset meant to lock them
+ * out.
+ */
+async function anAdminPasswordResetEndsTheirSessions() {
+  const evicted: string[] = [];
+  const target = { id: 'u2', role: UserRole.CASHIER, businessId: 'b1', isActive: true };
+  let written: any = null;
+
+  const makeService = () =>
+    new UsersService(
+      stub<PrismaService>({
+        user: {
+          findFirst: async () => target,
+          findUnique: async () => null,
+          update: async (args: any) => {
+            written = args.data;
+            return { id: target.id };
+          },
+        },
+        store: { findFirst: async () => ({ id: 's1' }) },
+      }),
+      stub<PrincipalCache>({ evict: (id: string) => evicted.push(id) }),
+    );
+
+  // An owner resetting someone else's password.
+  await makeService().update('b1', 'u2', { password: 'newpassword1' }, UserRole.OWNER, 'u1');
+  assert.ok(written.passwordHash, 'the new password is hashed');
+  assert.deepStrictEqual(
+    written.tokenVersion,
+    { increment: 1 },
+    'the reset must retire every token minted under the old password',
+  );
+  assert.ok(evicted.includes('u2'), 'the cached principal must go with it');
+
+  // A plain rename touches neither, but still drops the cache -- the entry
+  // carries the role and active flag an edit may have just changed.
+  evicted.length = 0;
+  await makeService().update('b1', 'u2', { name: 'Renamed' }, UserRole.OWNER, 'u1');
+  assert.strictEqual(written.tokenVersion, undefined, 'a rename retires no tokens');
+  assert.ok(evicted.includes('u2'), 'any edit drops the cached principal');
+
+  // Resetting your *own* password here would sign you out mid-edit with no
+  // replacement token; AuthService.changePassword is the flow that does it
+  // properly, so this one refuses.
+  await assert.rejects(
+    makeService().update('b1', 'u1', { password: 'newpassword1' }, UserRole.OWNER, 'u1'),
+    /Change password/,
+    'self password change must be sent to the flow that returns a fresh token',
+  );
+
+  // Deactivating must drop the cache too: JwtStrategy refuses an inactive
+  // user, but only once it gets past the cache.
+  evicted.length = 0;
+  await makeService().remove('b1', 'u2', 'u1');
+  assert.ok(evicted.includes('u2'), 'a deactivated user must not be served from cache');
+}
+
+/**
+ * ProductsService seeds a new product into every existing store. The mirror
+ * image was missing: a new store inherited nothing, so a branch opened with an
+ * empty catalog and every product had to be added back one dialog at a time.
+ */
+async function aNewStoreOpensCarryingTheCatalog() {
+  let created: any = null;
+  const svc = new StoresService(
+    stub<PrismaService>({
+      store: { create: async () => ({ id: 's2', businessId: 'b1', name: 'Branch' }) },
+      product: {
+        findMany: async () => [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }],
+      },
+      stockItem: {
+        createMany: async (args: any) => {
+          created = args.data;
+          return { count: args.data.length };
+        },
+      },
+    }),
+  );
+
+  const store = await svc.create('b1', { name: 'Branch' } as any);
+  assert.strictEqual(store.id, 's2');
+  assert.strictEqual(created.length, 3, 'every existing product reaches the new store');
+  assert.ok(
+    created.every((r: any) => r.storeId === 's2' && r.businessId === 'b1'),
+    'the rows belong to the new store and its business',
+  );
+  assert.ok(
+    created.every((r: any) => Number(r.quantity) === 0),
+    'a new branch starts at zero -- seeding must never invent stock',
+  );
+
+  // A business with no products yet must not blow up on an empty createMany.
+  let touched = false;
+  const empty = new StoresService(
+    stub<PrismaService>({
+      store: { create: async () => ({ id: 's3' }) },
+      product: { findMany: async () => [] },
+      stockItem: { createMany: async () => { touched = true; return { count: 0 }; } },
+    }),
+  );
+  await empty.create('b1', { name: 'First' } as any);
+  assert.strictEqual(touched, false, 'no products means no seeding call at all');
+}
+
 async function main() {
   await shiftReportBalancesTheDrawer();
   await stockTakePreviewComputesVariances();
@@ -679,6 +1092,11 @@ async function main() {
   await aStaleReadCannotOverReturnALine();
   envValidationRefusesUnsafeConfig();
   await principalCacheCannotResurrectARetiredToken();
+  await permanentDeleteRefusesToDestroyHistory();
+  staffCannotReachAnotherStore();
+  await productStoresCannotSilentlyWriteOffStock();
+  await anAdminPasswordResetEndsTheirSessions();
+  await aNewStoreOpensCarryingTheCatalog();
   console.log('checks passed');
 }
 

@@ -27,7 +27,8 @@ import { CustomersService } from './customers.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
-import { PaginationDto } from '../common/dto/pagination.dto';
+import { scopeToStore } from '../common/store-scope';
+import { QueryCustomerDto } from './dto/query-customer.dto';
 
 export class CreateCustomerDto {
   @ApiProperty()
@@ -71,7 +72,10 @@ export class CustomersController {
   }
 
   @Get()
-  findAll(@CurrentUser() u: AuthUser, @Query() q: PaginationDto) {
+  findAll(@CurrentUser() u: AuthUser, @Query() q: QueryCustomerDto) {
+    // Assigned in place rather than spread: PaginationDto's `skip` is a
+    // prototype getter that a spread would drop.
+    q.storeId = scopeToStore(u, q.storeId);
     return this.customers.findAll(u.businessId, q);
   }
 

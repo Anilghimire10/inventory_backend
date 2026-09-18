@@ -4,6 +4,14 @@ import { IsArray, IsBoolean, IsOptional, IsString } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
 export class QueryProductDto extends PaginationDto {
+  @ApiPropertyOptional({
+    description:
+      'Only products this store carries. Staff pinned to a store always get their own.',
+  })
+  @IsOptional()
+  @IsString()
+  storeId?: string;
+
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()

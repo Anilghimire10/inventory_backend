@@ -19,6 +19,7 @@ import { QuerySaleDto } from './dto/query-sale.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
+import { scopeToStore } from '../common/store-scope';
 
 export class EmailReceiptDto {
   @ApiPropertyOptional({ description: 'Override recipient; defaults to the customer email' })
@@ -84,6 +85,9 @@ export class SalesController {
 
   @Get()
   findAll(@CurrentUser() u: AuthUser, @Query() q: QuerySaleDto) {
+    // Assigned in place rather than spread: QuerySaleDto carries prototype
+    // getters (PaginationDto's `skip`) that a spread would silently drop.
+    q.storeId = scopeToStore(u, q.storeId);
     return this.sales.findAll(u.businessId, q);
   }
 

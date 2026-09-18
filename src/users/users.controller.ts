@@ -47,8 +47,19 @@ export class UsersController {
     return this.users.update(u.businessId, id, dto, u.role, u.userId);
   }
 
+  /** Deactivate: the reversible first step of offboarding. */
   @Delete(':id')
   remove(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.users.remove(u.businessId, id, u.userId);
+  }
+
+  /**
+   * Permanently delete an already-deactivated staff member.
+   * Owner-only: it is the one irreversible action on this screen.
+   */
+  @Roles(UserRole.OWNER)
+  @Delete(':id/permanent')
+  destroy(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.users.destroy(u.businessId, id, u.userId);
   }
 }
