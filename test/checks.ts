@@ -7,10 +7,14 @@
  * an integration suite.
  */
 import assert from 'assert';
+import { createHash } from 'crypto';
+import { JwtService } from '@nestjs/jwt';
 import { PaymentMethod, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { SalesService } from '../src/sales/sales.service';
 import { MailService } from '../src/mail/mail.service';
+import { AuthService } from '../src/auth/auth.service';
+import { AuditService } from '../src/audit/audit.service';
 import { InventoryService } from '../src/inventory/inventory.service';
 import { PurchasesService } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
@@ -620,6 +624,112 @@ function envValidationRefusesUnsafeConfig() {
     /MAIL_TRANSPORT/,
     'an unknown transport is a typo, not a silent fallback',
   );
+
+}
+
+/**
+ * POST /auth/verify-email is @Public(), and it used to check the emailed code
+ * only when the account was still unverified -- the check sat inside
+ * `if (!user.emailVerified)` while issueToken() ran unconditionally after it.
+ * So for any already-verified account the code was never looked at and the
+ * endpoint returned a working session to whoever asked, OWNER accounts
+ * included; knowing the email address was the entire attack. Both halves are
+ * pinned here: the code must be required in every case, and a verified
+ * account must fail exactly the way a wrong code does, with no distinguishing
+ * message that would turn this into an account-enumeration oracle.
+ */
+async function verifyEmailAlwaysRequiresTheCode() {
+  const TOKEN = 'signed-token';
+
+  const makeService = (
+    user: { id: string; emailVerified: boolean } | null,
+    liveCodeHash: string | null,
+  ) => {
+    let consumed = false;
+    let markedVerified = false;
+    const prisma = stub<PrismaService>({
+      user: {
+        findUnique: async () =>
+          user && {
+            ...user,
+            businessId: 'b1',
+            email: 'owner@example.com',
+            name: 'Owner',
+            role: 'OWNER',
+            tokenVersion: 0,
+          },
+        update: async () => {
+          markedVerified = true;
+          return user;
+        },
+      },
+      emailToken: {
+        // Mirrors the real consumeCode(): the claim only succeeds when a live
+        // token row matches the hash of the code that was sent.
+        updateMany: async (args: any) => {
+          if (args.data?.consumedAt && liveCodeHash &&
+              args.where?.codeHash === liveCodeHash && !consumed) {
+            consumed = true;
+            return { count: 1 };
+          }
+          return { count: 0 };
+        },
+      },
+    });
+    const service = new AuthService(
+      prisma,
+      stub<JwtService>({ sign: () => TOKEN }),
+      stub<MailService>({}),
+      stub<AuditService>({ record: async () => undefined }),
+      stub<PrincipalCache>({ evict: () => undefined }),
+    );
+    return { service, verified: () => markedVerified };
+  };
+
+  const hashOf = (code: string) =>
+    createHash('sha256').update(code).digest('hex');
+
+  // An unverified account with a live code: the happy path still works, and
+  // the account is actually flipped to verified.
+  const good = makeService({ id: 'u1', emailVerified: false }, hashOf('123456'));
+  const result = await good.service.verifyEmail('owner@example.com', '123456');
+  assert.strictEqual(result.accessToken, TOKEN, 'the right code still signs in');
+  assert.ok(good.verified(), 'the account is marked verified');
+
+  // The bug: a verified account has no outstanding code, so nothing can be
+  // claimed -- and that must be refused rather than waved through.
+  const already = makeService({ id: 'u1', emailVerified: true }, null);
+  await assert.rejects(
+    already.service.verifyEmail('owner@example.com', '000000'),
+    /Invalid or expired code/,
+    'a verified account must not hand out a token for a bogus code',
+  );
+
+  // The wrong code against an unverified account, for the comparison that
+  // matters: the two failures must be indistinguishable to the caller.
+  const wrong = makeService({ id: 'u1', emailVerified: false }, hashOf('123456'));
+  const [verifiedErr, wrongErr] = await Promise.all([
+    already.service.verifyEmail('owner@example.com', '000000').catch((e) => e),
+    wrong.service.verifyEmail('owner@example.com', '999999').catch((e) => e),
+  ]);
+  assert.strictEqual(
+    verifiedErr.message,
+    wrongErr.message,
+    'a verified account and a wrong code must be indistinguishable',
+  );
+  assert.strictEqual(
+    verifiedErr.getStatus(),
+    wrongErr.getStatus(),
+    'and must carry the same status code',
+  );
+
+  // No account at all: same again, or the endpoint reveals which emails exist.
+  const missing = makeService(null, null);
+  await assert.rejects(
+    missing.service.verifyEmail('nobody@example.com', '123456'),
+    /Invalid or expired code/,
+    'an unknown address must not be distinguishable either',
+  );
 }
 
 /**
@@ -1090,6 +1200,7 @@ async function main() {
   await unitsGovernFractionalQuantities();
   await partReturnLeavesTheSalePartiallyReturned();
   await aStaleReadCannotOverReturnALine();
+  await verifyEmailAlwaysRequiresTheCode();
   envValidationRefusesUnsafeConfig();
   await principalCacheCannotResurrectARetiredToken();
   await permanentDeleteRefusesToDestroyHistory();

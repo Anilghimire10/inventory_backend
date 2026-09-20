@@ -116,19 +116,37 @@ export class AuthService {
     }
   }
 
-  /** Confirm the emailed code, mark the account verified, and log the user in. */
+  /**
+   * Confirm the emailed code, mark the account verified, and log the user in.
+   *
+   * The code is checked unconditionally. It used to be checked only when the
+   * account was still unverified -- the whole block sat inside
+   * `if (!user.emailVerified)` while issueToken() ran either way -- so for any
+   * account that had already been verified the check was skipped and a token
+   * was handed back regardless of what code was sent. This endpoint is
+   * @Public(), so knowing an email address was enough to get a working
+   * session for it, OWNER accounts included.
+   *
+   * A verified account never has an outstanding EMAIL_VERIFY code (register
+   * issues one, and resendVerification() declines to issue another once
+   * verified), so consumeCode() finds nothing to claim and it now fails the
+   * same way a wrong code does -- deliberately with the same message, since a
+   * distinct "already verified" would let an anonymous caller enumerate which
+   * addresses hold accounts.
+   */
   async verifyEmail(rawEmail: string, code: string) {
     const email = normalizeEmail(rawEmail);
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (!user) throw new BadRequestException('Invalid or expired code');
 
+    const ok = await this.consumeCode(
+      user.id,
+      EmailTokenType.EMAIL_VERIFY,
+      code,
+    );
+    if (!ok) throw new BadRequestException('Invalid or expired code');
+
     if (!user.emailVerified) {
-      const ok = await this.consumeCode(
-        user.id,
-        EmailTokenType.EMAIL_VERIFY,
-        code,
-      );
-      if (!ok) throw new BadRequestException('Invalid or expired code');
       await this.prisma.user.update({
         where: { id: user.id },
         data: { emailVerified: true },
