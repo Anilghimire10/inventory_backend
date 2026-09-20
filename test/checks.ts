@@ -7,7 +7,7 @@
  * an integration suite.
  */
 import assert from 'assert';
-import { PaymentMethod } from '@prisma/client';
+import { PaymentMethod, Prisma } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { InventoryService } from '../src/inventory/inventory.service';
 import { PurchasesService } from '../src/purchases/purchases.service';
@@ -15,6 +15,18 @@ import { ProductsService } from '../src/products/products.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
 import { allowsFraction, normalizeUnit } from '../src/common/units';
+import {
+  DAY_MS,
+  addMonths,
+  daysUntil,
+  paymentPeriod,
+  subscriptionStatus,
+  trialEndsAt,
+} from '../src/common/subscription';
+import { MailService } from '../src/mail/mail.service';
+import { PlatformAdminsService } from '../src/platform/platform-admins.service';
+import { PlatformAuditService } from '../src/platform/platform-audit.service';
+import { SubscriptionRemindersService } from '../src/platform/subscription-reminders.service';
 
 const stub = <T>(impl: unknown) => impl as T;
 const user: AuthUser = {
@@ -336,7 +348,114 @@ async function unitsGovernFractionalQuantities() {
   );
 }
 
+/**
+ * Manual subscriptions: what the admin panel labels a business, and what a
+ * recorded payment does to its paid-until date. Getting this wrong either
+ * locks out a shop that paid or gives away months for free.
+ */
+function subscriptionRules() {
+  const now = new Date('2026-09-19T09:00:00Z');
+  const inDays = (d: number) => new Date(now.getTime() + d * DAY_MS);
+
+  // Labels, in priority order.
+  assert.strictEqual(subscriptionStatus({ isSubscribed: false, subscribedTo: inDays(30) }, 3, now), 'inactive');
+  assert.strictEqual(subscriptionStatus({ isSubscribed: true, subscribedTo: inDays(-1) }, 3, now), 'expired');
+  assert.strictEqual(subscriptionStatus({ isSubscribed: true, subscribedTo: inDays(2) }, 0, now), 'trial', 'never paid + end date = trial, even when ending soon');
+  assert.strictEqual(subscriptionStatus({ isSubscribed: true, subscribedTo: inDays(5) }, 1, now), 'expiring');
+  assert.strictEqual(subscriptionStatus({ isSubscribed: true, subscribedTo: inDays(40) }, 1, now), 'active');
+  assert.strictEqual(subscriptionStatus({ isSubscribed: true, subscribedTo: null }, 0, now), 'active', 'no end date never expires');
+
+  // Calendar months clamp to the month's end instead of spilling over.
+  assert.strictEqual(addMonths(new Date('2026-01-31T00:00:00Z'), 1).toISOString().slice(0, 10), '2026-02-28');
+  assert.strictEqual(addMonths(new Date('2026-11-15T00:00:00Z'), 3).toISOString().slice(0, 10), '2027-02-15');
+
+  // Paying early continues from the current end date, so no days are lost.
+  const early = paymentPeriod({ now, currentEnd: inDays(10), months: 1 });
+  assert.strictEqual(early.from.getTime(), inDays(10).getTime());
+  assert.strictEqual(early.newEnd.getTime(), addMonths(inDays(10), 1).getTime());
+  // Paying after it lapsed starts today.
+  const late = paymentPeriod({ now, currentEnd: inDays(-20), months: 1 });
+  assert.strictEqual(late.from.getTime(), now.getTime());
+  // Recording an old, shorter payment never cuts a longer subscription back.
+  const old = paymentPeriod({ now, currentEnd: inDays(300), periodFrom: inDays(-60), periodTo: inDays(-30) });
+  assert.strictEqual(old.newEnd.getTime(), inDays(300).getTime());
+  assert.throws(() => paymentPeriod({ now, currentEnd: null }), /either months or periodTo/);
+  assert.throws(() => paymentPeriod({ now, currentEnd: null, months: 1, periodTo: inDays(9) }), /either months or periodTo/);
+  assert.throws(() => paymentPeriod({ now, currentEnd: null, periodTo: inDays(-1) }), /must end after/);
+
+  // Run once a day, every reminder threshold is hit exactly once.
+  const end = new Date('2026-10-01T00:00:00Z');
+  const seen = Array.from({ length: 10 }, (_, i) =>
+    daysUntil(end, new Date(end.getTime() - (8 - i) * DAY_MS + 9 * 3600 * 1000)),
+  );
+  assert.deepStrictEqual(seen, [8, 7, 6, 5, 4, 3, 2, 1, 0, -1]);
+
+  const trial = trialEndsAt(now);
+  assert.strictEqual(trial.getTime() - now.getTime(), 14 * DAY_MS, 'default trial is 14 days');
+}
+
+/** The admin panel must never be able to lock every admin out. */
+async function adminCannotLockOutThePanel() {
+  const admins = [
+    { id: 'a1', email: 'a1@x.com', isActive: true },
+    { id: 'a2', email: 'a2@x.com', isActive: true },
+  ];
+  const prisma = stub<PrismaService>({
+    platformAdmin: {
+      findUnique: async ({ where }: any) => admins.find((a) => a.id === where.id) ?? null,
+      count: async ({ where }: any) =>
+        admins.filter((a) => a.isActive && a.id !== where.id.not).length,
+      update: async ({ where, data }: any) => Object.assign(admins.find((a) => a.id === where.id)!, data),
+    },
+  });
+  const audit = stub<PlatformAuditService>({ record: async () => {} });
+  const service = new PlatformAdminsService(prisma, audit);
+  const me = { adminId: 'a1', email: 'a1@x.com' };
+
+  await assert.rejects(service.update(me, 'a1', { isActive: false }), /deactivate yourself/);
+  await service.update(me, 'a2', { isActive: false }); // another admin: fine
+  // a1 is now the only active admin; a2 (inactive) can't take them out either.
+  await assert.rejects(
+    service.update({ adminId: 'a2', email: 'a2@x.com' }, 'a1', { isActive: false }),
+    /must stay active/,
+  );
+}
+
+/** A restarted server or a second run the same day must not email twice. */
+async function reminderGoesOutOncePerThreshold() {
+  const keys = new Set<string>();
+  const emails: string[] = [];
+  const prisma = stub<PrismaService>({
+    notification: {
+      create: async ({ data }: any) => {
+        if (data.dedupeKey && keys.has(data.dedupeKey)) {
+          throw new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002', clientVersion: 'x' });
+        }
+        if (data.dedupeKey) keys.add(data.dedupeKey);
+        return data;
+      },
+    },
+    user: { findMany: async () => [{ email: 'owner@shop.com', name: 'Owner' }] },
+  });
+  const mail = stub<MailService>({
+    sendSubscriptionReminder: async (to: string) => {
+      emails.push(to);
+    },
+  });
+  const reminders = new SubscriptionRemindersService(prisma, mail);
+  const shop = { id: 'b1', name: 'Shop', subscribedTo: new Date('2026-10-01T00:00:00Z') };
+
+  assert.deepStrictEqual(await reminders.remind(shop, 3), { alreadySent: false, emailed: 1, failed: 0 });
+  assert.strictEqual((await reminders.remind(shop, 3)).alreadySent, true, 'same threshold again is skipped');
+  await reminders.remind(shop, 1); // the next threshold is new
+  await reminders.remind(shop, 1, true); // "send now" always sends
+  assert.strictEqual(emails.length, 3);
+}
+
 async function main() {
+  subscriptionRules();
+  await adminCannotLockOutThePanel();
+  await reminderGoesOutOncePerThreshold();
   await shiftReportBalancesTheDrawer();
   await stockTakePreviewComputesVariances();
   await reorderSuggestionsGroupBySupplier();

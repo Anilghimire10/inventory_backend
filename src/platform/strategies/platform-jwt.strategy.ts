@@ -36,7 +36,7 @@ export class PlatformJwtStrategy extends PassportStrategy(
     });
   }
 
-  async validate(payload: PlatformJwtPayload): Promise<PlatformPrincipal> {
+  async validate(payload: PlatformJwtPayload & { iat?: number }): Promise<PlatformPrincipal> {
     if (payload.scope !== 'platform') {
       throw new UnauthorizedException();
     }
@@ -45,6 +45,15 @@ export class PlatformJwtStrategy extends PassportStrategy(
     });
     if (!admin || !admin.isActive) {
       throw new UnauthorizedException('Admin no longer active');
+    }
+    // A password change or reset signs out every session opened before it.
+    // Compared in whole seconds (iat's resolution), so the token issued in
+    // the same request as the change still works.
+    if (
+      admin.passwordChangedAt &&
+      (payload.iat ?? 0) < Math.floor(admin.passwordChangedAt.getTime() / 1000)
+    ) {
+      throw new UnauthorizedException('Password changed, please sign in again');
     }
     return { adminId: admin.id, email: admin.email, name: admin.name };
   }

@@ -5,6 +5,7 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import { isSubscriptionActive } from '../../common/subscription';
+import { suspendedMessage } from '../auth.service';
 
 export interface JwtPayload {
   sub: string; // userId
@@ -30,7 +31,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       where: { id: payload.sub },
       include: {
         business: {
-          select: { isSuspended: true, isSubscribed: true, subscribedTo: true },
+          select: {
+            isSuspended: true,
+            suspendedReason: true,
+            isSubscribed: true,
+            subscribedTo: true,
+          },
         },
       },
     });
@@ -38,7 +44,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('User no longer active');
     }
     if (user.business.isSuspended) {
-      throw new UnauthorizedException('This business has been suspended');
+      throw new UnauthorizedException(suspendedMessage(user.business.suspendedReason));
     }
     if (!isSubscriptionActive(user.business)) {
       throw new UnauthorizedException(

@@ -20,5 +20,6 @@ import { JwtStrategy } from './strategies/jwt.strategy';
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy],
+  exports: [AuthService], // the admin panel's support tools reuse issueCode()
 })
 export class AuthModule {}

@@ -4,29 +4,25 @@ import {
   Get,
   Param,
   Patch,
+  Post,
   Query,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { IsBoolean, IsDateString, IsOptional } from 'class-validator';
 import { PlatformService } from './platform.service';
 import { PlatformAuthGuard } from './platform-auth.guard';
+import { CurrentActor } from './current-admin.decorator';
+import { Actor } from './platform-audit.service';
+import {
+  CreateBusinessDto,
+  QueryBusinessesDto,
+  RecordPaymentDto,
+  SetSubscriptionDto,
+  SuspendDto,
+  UpdateBusinessDto,
+} from './dto/platform.dto';
 import { Public } from '../common/decorators/public.decorator';
 import { PaginationDto } from '../common/dto/pagination.dto';
-
-class SuspendDto {
-  @IsBoolean()
-  isSuspended: boolean;
-}
-
-class SetSubscriptionDto {
-  @IsBoolean()
-  isSubscribed: boolean;
-
-  @IsOptional()
-  @IsDateString()
-  subscribedTo?: string | null;
-}
 
 // @Public() skips the global tenant guard; PlatformAuthGuard enforces admin JWT.
 @ApiTags('admin')
@@ -42,14 +38,34 @@ export class PlatformController {
     return this.platform.stats();
   }
 
+  /**
+   * Filter with status, subscription (active | trial | expiring | expired |
+   * inactive | no-expiry), type and days; order with sort. The renewals page
+   * is `?subscription=expiring&days=7&sort=expiry`.
+   */
   @Get('businesses')
-  listBusinesses(@Query() q: PaginationDto) {
+  listBusinesses(@Query() q: QueryBusinessesDto) {
     return this.platform.listBusinesses(q);
+  }
+
+  /** Onboard a shop by hand: business + Main Store + verified owner. */
+  @Post('businesses')
+  createBusiness(@CurrentActor() actor: Actor, @Body() dto: CreateBusinessDto) {
+    return this.platform.createBusiness(actor, dto);
   }
 
   @Get('businesses/:id')
   getBusiness(@Param('id') id: string) {
     return this.platform.getBusiness(id);
+  }
+
+  @Patch('businesses/:id')
+  updateBusiness(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Body() dto: UpdateBusinessDto,
+  ) {
+    return this.platform.updateBusiness(actor, id, dto);
   }
 
   @Get('businesses/:id/customers')
@@ -73,13 +89,42 @@ export class PlatformController {
   }
 
   @Patch('businesses/:id/suspend')
-  suspend(@Param('id') id: string, @Body() dto: SuspendDto) {
-    return this.platform.setSuspended(id, dto.isSuspended);
+  suspend(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Body() dto: SuspendDto,
+  ) {
+    return this.platform.setSuspended(actor, id, dto);
   }
 
   @Patch('businesses/:id/subscription')
-  setSubscription(@Param('id') id: string, @Body() dto: SetSubscriptionDto) {
-    return this.platform.setSubscription(id, dto.isSubscribed, dto.subscribedTo ?? null);
+  setSubscription(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Body() dto: SetSubscriptionDto,
+  ) {
+    return this.platform.setSubscription(actor, id, dto.isSubscribed, dto.subscribedTo ?? null);
+  }
+
+  @Get('businesses/:id/payments')
+  listPayments(@Param('id') id: string, @Query() q: PaginationDto) {
+    return this.platform.listPayments(id, q);
+  }
+
+  /** Record a subscription payment; extends the paid-until date. */
+  @Post('businesses/:id/payments')
+  recordPayment(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Body() dto: RecordPaymentDto,
+  ) {
+    return this.platform.recordPayment(actor, id, dto);
+  }
+
+  /** Email the owners and post a bell notification about the end date now. */
+  @Post('businesses/:id/send-reminder')
+  sendReminder(@CurrentActor() actor: Actor, @Param('id') id: string) {
+    return this.platform.sendReminder(actor, id);
   }
 
   /** Global activity feed across all businesses. */
