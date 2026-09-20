@@ -12,7 +12,7 @@ import { createHash, randomInt } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { AuditService } from '../audit/audit.service';
-import { isSubscriptionActive } from '../common/subscription';
+import { isSubscriptionActive, trialEndsAt } from '../common/subscription';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import {
@@ -33,6 +33,12 @@ const CODE_TTL_MS = 15 * 60 * 1000; // verify/reset codes live 15 minutes
  * attempts across addresses.
  */
 const MAX_CODE_ATTEMPTS = 5;
+
+/** What a suspended business's users are told, with the admin's reason if given. */
+export const suspendedMessage = (reason?: string | null) =>
+  reason
+    ? `This business has been suspended: ${reason}. Please contact support.`
+    : 'This business has been suspended. Please contact support.';
 
 @Injectable()
 export class AuthService {
@@ -67,6 +73,8 @@ export class AuthService {
           type: dto.businessType ?? BusinessType.OTHER,
           ...(dto.salesModel ? { salesModel: dto.salesModel } : {}),
           ...(dto.currency ? { currency: dto.currency.toUpperCase() } : {}),
+          // Every signup starts on a trial; an admin extends it once paid.
+          subscribedTo: trialEndsAt(),
         },
       });
       const store = await tx.store.create({
@@ -177,7 +185,12 @@ export class AuthService {
       where: { email: normalizeEmail(dto.email) },
       include: {
         business: {
-          select: { isSuspended: true, isSubscribed: true, subscribedTo: true },
+          select: {
+            isSuspended: true,
+            suspendedReason: true,
+            isSubscribed: true,
+            subscribedTo: true,
+          },
         },
       },
     });
@@ -192,9 +205,7 @@ export class AuthService {
       );
     }
     if (user.business.isSuspended) {
-      throw new UnauthorizedException(
-        'This business has been suspended. Please contact support.',
-      );
+      throw new UnauthorizedException(suspendedMessage(user.business.suspendedReason));
     }
     if (!isSubscriptionActive(user.business)) {
       throw new UnauthorizedException(
@@ -327,10 +338,14 @@ export class AuthService {
     return createHash('sha256').update(code).digest('hex');
   }
 
-  /** Generate a 6-digit code, invalidate prior unused ones, and persist its hash. */
-  private async issueCode(userId: string, type: EmailTokenType) {
-    // randomInt, not Math.random: this guards password resets, and Math.random
-    // is a predictable PRNG that is explicitly not for anything security-bearing.
+  /**
+   * Generate a 6-digit code, invalidate prior unused ones, and persist its
+   * hash. Public so the admin panel's support tools issue codes the same way.
+   *
+   * randomInt, not Math.random: this guards password resets, and Math.random
+   * is a predictable PRNG that is explicitly not for anything security-bearing.
+   */
+  async issueCode(userId: string, type: EmailTokenType) {
     const code = String(randomInt(100000, 1000000));
     await this.prisma.emailToken.updateMany({
       where: { userId, type, consumedAt: null },

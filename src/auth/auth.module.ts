@@ -22,6 +22,8 @@ import { PrincipalCache } from '../common/principal-cache';
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy, PrincipalCache],
-  exports: [PrincipalCache],
+  // PrincipalCache so JwtStrategy and UsersService share one entry per user;
+  // AuthService because the admin panel's support tools reuse issueCode().
+  exports: [PrincipalCache, AuthService],
 })
 export class AuthModule {}

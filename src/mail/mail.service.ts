@@ -7,6 +7,10 @@ interface SendArgs {
   html: string;
 }
 
+/** Escape user-supplied text before it goes into an email's HTML. */
+const esc = (s: string) =>
+  s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
 /**
  * Transactional email via Resend's HTTP API.
  *
@@ -214,6 +218,58 @@ export class MailService {
       to,
       subject: `Low stock: ${items.length} item${items.length === 1 ? '' : 's'} need restocking`,
       html,
+    });
+  }
+
+  /**
+   * A platform admin created this account. No code in it: the owner sets a
+   * password through the normal "Forgot password" flow, so the invite never
+   * expires the way a 15-minute code would.
+   */
+  sendAccountInvite(to: string, name: string, businessName: string) {
+    return this.send({
+      to,
+      subject: `Your ${businessName} account is ready`,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">Welcome to Inventory Manager</h2>
+        <p style="margin:0 0 8px">Hi ${esc(name)},</p>
+        <p style="margin:0 0 16px;color:#475569">An account has been created for <strong>${esc(businessName)}</strong> with this email address.</p>
+        <p style="margin:0 0 16px;color:#475569">To choose your password, open the sign-in page, click <strong>Forgot password</strong> and enter this email. You'll get a code to set it.</p>
+      </div>`,
+    });
+  }
+
+  /** Subscription ending soon (daysLeft > 0) or already ended (daysLeft <= 0). */
+  sendSubscriptionReminder(
+    to: string,
+    name: string,
+    businessName: string,
+    endsOn: Date,
+    daysLeft: number,
+  ) {
+    const date = endsOn.toISOString().slice(0, 10);
+    const when =
+      daysLeft > 0
+        ? `ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}, on ${date}`
+        : `ended on ${date}`;
+    return this.send({
+      to,
+      subject:
+        daysLeft > 0
+          ? `Your subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`
+          : 'Your subscription has ended',
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">Subscription reminder</h2>
+        <p style="margin:0 0 8px">Hi ${esc(name)},</p>
+        <p style="margin:0 0 16px;color:#475569">The subscription for <strong>${esc(businessName)}</strong> ${when}.</p>
+        <p style="margin:0;color:#475569">${
+          daysLeft > 0
+            ? 'Renew before then to keep using the app without interruption.'
+            : 'Your team can no longer sign in. Contact us to renew.'
+        }</p>
+      </div>`,
     });
   }
 

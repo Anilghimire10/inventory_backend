@@ -83,6 +83,16 @@ enum PaymentMethod {
   MIXED
 }
 
+// How a shop paid its subscription. Recorded by hand in the admin panel
+// until online payment (Fonepay) creates these rows itself.
+enum SubscriptionPaymentMethod {
+  CASH
+  BANK
+  ESEWA
+  KHALTI
+  OTHER
+}
+
 // One-time email codes: account verification and password reset.
 enum EmailTokenType {
   EMAIL_VERIFY
@@ -101,13 +111,17 @@ enum NotificationType {
 // Platform-level operator (super-admin). NOT a tenant user — sees/manages
 // every business. Lives outside the businessId tenancy boundary.
 model PlatformAdmin {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String
-  name         String
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id                String    @id @default(cuid())
+  email             String    @unique
+  passwordHash      String
+  name              String
+  isActive          Boolean   @default(true)
+  passwordChangedAt DateTime? // tokens issued before this are rejected
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  paymentsRecorded SubscriptionPayment[]
+  auditLogs        PlatformAuditLog[]
 }
 
 model Business {
@@ -121,10 +135,15 @@ model Business {
   taxInclusive    Boolean      @default(false)
   taxEnabled      Boolean      @default(true) // master switch: when off, no sale charges tax
   isSuspended     Boolean      @default(false) // suspended by a platform admin
+  suspendedReason String? // shown to the business's users when sign-in is refused
+  suspendedAt     DateTime?
   isSubscribed    Boolean      @default(true) // paid/active subscription (Fonepay later)
   subscribedTo    DateTime? // subscription end date; null = no expiry
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
+
+  subscriptionPayments SubscriptionPayment[]
+  platformAuditLogs    PlatformAuditLog[]
 
   stores         Store[]
   users          User[]
@@ -616,4 +635,45 @@ model AuditLog {
 
   @@index([businessId, createdAt])
   @@index([userId])
+}
+
+// ---------- Platform (super-admin) ----------
+
+// A subscription payment recorded by a platform admin. Recording one extends
+// Business.subscribedTo; a business with no rows here is on its trial.
+model SubscriptionPayment {
+  id                String                    @id @default(cuid())
+  businessId        String
+  business          Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  amount            Decimal                   @db.Decimal(12, 2)
+  currency          String
+  method            SubscriptionPaymentMethod
+  reference         String? // receipt number, bank reference
+  periodFrom        DateTime
+  periodTo          DateTime
+  note              String?
+  recordedByAdminId String?
+  recordedByAdmin   PlatformAdmin?            @relation(fields: [recordedByAdminId], references: [id], onDelete: SetNull)
+  createdAt         DateTime                  @default(now())
+
+  @@index([businessId, createdAt])
+}
+
+// What platform admins did. Separate from AuditLog, which belongs to one
+// business and records its own users.
+model PlatformAuditLog {
+  id           String         @id @default(cuid())
+  adminId      String?
+  admin        PlatformAdmin? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  adminEmail   String // snapshot, so the entry outlives the admin account
+  action       String // e.g. "business.suspend", "payment.record"
+  businessId   String?
+  business     Business?      @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  targetUserId String?
+  details      Json?
+  ip           String?
+  createdAt    DateTime       @default(now())
+
+  @@index([createdAt])
+  @@index([businessId, createdAt])
 }
