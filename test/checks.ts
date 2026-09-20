@@ -625,6 +625,29 @@ function envValidationRefusesUnsafeConfig() {
     'an unknown transport is a typo, not a silent fallback',
   );
 
+  // The throttle settings are read with Number(). A value that isn't a
+  // positive integer becomes NaN there, and a NaN limit turns rate limiting
+  // off without saying so -- which is worse than refusing to boot.
+  assert.doesNotThrow(
+    () => validateEnv({ ...ok, THROTTLE_TTL: '60000', THROTTLE_LIMIT: '120' }),
+    'ordinary numeric throttle settings pass',
+  );
+  assert.doesNotThrow(
+    () => validateEnv({ ...ok, THROTTLE_TTL: '', THROTTLE_LIMIT: '' }),
+    'unset throttle settings fall back to the defaults in app.module',
+  );
+  for (const bad of ['0', '-1', 'abc', '60s', '1.5']) {
+    assert.throws(
+      () => validateEnv({ ...ok, THROTTLE_TTL: bad }),
+      /THROTTLE_TTL must be a positive integer/,
+      `THROTTLE_TTL="${bad}" must not boot`,
+    );
+    assert.throws(
+      () => validateEnv({ ...ok, THROTTLE_LIMIT: bad }),
+      /THROTTLE_LIMIT must be a positive integer/,
+      `THROTTLE_LIMIT="${bad}" must not boot`,
+    );
+  }
 }
 
 /**

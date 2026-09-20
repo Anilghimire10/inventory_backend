@@ -42,8 +42,17 @@ import { ShiftsModule } from './shifts/shifts.module';
       inject: [ConfigService],
       useFactory: (c: ConfigService) => [
         {
-          ttl: c.get<number>('THROTTLE_TTL') ?? 60_000,
-          limit: c.get<number>('THROTTLE_LIMIT') ?? 120,
+          // Number(), not a bare get<number>(): the generic is a TypeScript
+          // cast, not a conversion, so anything coming from the environment
+          // arrives here as a string while claiming to be a number. The
+          // throttler stores a block's expiry as `Date.now() + ttl`, and with
+          // a string that concatenates instead of adding -- "60000" turned a
+          // 60-second block into one ~5.7 million years long, so the first IP
+          // to trip the limit stayed blocked until the process restarted.
+          // validateEnv() rejects anything that isn't a positive integer, so
+          // these cannot quietly become NaN and switch rate limiting off.
+          ttl: Number(c.get('THROTTLE_TTL') ?? 60_000),
+          limit: Number(c.get('THROTTLE_LIMIT') ?? 120),
         },
       ],
     }),

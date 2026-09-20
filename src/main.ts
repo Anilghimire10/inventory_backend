@@ -19,6 +19,20 @@ async function bootstrap() {
   // adds up fast and starves everyone else with "max clients reached".
   app.enableShutdownHooks();
 
+  // Trust the platform's load balancer (Render, and any other single reverse
+  // proxy) so req.ip is the X-Forwarded-For client address rather than the
+  // proxy's own. Rate limiting buckets by req.ip: without this every request
+  // that arrives through the proxy shares one bucket, so the global limit and
+  // the tighter credential limit on /auth/login apply to the whole platform
+  // at once instead of per user, and ordinary traffic locks everybody out.
+  // It also means AuditLog.ip records the caller instead of the proxy.
+  //
+  // The 1 is the hop count, and it matters: `true` would trust the entire
+  // X-Forwarded-For chain, letting a caller prepend any address they like and
+  // so pick their own rate-limit bucket. Raise it only if you put additional
+  // proxies of your own in front of this app.
+  app.set("trust proxy", 1);
+
   // Allow larger JSON bodies for bulk product imports (default is ~100kb).
   const bodyLimit = config.get<string>("BODY_LIMIT") ?? "8mb";
   app.use(json({ limit: bodyLimit }));

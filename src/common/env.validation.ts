@@ -74,6 +74,17 @@ export function validateEnv(config: Record<string, unknown>) {
     );
   }
 
+  // These two reach the throttler through Number(). A value that isn't a
+  // positive integer becomes NaN there, and a NaN limit disables rate
+  // limiting altogether -- silently, since nothing else reads them. Catch a
+  // typo'd THROTTLE_LIMIT here rather than discovering it as an open door.
+  for (const key of ['THROTTLE_TTL', 'THROTTLE_LIMIT']) {
+    const raw = get(key);
+    if (raw && !/^[1-9]\d*$/.test(raw)) {
+      errors.push(`${key} must be a positive integer (got "${raw}").`);
+    }
+  }
+
   if (errors.length) {
     throw new Error(
       `Invalid environment configuration:\n  - ${errors.join('\n  - ')}`,
