@@ -24,7 +24,8 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET') ?? 'dev-secret',
+        // Validated at boot by validateEnv() — never falls back to a literal.
+        secret: config.getOrThrow<string>('JWT_SECRET'),
         // Shorter than a shop user's session: an admin token opens every business.
         signOptions: { expiresIn: config.get<string>('PLATFORM_JWT_EXPIRES_IN') ?? '12h' },
       }),

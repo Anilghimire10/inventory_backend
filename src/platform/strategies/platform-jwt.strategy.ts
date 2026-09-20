@@ -32,7 +32,8 @@ export class PlatformJwtStrategy extends PassportStrategy(
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: config.get<string>('JWT_SECRET') ?? 'dev-secret',
+      // Validated at boot by validateEnv() — never falls back to a literal.
+      secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
     });
   }
 
