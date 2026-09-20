@@ -116,6 +116,10 @@ async function main() {
 
   // ---- Products ----
   // [name, category, sku, barcode, unit, cost, price, reorderLevel, opts]
+  // `unit` must be one of the canonical UNITS in src/common/units.ts -- the
+  // Product_unit_check constraint rejects anything else, so a descriptive
+  // one ('tray', 'strip', 'bottle') fails the whole seed partway through.
+  // Pick the nearest canonical unit and put the packaging in the name.
   const productDefs: Array<[string, string, string, string, string, number, number, number, Partial<{ rx: boolean; batch: boolean; taxable: boolean; brand: string; desc: string }>]> = [
     ['Coca-Cola 500ml', 'Beverages', 'BEV-001', '8901030812345', 'pcs', 0.45, 1.0, 40, { brand: 'Coca-Cola' }],
     ['Pepsi 500ml', 'Beverages', 'BEV-002', '8901030812346', 'pcs', 0.4, 0.9, 40, { brand: 'Pepsi' }],
@@ -126,14 +130,14 @@ async function main() {
     ['Biscuits Family Pack', 'Snacks', 'SNK-003', '8901030812351', 'pcs', 1.1, 2.0, 35, { brand: 'Parle' }],
     ['Whole Milk 1L', 'Dairy & Eggs', 'DRY-001', '8901030812352', 'pcs', 0.7, 1.3, 30, { batch: true, brand: 'Dairyland' }],
     ['Cheddar Cheese 200g', 'Dairy & Eggs', 'DRY-002', '8901030812353', 'pcs', 2.5, 4.5, 20, { batch: true, brand: 'Kraft' }],
-    ['Eggs (12)', 'Dairy & Eggs', 'DRY-003', '8901030812354', 'tray', 1.8, 3.0, 30, { batch: true }],
+    ['Eggs (12)', 'Dairy & Eggs', 'DRY-003', '8901030812354', 'dozen', 1.8, 3.0, 30, { batch: true }],
     ['White Bread 400g', 'Bakery', 'BKY-001', '8901030812355', 'pcs', 0.5, 1.0, 25, { batch: true }],
     ['Croissant (2-pack)', 'Bakery', 'BKY-002', '8901030812356', 'pcs', 1.0, 2.0, 20, { batch: true }],
     ['Dish Soap 500ml', 'Cleaning & Home', 'CLN-001', '8901030812357', 'pcs', 1.3, 2.5, 15, { brand: 'Vim' }],
     ['Laundry Detergent 2kg', 'Cleaning & Home', 'CLN-002', '8901030812358', 'pcs', 4.0, 7.5, 10, { brand: 'Ariel' }],
-    ['Paracetamol 500mg', 'Health & Pharmacy', 'PHM-001', '8901030812359', 'strip', 0.5, 1.2, 50, { rx: false, batch: true, brand: 'GSK' }],
-    ['Amoxicillin 250mg', 'Health & Pharmacy', 'PHM-002', '8901030812360', 'strip', 1.5, 3.5, 30, { rx: true, batch: true, brand: 'Cipla' }],
-    ['Multivitamin Tablets', 'Health & Pharmacy', 'PHM-003', '8901030812361', 'bottle', 3.0, 6.0, 20, { rx: false, batch: true, brand: 'Centrum' }],
+    ['Paracetamol 500mg', 'Health & Pharmacy', 'PHM-001', '8901030812359', 'pkt', 0.5, 1.2, 50, { rx: false, batch: true, brand: 'GSK' }],
+    ['Amoxicillin 250mg', 'Health & Pharmacy', 'PHM-002', '8901030812360', 'pkt', 1.5, 3.5, 30, { rx: true, batch: true, brand: 'Cipla' }],
+    ['Multivitamin Tablets', 'Health & Pharmacy', 'PHM-003', '8901030812361', 'pcs', 3.0, 6.0, 20, { rx: false, batch: true, brand: 'Centrum' }],
     ['Toothpaste 100g', 'Personal Care', 'PRS-001', '8901030812362', 'pcs', 1.0, 2.2, 25, { brand: 'Colgate' }],
     ['Shampoo 200ml', 'Personal Care', 'PRS-002', '8901030812363', 'pcs', 2.2, 4.0, 15, { brand: 'Pantene' }],
     ['Hand Sanitizer 250ml', 'Personal Care', 'PRS-003', '8901030812364', 'pcs', 1.1, 2.0, 20, { brand: 'Dettol' }],
