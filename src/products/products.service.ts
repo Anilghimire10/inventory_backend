@@ -288,6 +288,28 @@ export class ProductsService {
     // storeIds is availability, not a product column — it must not reach
     // Prisma via ...rest.
     const { categoryIds, expiryDate, taxId, storeIds, ...rest } = dto;
+    // create() calls assertParent(); update() spread parentId straight through
+    // ...rest unchecked, and UpdateProductDto extends PartialType(Create...) so
+    // the field is accepted. The FK only requires that *some* Product row
+    // exists, so a product could be pointed at itself, at a variant (nesting,
+    // which generateVariants explicitly forbids), or at another tenant's
+    // product. Same guard, same place in the flow.
+    if (rest.parentId !== undefined && rest.parentId !== null) {
+      if (rest.parentId === id) {
+        throw new BadRequestException('A product cannot be its own variant');
+      }
+      await this.assertParent(businessId, rest.parentId);
+      // A style that already has variants cannot itself become one -- that
+      // would orphan its children underneath a variant.
+      const children = await this.prisma.product.count({
+        where: { parentId: id, businessId },
+      });
+      if (children > 0) {
+        throw new BadRequestException(
+          'This product already has variants, so it cannot become a variant itself',
+        );
+      }
+    }
     await this.assertCategories(businessId, categoryIds);
     try {
       return await this.prisma.product.update({
