@@ -222,6 +222,9 @@ export class PlatformService {
             subscriptionPayments: true,
           },
         },
+        // Name and status only. Store.address and Store.phone exist but stay
+        // with the tenant: the platform admin needs to know a branch exists,
+        // not where it is. Widen this only behind an audited read.
         stores: { select: { id: true, name: true, isActive: true } },
         users: {
           select: {
@@ -482,7 +485,7 @@ export class PlatformService {
   // ---- Per-business drill-downs (super-admin) ----
 
   /** Customers of a business, paginated. */
-  async businessCustomers(businessId: string, q: PaginationDto) {
+  async businessCustomers(actor: Actor, businessId: string, q: PaginationDto) {
     await this.getBusinessOrThrow(businessId);
     const where: Prisma.CustomerWhereInput = {
       businessId,
@@ -514,11 +517,18 @@ export class PlatformService {
       }),
       this.prisma.customer.count({ where }),
     ]);
+    // The query and the size of the answer, never the rows -- logging the
+    // customers here would make the audit trail a second copy of the PII it
+    // exists to protect.
+    await this.audit.record(actor, 'business.customers.view', {
+      businessId,
+      details: { search: q.search ?? null, page: q.page, returned: data.length, total },
+    });
     return paginate(data, total, q.page, q.limit);
   }
 
   /** Sales history of a business, paginated. */
-  async businessSales(businessId: string, q: PaginationDto) {
+  async businessSales(actor: Actor, businessId: string, q: PaginationDto) {
     await this.getBusinessOrThrow(businessId);
     const where: Prisma.SaleWhereInput = {
       businessId,
@@ -546,11 +556,15 @@ export class PlatformService {
       }),
       this.prisma.sale.count({ where }),
     ]);
+    await this.audit.record(actor, 'business.sales.view', {
+      businessId,
+      details: { search: q.search ?? null, page: q.page, returned: data.length, total },
+    });
     return paginate(data, total, q.page, q.limit);
   }
 
   /** A single sale with its line items — "what they sold". */
-  async businessSale(businessId: string, saleId: string) {
+  async businessSale(actor: Actor, businessId: string, saleId: string) {
     const sale = await this.prisma.sale.findFirst({
       where: { id: saleId, businessId },
       include: {
@@ -561,11 +575,15 @@ export class PlatformService {
       },
     });
     if (!sale) throw new NotFoundException('Sale not found');
+    await this.audit.record(actor, 'business.sale.view', {
+      businessId,
+      details: { saleId, receiptNo: sale.receiptNo },
+    });
     return sale;
   }
 
   /** Global activity feed across every business (super-admin monitoring). */
-  async activityFeed(q: PaginationDto) {
+  async activityFeed(actor: Actor, q: PaginationDto) {
     const where: Prisma.AuditLogWhereInput = q.search
       ? { action: { contains: q.search, mode: 'insensitive' } }
       : {};
@@ -582,11 +600,15 @@ export class PlatformService {
       }),
       this.prisma.auditLog.count({ where }),
     ]);
+    // Cross-tenant by definition, so it is the broadest read on the panel.
+    await this.audit.record(actor, 'activity.view', {
+      details: { search: q.search ?? null, page: q.page, returned: data.length, total },
+    });
     return paginate(data, total, q.page, q.limit);
   }
 
   /** Activity log of a business, paginated. */
-  async businessActivity(businessId: string, q: PaginationDto) {
+  async businessActivity(actor: Actor, businessId: string, q: PaginationDto) {
     await this.getBusinessOrThrow(businessId);
     const [data, total] = await Promise.all([
       this.prisma.auditLog.findMany({
@@ -600,6 +622,10 @@ export class PlatformService {
       }),
       this.prisma.auditLog.count({ where: { businessId } }),
     ]);
+    await this.audit.record(actor, 'business.activity.view', {
+      businessId,
+      details: { page: q.page, returned: data.length, total },
+    });
     return paginate(data, total, q.page, q.limit);
   }
 

@@ -69,23 +69,39 @@ export class PlatformController {
   }
 
   @Get('businesses/:id/customers')
-  businessCustomers(@Param('id') id: string, @Query() q: PaginationDto) {
-    return this.platform.businessCustomers(id, q);
+  businessCustomers(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Query() q: PaginationDto,
+  ) {
+    return this.platform.businessCustomers(actor, id, q);
   }
 
   @Get('businesses/:id/sales')
-  businessSales(@Param('id') id: string, @Query() q: PaginationDto) {
-    return this.platform.businessSales(id, q);
+  businessSales(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Query() q: PaginationDto,
+  ) {
+    return this.platform.businessSales(actor, id, q);
   }
 
   @Get('businesses/:id/sales/:saleId')
-  businessSale(@Param('id') id: string, @Param('saleId') saleId: string) {
-    return this.platform.businessSale(id, saleId);
+  businessSale(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Param('saleId') saleId: string,
+  ) {
+    return this.platform.businessSale(actor, id, saleId);
   }
 
   @Get('businesses/:id/activity')
-  businessActivity(@Param('id') id: string, @Query() q: PaginationDto) {
-    return this.platform.businessActivity(id, q);
+  businessActivity(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Query() q: PaginationDto,
+  ) {
+    return this.platform.businessActivity(actor, id, q);
   }
 
   @Patch('businesses/:id/suspend')
@@ -129,7 +145,7 @@ export class PlatformController {
 
   /** Global activity feed across all businesses. */
   @Get('activity')
-  activity(@Query() q: PaginationDto) {
-    return this.platform.activityFeed(q);
+  activity(@CurrentActor() actor: Actor, @Query() q: PaginationDto) {
+    return this.platform.activityFeed(actor, q);
   }
 }
