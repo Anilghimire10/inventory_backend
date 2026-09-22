@@ -88,7 +88,14 @@ export class SalesController {
     // Assigned in place rather than spread: QuerySaleDto carries prototype
     // getters (PaginationDto's `skip`) that a spread would silently drop.
     q.storeId = scopeToStore(u, q.storeId);
-    return this.sales.findAll(u.businessId, q);
+    // Revenue KPIs are management-only, the same rule reports.dashboard()
+    // applies and the web mirrors with can.viewFinancials -- without this a
+    // cashier reading /sales got the business's all-time revenue. Skipping
+    // them also drops two aggregate queries from every list load for the
+    // roles that cannot see the numbers.
+    const includeFinancials =
+      u.role === UserRole.OWNER || u.role === UserRole.MANAGER;
+    return this.sales.findAll(u.businessId, q, includeFinancials);
   }
 
   /** Full sale detail incl. store/business info — used to render a receipt. */

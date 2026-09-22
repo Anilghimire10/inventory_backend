@@ -474,7 +474,16 @@ export class SalesService {
     }, TX_OPTS);
   }
 
-  async findAll(businessId: string, q: QuerySaleDto) {
+  /**
+   * @param includeFinancials revenue KPIs are management-only (see
+   * sales.controller.ts). Defaults true so internal callers keep the figures;
+   * the HTTP route passes the caller's role explicitly.
+   */
+  async findAll(
+    businessId: string,
+    q: QuerySaleDto,
+    includeFinancials = true,
+  ) {
     const RETURNS = [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED];
     const NOT_RETURNED_HELD = { notIn: [...RETURNS, SaleStatus.HELD] };
     const statusWhere =
@@ -554,30 +563,38 @@ export class SalesService {
         orderBy: { createdAt: 'desc' },
       }),
       this.prisma.sale.count({ where }),
-      this.prisma.sale.aggregate({
-        where: revenueWhere,
-        _sum: { total: true, refundedTotal: true },
-        _count: true,
-      }),
-      this.prisma.sale.aggregate({
-        where: todayWhere,
-        _sum: { total: true, refundedTotal: true },
-        _count: true,
-      }),
+      // Not just withheld from the response -- not queried at all, so a
+      // cashier's list load costs two fewer aggregates over the whole table.
+      includeFinancials
+        ? this.prisma.sale.aggregate({
+            where: revenueWhere,
+            _sum: { total: true, refundedTotal: true },
+            _count: true,
+          })
+        : Promise.resolve(null),
+      includeFinancials
+        ? this.prisma.sale.aggregate({
+            where: todayWhere,
+            _sum: { total: true, refundedTotal: true },
+            _count: true,
+          })
+        : Promise.resolve(null),
     ]);
     const result = paginate(data, total, q.page, q.limit);
-    /** What was rung up, less what was handed back on returns. */
-    const netOf = (a: {
-      _sum: { total: Prisma.Decimal | null; refundedTotal: Prisma.Decimal | null };
-    }) => round2(Number(a._sum.total ?? 0) - Number(a._sum.refundedTotal ?? 0));
-    result.meta.revenue = netOf(agg);
-    // The number of sales that `revenue` is the sum of. Not the same as
-    // meta.total, which counts whatever the list is showing -- returned and
-    // held sales included. Without it an average sale value can't be worked
-    // out from this response.
-    result.meta.revenueCount = agg._count;
-    result.meta.todayRevenue = netOf(today);
-    result.meta.todayCount = today._count;
+    if (agg && today) {
+      /** What was rung up, less what was handed back on returns. */
+      const netOf = (a: {
+        _sum: { total: Prisma.Decimal | null; refundedTotal: Prisma.Decimal | null };
+      }) => round2(Number(a._sum.total ?? 0) - Number(a._sum.refundedTotal ?? 0));
+      result.meta.revenue = netOf(agg);
+      // The number of sales that `revenue` is the sum of. Not the same as
+      // meta.total, which counts whatever the list is showing -- returned and
+      // held sales included. Without it an average sale value can't be worked
+      // out from this response.
+      result.meta.revenueCount = agg._count;
+      result.meta.todayRevenue = netOf(today);
+      result.meta.todayCount = today._count;
+    }
     return result;
   }
 
