@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateStoreDto, UpdateStoreDto } from './dto/store.dto';
+import { TX_OPTS } from '../common/prisma-tx';
 
 @Injectable()
 export class StoresService {
@@ -19,25 +20,31 @@ export class StoresService {
    * transfer or adjustment.
    */
   async create(businessId: string, dto: CreateStoreDto) {
-    const store = await this.prisma.store.create({
-      data: { businessId, ...dto },
-    });
-    const products = await this.prisma.product.findMany({
-      where: { businessId },
-      select: { id: true },
-    });
-    if (products.length) {
-      await this.prisma.stockItem.createMany({
-        data: products.map((p) => ({
-          businessId,
-          storeId: store.id,
-          productId: p.id,
-          quantity: 0,
-        })),
-        skipDuplicates: true,
+    // One transaction: a half-applied create leaves a branch that exists but
+    // carries nothing, and the only repair is re-adding every product by hand
+    // through setStores. The seed is part of opening the branch, not a
+    // follow-up to it.
+    return this.prisma.$transaction(async (tx) => {
+      const store = await tx.store.create({
+        data: { businessId, ...dto },
       });
-    }
-    return store;
+      const products = await tx.product.findMany({
+        where: { businessId },
+        select: { id: true },
+      });
+      if (products.length) {
+        await tx.stockItem.createMany({
+          data: products.map((p) => ({
+            businessId,
+            storeId: store.id,
+            productId: p.id,
+            quantity: 0,
+          })),
+          skipDuplicates: true,
+        });
+      }
+      return store;
+    }, TX_OPTS);
   }
 
   findAll(businessId: string) {

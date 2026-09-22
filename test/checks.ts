@@ -1023,6 +1023,8 @@ async function productStoresCannotSilentlyWriteOffStock() {
     batches?: { storeId: string }[];
     serials?: { storeId: string | null }[];
     variants?: { id: string }[];
+    /** Rows as they are at DELETE time, when a concurrent write changed them. */
+    stockAtDelete?: { storeId: string; productId: string; quantity: number }[];
   }) => {
     const deleted: unknown[] = [];
     const created: unknown[] = [];
@@ -1048,7 +1050,18 @@ async function productStoresCannotSilentlyWriteOffStock() {
         $transaction: async (fn: any) =>
           fn({
             stockItem: {
-              deleteMany: async (a: unknown) => { deleted.push(a); return { count: 1 }; },
+              // The real delete carries `quantity: 0` and is matched against the
+              // live row, so the stub matches against `stockAtDelete` when the
+              // test is simulating a concurrent write.
+              deleteMany: async (a: any) => {
+                deleted.push(a);
+                const live = opts.stockAtDelete ?? opts.stock;
+                const dropping: string[] = a?.where?.storeId?.in ?? [];
+                const count = live.filter(
+                  (r) => dropping.includes(r.storeId) && Number(r.quantity) === 0,
+                ).length;
+                return { count };
+              },
               createMany: async (a: unknown) => { created.push(a); return { count: 1 }; },
             },
           }),
@@ -1097,6 +1110,19 @@ async function productStoresCannotSilentlyWriteOffStock() {
   });
   await loose.svc.setStores('b1', 'p1', ['s1']);
   assert.strictEqual(loose.deleted.length, 1, 'an empty branch is dropped');
+
+  // The pre-flight check reads stock outside the transaction, so it can go
+  // stale. If a sale, transfer or receipt lands before the delete, the guard on
+  // the delete itself must catch it -- otherwise those units vanish with no
+  // StockMovement saying where they went.
+  await assert.rejects(
+    make({
+      stock: [{ storeId: 's2', productId: 'p1', quantity: 0 }],
+      stockAtDelete: [{ storeId: 's2', productId: 'p1', quantity: 5 }],
+    }).svc.setStores('b1', 'p1', ['s1']),
+    /changed stock while its stores were being edited/,
+    'stock arriving mid-edit must abort the drop, not be deleted with the row',
+  );
 
   // Variants follow their parent.
   const withVariants = make({
@@ -1187,16 +1213,21 @@ async function aNewStoreOpensCarryingTheCatalog() {
   let created: any = null;
   const svc = new StoresService(
     stub<PrismaService>({
-      store: { create: async () => ({ id: 's2', businessId: 'b1', name: 'Branch' }) },
-      product: {
-        findMany: async () => [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }],
-      },
-      stockItem: {
-        createMany: async (args: any) => {
-          created = args.data;
-          return { count: args.data.length };
-        },
-      },
+      // create() opens a store and seeds its catalog in one transaction, so
+      // the delegates live on the tx handed to the callback.
+      $transaction: async (fn: any) =>
+        fn({
+          store: { create: async () => ({ id: 's2', businessId: 'b1', name: 'Branch' }) },
+          product: {
+            findMany: async () => [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }],
+          },
+          stockItem: {
+            createMany: async (args: any) => {
+              created = args.data;
+              return { count: args.data.length };
+            },
+          },
+        }),
     }),
   );
 
@@ -1216,9 +1247,12 @@ async function aNewStoreOpensCarryingTheCatalog() {
   let touched = false;
   const empty = new StoresService(
     stub<PrismaService>({
-      store: { create: async () => ({ id: 's3' }) },
-      product: { findMany: async () => [] },
-      stockItem: { createMany: async () => { touched = true; return { count: 0 }; } },
+      $transaction: async (fn: any) =>
+        fn({
+          store: { create: async () => ({ id: 's3' }) },
+          product: { findMany: async () => [] },
+          stockItem: { createMany: async () => { touched = true; return { count: 0 }; } },
+        }),
     }),
   );
   await empty.create('b1', { name: 'First' } as any);

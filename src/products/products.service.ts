@@ -211,19 +211,38 @@ export class ProductsService {
 
     await this.prisma.$transaction(async (tx) => {
       if (dropping.length) {
-        await tx.stockItem.deleteMany({
-          where: { productId: { in: productIds }, storeId: { in: dropping } },
+        // The checks above read `current` outside this transaction, so they go
+        // stale: a sale, transfer or receipt landing in between would have its
+        // stock deleted here silently, with no StockMovement to say where it
+        // went -- the one way this schema can otherwise lose stock untraceably.
+        //
+        // So the delete carries the condition itself. `quantity: 0` is
+        // evaluated against the live, locked row rather than the earlier read,
+        // and any mismatch in the count means a row gained stock (skipped) or
+        // appeared (extra) while we worked. Either way nothing is dropped: the
+        // throw rolls the whole transaction back and the caller retries.
+        const expected = current.filter((r) => dropping.includes(r.storeId)).length;
+        const { count } = await tx.stockItem.deleteMany({
+          where: {
+            productId: { in: productIds },
+            storeId: { in: dropping },
+            quantity: 0,
+          },
         });
+        if (count !== expected) {
+          throw new ConflictException(
+            `${product.name} changed stock while its stores were being edited. Nothing was changed — try again.`,
+          );
+        }
       }
-      const have = new Set(current.map((r) => `${r.storeId}|${r.productId}`));
+      // Every wanted (store, product) pair, unconditionally. `skipDuplicates`
+      // makes this an ON CONFLICT DO NOTHING, so existing rows keep their
+      // quantity -- which is both idempotent and free of the stale `current`
+      // read the old `have` set depended on.
       const rows = productIds.flatMap((pid) =>
-        wanted
-          .filter((sid) => !have.has(`${sid}|${pid}`))
-          .map((sid) => ({ businessId, storeId: sid, productId: pid, quantity: 0 })),
+        wanted.map((sid) => ({ businessId, storeId: sid, productId: pid, quantity: 0 })),
       );
-      if (rows.length) {
-        await tx.stockItem.createMany({ data: rows, skipDuplicates: true });
-      }
+      await tx.stockItem.createMany({ data: rows, skipDuplicates: true });
     });
 
     return { id: product.id, storeIds: wanted, variantsUpdated: variants.length };
