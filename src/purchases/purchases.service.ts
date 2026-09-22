@@ -694,15 +694,27 @@ export class PurchasesService {
     dto: CreatePurchaseDto,
     _productMap: Map<string, { id: string }>,
   ) {
-    for (const item of dto.items) {
-      await this.inventory.applyMovement(tx, {
+    // One batched stock write for the whole delivery rather than a
+    // read + upsert + insert per line, the same way checkout and returns
+    // already do it -- an N-line purchase cost 5N round trips before this,
+    // and the DB is not co-located with the app. See applyMovementsBatch.
+    await this.inventory.applyMovementsBatch(
+      tx,
+      dto.items.map((item) => ({
         businessId,
         storeId,
         productId: item.productId,
         type: StockMovementType.PURCHASE,
         quantity: item.quantity,
         reference: purchaseId,
-      });
+      })),
+    );
+
+    // Batches, serials and cost price stay per line: each carries per-item
+    // logic (natural-key batch merge, serial reconciliation) that doesn't
+    // reduce to a single statement. Order is independent of the stock write
+    // above, and a throw anywhere still rolls the whole purchase back.
+    for (const item of dto.items) {
       await this.createBatchIfNeeded(tx, businessId, storeId, {
         productId: item.productId,
         quantity: item.quantity,
