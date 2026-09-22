@@ -306,26 +306,82 @@ export class InventoryService {
    * Items at or below their reorder level. Effective level is the
    * per-store override when set, otherwise the product default.
    */
+  /**
+   * Stock at or below its reorder point.
+   *
+   * The filter runs in SQL, not in JS. This used to `findMany` **every**
+   * StockItem row for the business -- with a product and store join on each --
+   * and then drop the ones above their reorder level in Node. It is the hot
+   * path behind the notification sync, the dashboard, analytics, the daily
+   * digest and the reorder suggestions, so it read the whole table several
+   * times a minute to return a handful of rows.
+   *
+   * The effective level is the per-store override when non-zero, otherwise the
+   * product default -- `COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel")`,
+   * which is exactly what `it.reorderLevel || it.product.reorderLevel` meant.
+   *
+   * The nested `product`/`store` shape is rebuilt below rather than flattened:
+   * six call sites and the `GET /inventory/low-stock` response read it, and the
+   * win here is the SQL filter, not the response shape.
+   */
   async lowStock(businessId: string, storeId?: string) {
-    const items = await this.prisma.stockItem.findMany({
-      where: { businessId, ...(storeId ? { storeId } : {}) },
-      include: {
-        product: {
-          select: { id: true, name: true, sku: true, unit: true, costPrice: true, reorderLevel: true },
-        },
-        store: { select: { id: true, name: true } },
+    const rows = await this.prisma.$queryRaw<
+      {
+        id: string;
+        businessId: string;
+        storeId: string;
+        productId: string;
+        quantity: Prisma.Decimal;
+        reorderLevel: number;
+        updatedAt: Date;
+        effectiveReorderLevel: number;
+        productName: string;
+        productSku: string | null;
+        productUnit: string;
+        productCostPrice: Prisma.Decimal;
+        productReorderLevel: number;
+        storeName: string;
+      }[]
+    >`
+      SELECT si.id, si."businessId", si."storeId", si."productId",
+             si.quantity, si."reorderLevel", si."updatedAt",
+             COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel")
+               AS "effectiveReorderLevel",
+             p.name        AS "productName",
+             p.sku         AS "productSku",
+             p.unit        AS "productUnit",
+             p."costPrice" AS "productCostPrice",
+             p."reorderLevel" AS "productReorderLevel",
+             s.name        AS "storeName"
+      FROM "StockItem" si
+      JOIN "Product" p ON p.id = si."productId"
+      JOIN "Store"   s ON s.id = si."storeId"
+      WHERE si."businessId" = ${businessId}
+        ${storeId ? Prisma.sql`AND si."storeId" = ${storeId}` : Prisma.empty}
+        AND COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel") > 0
+        AND si.quantity <= COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel")
+      ORDER BY p.name ASC
+    `;
+
+    return rows.map((r) => ({
+      id: r.id,
+      businessId: r.businessId,
+      storeId: r.storeId,
+      productId: r.productId,
+      quantity: r.quantity,
+      reorderLevel: r.reorderLevel,
+      updatedAt: r.updatedAt,
+      effectiveReorderLevel: Number(r.effectiveReorderLevel),
+      product: {
+        id: r.productId,
+        name: r.productName,
+        sku: r.productSku,
+        unit: r.productUnit,
+        costPrice: r.productCostPrice,
+        reorderLevel: r.productReorderLevel,
       },
-    });
-    return items
-      .map((it) => ({
-        ...it,
-        effectiveReorderLevel: it.reorderLevel || it.product.reorderLevel,
-      }))
-      .filter(
-        (it) =>
-          it.effectiveReorderLevel > 0 &&
-          Number(it.quantity) <= it.effectiveReorderLevel,
-      );
+      store: { id: r.storeId, name: r.storeName },
+    }));
   }
 
   // ---- Serial / IMEI tracking ----

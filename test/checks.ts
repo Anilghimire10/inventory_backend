@@ -156,7 +156,35 @@ async function reorderSuggestionsGroupBySupplier() {
     { productId: 'p2', costPrice: 4.5, purchase: { createdAt: new Date('2026-02-01'), supplier: { id: 'sup1', name: 'Acme' } } },
   ];
   const prisma = stub<PrismaService>({
-    stockItem: { findMany: async () => stock },
+    // lowStock() is one raw query now: the reorder-point filter runs in SQL
+    // rather than in JS. The stub mirrors that filter over the fixtures above
+    // -- COALESCE(NULLIF(si.reorderLevel, 0), p.reorderLevel) -- so the rows
+    // that exist to test it (p2's per-store override, p4 being well stocked)
+    // still earn their place. The SQL itself is exercised against a real
+    // database, which no stub can stand in for.
+    $queryRaw: async () =>
+      stock
+        .map((it) => ({
+          id: `si-${it.productId}`,
+          businessId: 'b1',
+          storeId: it.storeId,
+          productId: it.productId,
+          quantity: it.quantity,
+          reorderLevel: it.reorderLevel,
+          updatedAt: new Date(),
+          effectiveReorderLevel: it.reorderLevel || it.product.reorderLevel,
+          productName: it.product.name,
+          productSku: it.product.sku,
+          productUnit: it.product.unit,
+          productCostPrice: it.product.costPrice,
+          productReorderLevel: it.product.reorderLevel,
+          storeName: it.store.name,
+        }))
+        .filter(
+          (r) =>
+            r.effectiveReorderLevel > 0 &&
+            Number(r.quantity) <= r.effectiveReorderLevel,
+        ),
     // the service asks for newest-first; the stub hands them back that way
     purchaseItem: { findMany: async () => history },
   });

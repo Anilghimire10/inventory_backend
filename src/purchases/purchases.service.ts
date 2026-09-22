@@ -314,15 +314,52 @@ export class PurchasesService {
         throw new BadRequestException('Purchase already received');
       }
 
-      for (const item of purchase.items) {
-        await this.inventory.applyMovement(tx, {
+      // One batched stock write for the whole delivery, the way checkout,
+      // returns and receive-on-create already do it. This loop previously made
+      // four sequential round trips per line inside a transaction holding row
+      // locks the whole way -- a 50-line purchase cost ~200 of them, against a
+      // database that is not co-located with the app.
+      await this.inventory.applyMovementsBatch(
+        tx,
+        purchase.items.map((item) => ({
           businessId,
           storeId: purchase.storeId,
           productId: item.productId,
           type: StockMovementType.PURCHASE,
           quantity: Number(item.quantity),
           reference: purchase.id,
+        })),
+      );
+
+      // Cost snapshots: one updateMany per *distinct* cost rather than one
+      // update per line.
+      //
+      // The old loop wrote costPrice per line in order, so when a purchase
+      // listed the same product twice at different costs the last line won.
+      // Grouping by cost alone would lose that -- the two updateMany calls
+      // could land in either order. So collapse to one cost per product first,
+      // keeping the last line's, and group what remains.
+      const lastCostByProduct = new Map<string, Prisma.Decimal>();
+      for (const item of purchase.items) {
+        lastCostByProduct.set(item.productId, item.costPrice);
+      }
+      const productsByCost = new Map<string, string[]>();
+      for (const [productId, cost] of lastCostByProduct) {
+        const key = String(cost);
+        productsByCost.set(key, [...(productsByCost.get(key) ?? []), productId]);
+      }
+      for (const [cost, ids] of productsByCost) {
+        await tx.product.updateMany({
+          where: { id: { in: ids } },
+          data: { costPrice: cost },
         });
+      }
+
+      // Batches and serials stay per line: each carries per-item logic
+      // (natural-key batch merge, serial reconciliation) that does not reduce
+      // to a single statement. A throw anywhere still rolls the whole receive
+      // back.
+      for (const item of purchase.items) {
         await this.createBatchIfNeeded(tx, businessId, purchase.storeId, item);
         await this.inventory.receiveSerials(tx, {
           businessId,
@@ -330,10 +367,6 @@ export class PurchasesService {
           productId: item.productId,
           purchaseId: purchase.id,
           serials: serialsByItem.get(item.id) ?? [],
-        });
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { costPrice: item.costPrice },
         });
       }
       return tx.purchase.findFirstOrThrow({
