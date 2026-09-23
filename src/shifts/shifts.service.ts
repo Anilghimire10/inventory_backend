@@ -12,6 +12,10 @@ import { CloseShiftDto, OpenShiftDto, QueryShiftDto } from './dto/shift.dto';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+/** Roles that may work on -- and close -- a till someone else opened. */
+const isManagement = (role: UserRole) =>
+  role === UserRole.OWNER || role === UserRole.MANAGER;
+
 /** Tenders that put physical cash in the drawer. */
 const CASH_TENDERS: PaymentMethod[] = [PaymentMethod.CASH, PaymentMethod.MIXED];
 
@@ -61,16 +65,47 @@ export class ShiftsService {
     }
   }
 
-  /** The caller's open shift plus its running totals, or null if none. */
   /**
-   * The caller's open till at a given store, or null.
+   * The till the caller is working on at a given store, or null.
    *
-   * Scoped by store because a user may now have one open shift per store: an
+   * Scoped by store because a user may have one open shift per store: an
    * owner switching branch gets that branch's till, and the one they left
    * stays open behind them rather than having to be closed first.
+   *
+   * An owner or manager with no till of their own at that store *joins* the
+   * one already open there. A shift is a drawer, not a login: when the owner
+   * steps up to the counter the cashier is standing at, their sales belong in
+   * that cashier's drawer, and making them open a second shift for the same
+   * physical till would split one drawer's cash across two Z reports that
+   * neither of them could then reconcile.
+   *
+   * Joining is only ever automatic when there is exactly one open till to
+   * join. With two running, which drawer the owner's cash goes into is a
+   * question only the person standing there can answer, so this returns null
+   * and the client asks (see `openAtStore`). Passing `preferShiftId` is that
+   * answer coming back.
    */
-  async current(user: AuthUser, storeId?: string) {
-    const shift = await this.prisma.shift.findFirst({
+  async current(user: AuthUser, storeId?: string, preferShiftId?: string) {
+    const id = await this.resolveShiftId(user, storeId, preferShiftId);
+    return id ? this.report(user.businessId, id, user.userId) : null;
+  }
+
+  /**
+   * Which till the caller is on, as an id, or null for none.
+   *
+   * The single rule, used by `current()` for what the POS displays and by the
+   * sale path for what a sale is stamped with. Two implementations of this
+   * would eventually disagree, and the symptom would be a cashier's drawer
+   * quietly short by the owner's sales.
+   */
+  async resolveShiftId(
+    user: AuthUser,
+    storeId?: string,
+    preferShiftId?: string,
+  ): Promise<string | null> {
+    if (preferShiftId) return this.joinable(user, preferShiftId, storeId);
+
+    const own = await this.prisma.shift.findFirst({
       where: {
         businessId: user.businessId,
         userId: user.userId,
@@ -80,14 +115,85 @@ export class ShiftsService {
       select: { id: true },
       orderBy: { openedAt: 'desc' },
     });
-    return shift ? this.report(user.businessId, shift.id) : null;
+    if (own) return own.id;
+
+    if (!storeId || !isManagement(user.role)) return null;
+
+    // Two is already the ambiguous case, so ask for two and stop.
+    const open = await this.prisma.shift.findMany({
+      where: { businessId: user.businessId, storeId, closedAt: null },
+      select: { id: true },
+      orderBy: { openedAt: 'asc' },
+      take: 2,
+    });
+    return open.length === 1 ? open[0].id : null;
+  }
+
+  /**
+   * Every till open at a store — what the client offers when `current()`
+   * found more than one and had to ask which drawer the owner is on.
+   *
+   * Management only: it names who is on each till, which is not a cashier's
+   * business, and only management can join one anyway.
+   */
+  async openAtStore(user: AuthUser, storeId: string) {
+    const shifts = await this.prisma.shift.findMany({
+      where: { businessId: user.businessId, storeId, closedAt: null },
+      select: {
+        id: true,
+        openedAt: true,
+        openingFloat: true,
+        userId: true,
+        user: { select: { id: true, name: true } },
+        _count: { select: { sales: true } },
+      },
+      orderBy: { openedAt: 'asc' },
+    });
+    return shifts.map((s) => ({
+      id: s.id,
+      openedAt: s.openedAt,
+      openingFloat: Number(s.openingFloat),
+      openedBy: s.user,
+      salesCount: s._count.sales,
+      isOwnShift: s.userId === user.userId,
+    }));
+  }
+
+  /**
+   * Check that the caller may work on this shift, and hand back its id.
+   *
+   * Shared by `current()` and by the sale path, so the till the POS displays
+   * and the drawer a sale lands in can never be resolved by two different
+   * rules. Throws rather than returning null: the caller named a specific
+   * shift, so silently falling back to another one would put their cash
+   * somewhere they didn't ask for.
+   */
+  async joinable(user: AuthUser, shiftId: string, storeId?: string) {
+    const shift = await this.prisma.shift.findFirst({
+      where: {
+        id: shiftId,
+        businessId: user.businessId,
+        closedAt: null,
+        ...(storeId ? { storeId } : {}),
+      },
+      select: { id: true, userId: true },
+    });
+    if (!shift) {
+      throw new NotFoundException('No open shift by that id at this store');
+    }
+    if (shift.userId !== user.userId && !isManagement(user.role)) {
+      throw new ForbiddenException(
+        'Only an owner or manager can work on someone else’s shift',
+      );
+    }
+    return shift.id;
   }
 
   /**
    * X report (mid-shift, read-only) and Z report (after close) are the same
    * numbers — what separates them is whether `closedAt` is set.
    */
-  async report(businessId: string, id: string) {
+  async report(businessId: string, id: string, viewerId?: string) {
     const shift = await this.prisma.shift.findFirst({
       where: { id, businessId },
       include: {
@@ -100,6 +206,10 @@ export class ShiftsService {
     return {
       ...shift,
       isOpen: shift.closedAt === null,
+      // Whose drawer this is. The till shows "Ramesh's till" rather than
+      // "your shift" when an owner has joined one, so nobody counts a drawer
+      // believing it to be theirs.
+      isOwnShift: viewerId ? shift.userId === viewerId : undefined,
       ...totals,
       // Once closed, the stored snapshot is the authority — a later return
       // against one of the shift's sales must not silently rewrite history.
@@ -120,9 +230,7 @@ export class ShiftsService {
     });
     if (!shift) throw new NotFoundException('Shift not found');
     if (shift.closedAt) throw new BadRequestException('Shift is already closed');
-    const isManager =
-      user.role === UserRole.OWNER || user.role === UserRole.MANAGER;
-    if (shift.userId !== user.userId && !isManager) {
+    if (shift.userId !== user.userId && !isManagement(user.role)) {
       throw new ForbiddenException('Only the cashier or a manager can close this shift');
     }
 
@@ -143,7 +251,7 @@ export class ShiftsService {
     });
     if (claimed.count === 0) throw new BadRequestException('Shift is already closed');
 
-    return this.report(user.businessId, id);
+    return this.report(user.businessId, id, user.userId);
   }
 
   async findAll(businessId: string, q: QueryShiftDto) {

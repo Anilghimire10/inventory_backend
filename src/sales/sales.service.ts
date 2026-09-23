@@ -11,6 +11,7 @@ import {
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ShiftsService } from '../shifts/shifts.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
@@ -39,6 +40,7 @@ export class SalesService {
     private prisma: PrismaService,
     private inventory: InventoryService,
     private mail: MailService,
+    private shifts: ShiftsService,
   ) {}
 
   /** Email a sale's receipt to the customer (or an explicit address). */
@@ -76,15 +78,24 @@ export class SalesService {
     if (!storeId) {
       throw new BadRequestException('No store specified for this sale');
     }
-    // Priced-out cart and the cashier's open till session (if any) — the
-    // sale is stamped with it so the shift's Z report can reconcile cash.
-    const [{ lines, subtotal, tax, billDiscount, total }, openShift] =
+    // Priced-out cart and the till this sale belongs to (if any) — the sale
+    // is stamped with it so the shift's Z report can reconcile cash.
+    //
+    // Resolved through ShiftsService so the drawer a sale lands in is decided
+    // by exactly the rule the POS used to decide which till to show. That
+    // includes an owner or manager joining the cashier's open shift: the
+    // owner selling from the same physical till puts cash in the same drawer,
+    // so it has to reconcile there.
+    //
+    // The `storeId` filter is new and is a fix in its own right: this looked
+    // up the caller's open shift by user alone, so an owner with tills open at
+    // two branches could ring up a sale at one and have it stamped onto the
+    // other branch's drawer. Both Z reports were then wrong, and neither had
+    // anything in it to show why.
+    const [{ lines, subtotal, tax, billDiscount, total }, shiftId] =
       await Promise.all([
         this.buildLines(businessId, storeId, dto),
-        this.prisma.shift.findFirst({
-          where: { businessId, userId: user.userId, closedAt: null },
-          select: { id: true },
-        }),
+        this.shifts.resolveShiftId(user, storeId, dto.shiftId),
       ]);
 
     // Serialised goods: one scanned serial per unit, checked before the
@@ -138,7 +149,7 @@ export class SalesService {
           storeId,
           userId: user.userId,
           customerId: dto.customerId,
-          shiftId: openShift?.id ?? null,
+          shiftId,
           receiptNo,
           status: SaleStatus.COMPLETED,
           subtotal,

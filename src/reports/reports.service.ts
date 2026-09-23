@@ -585,6 +585,15 @@ export class ReportsService {
       // Drawer variance per cashier, over the shifts that *closed* in the
       // window -- a shift's variance only exists once it is counted, so
       // closedAt is the date that puts it in a period, not openedAt.
+      //
+      // Attributed to whoever opened the till, which is what `Shift.userId`
+      // is. An owner or manager can join a cashier's open shift and sell from
+      // the same drawer, and their sales then count towards that drawer's
+      // variance. That is the right answer -- one drawer, one count, one
+      // person responsible for it -- but it does mean a variance row can
+      // include takings the named cashier did not ring up. `byStaff.revenue`
+      // is unaffected: that comes from `Sale.userId`, which always records
+      // who actually made the sale.
       this.prisma.$queryRaw<
         {
           userId: string;

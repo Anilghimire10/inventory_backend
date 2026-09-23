@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { ShiftsService } from './shifts.service';
@@ -21,11 +29,34 @@ export class ShiftsController {
     return this.shifts.open(u, dto);
   }
 
-  /** The caller's open shift with running totals, or null. */
+  /**
+   * The till the caller is working on, with running totals, or null.
+   *
+   * For an owner or manager with no till of their own, that is the one open
+   * at the store -- they join the cashier's drawer rather than opening a
+   * second one for the same physical till. `shiftId` names which, for the
+   * case where more than one is open and the client has asked.
+   */
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
   @Get('current')
-  current(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
-    return this.shifts.current(u, scopeToStore(u, storeId));
+  current(
+    @CurrentUser() u: AuthUser,
+    @Query('storeId') storeId?: string,
+    @Query('shiftId') shiftId?: string,
+  ) {
+    return this.shifts.current(u, scopeToStore(u, storeId), shiftId);
+  }
+
+  /**
+   * Every till currently open at a store, for the "which drawer are you on?"
+   * picker. Management only -- they are the only ones who may join one.
+   */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Get('open')
+  openAtStore(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
+    const scoped = scopeToStore(u, storeId);
+    if (!scoped) throw new BadRequestException('storeId is required');
+    return this.shifts.openAtStore(u, scoped);
   }
 
   /** Shift history — owners and managers only. */
@@ -39,7 +70,7 @@ export class ShiftsController {
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
   @Get(':id/report')
   report(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.shifts.report(u.businessId, id);
+    return this.shifts.report(u.businessId, id, u.userId);
   }
 
   /** Close with the counted cash; stores expected, counted and variance. */

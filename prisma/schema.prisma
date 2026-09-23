@@ -591,6 +591,10 @@ model Shift {
   // each store reconciles its own drawer, and the sessions never mix.
   @@index([businessId, openedAt])
   @@index([userId, closedAt])
+  // "Which tills are open at this branch?" -- asked on every POS load now
+  // that an owner joins the cashier's drawer rather than opening a second
+  // one, and by the sale path to resolve which drawer a sale lands in.
+  @@index([storeId, closedAt])
 }
 
 // ---------- Notifications ----------

@@ -482,7 +482,7 @@ async function partReturnLeavesTheSalePartiallyReturned() {
     applyMovementsBatch: async () => undefined,
     returnSerialsToStock: async () => undefined,
   });
-  const service = new SalesService(prisma, inventory, stub<MailService>({}));
+  const service = new SalesService(prisma, inventory, stub<MailService>({}), stub<ShiftsService>({}));
 
   const first: any = await service.returnItems(user, 'sale1', {
     items: [{ saleItemId: 'si1', quantity: 2 }],
@@ -584,7 +584,7 @@ async function aStaleReadCannotOverReturnALine() {
     applyMovementsBatch: async () => undefined,
     returnSerialsToStock: async () => undefined,
   });
-  const service = new SalesService(prisma, inventory, stub<MailService>({}));
+  const service = new SalesService(prisma, inventory, stub<MailService>({}), stub<ShiftsService>({}));
 
   await assert.rejects(
     service.returnItems(user, 'sale1', {
@@ -1391,11 +1391,91 @@ async function reminderGoesOutOncePerThreshold() {
   assert.strictEqual(emails.length, 3);
 }
 
+/**
+ * An owner joins the cashier's drawer rather than opening a second one for
+ * the same physical till -- but never guesses which when more than one is
+ * running, and never lets a cashier onto someone else's.
+ */
+async function anOwnerJoinsTheTillAlreadyOpen() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  const cashier: AuthUser = { ...user, userId: 'u2', role: 'CASHIER' as AuthUser['role'] };
+
+  // `open` is every shift currently open at store s1.
+  const build = (open: { id: string; userId: string }[]) =>
+    new ShiftsService(
+      stub<PrismaService>({
+        shift: {
+          // resolveShiftId asks for the caller's own shift first.
+          findFirst: async (args: any) => {
+            if (args.where.id) {
+              return open.find((sh) => sh.id === args.where.id) ?? null;
+            }
+            return open.find((sh) => sh.userId === args.where.userId) ?? null;
+          },
+          findMany: async () => open,
+        },
+      }),
+    );
+
+  const ramesh = { id: 'sh-ramesh', userId: 'u2' };
+  const sita = { id: 'sh-sita', userId: 'u3' };
+
+  assert.strictEqual(
+    await build([ramesh]).resolveShiftId(owner, 's1'),
+    'sh-ramesh',
+    'one till open at the store: the owner joins it',
+  );
+
+  assert.strictEqual(
+    await build([ramesh, sita]).resolveShiftId(owner, 's1'),
+    null,
+    'two tills open: the owner is asked rather than guessed for',
+  );
+
+  assert.strictEqual(
+    await build([ramesh, sita]).resolveShiftId(owner, 's1', 'sh-sita'),
+    'sh-sita',
+    'once asked, the answer is honoured',
+  );
+
+  assert.strictEqual(
+    await build([ramesh]).resolveShiftId(cashier, 's1'),
+    'sh-ramesh',
+    "a cashier still gets their own till (it is Ramesh's own id here)",
+  );
+
+  const other = { id: 'sh-other', userId: 'u9' };
+  assert.strictEqual(
+    await build([other]).resolveShiftId(cashier, 's1'),
+    null,
+    'a cashier is never put on a till someone else opened',
+  );
+
+  await assert.rejects(
+    build([other]).resolveShiftId(cashier, 's1', 'sh-other'),
+    /owner or manager/,
+    'and cannot get there by naming it either',
+  );
+
+  await assert.rejects(
+    build([ramesh]).resolveShiftId(owner, 's1', 'sh-closed'),
+    /No open shift/,
+    'a remembered till that has since closed is refused, not silently swapped',
+  );
+
+  assert.strictEqual(
+    await build([]).resolveShiftId(owner, 's1'),
+    null,
+    'nothing open at the store means no drawer, so the sale carries none',
+  );
+}
+
 async function main() {
   subscriptionRules();
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
   await shiftReportBalancesTheDrawer();
+  await anOwnerJoinsTheTillAlreadyOpen();
   await stockTakePreviewComputesVariances();
   await reorderSuggestionsGroupBySupplier();
   await variantGenerationCoversEveryCombination();

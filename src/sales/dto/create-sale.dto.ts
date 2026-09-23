@@ -57,6 +57,16 @@ export class CreateSaleDto {
   @IsString()
   customerId?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Which open till this sale belongs to. Only needed when more than one ' +
+      'is open at the store and an owner or manager has picked one; ' +
+      'otherwise the server resolves it.',
+  })
+  @IsOptional()
+  @IsString()
+  shiftId?: string;
+
   @ApiPropertyOptional({ enum: PaymentMethod, default: PaymentMethod.CASH })
   @IsOptional()
   @IsEnum(PaymentMethod)
