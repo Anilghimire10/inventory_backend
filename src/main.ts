@@ -49,6 +49,11 @@ async function bootstrap() {
 
   // Serve locally-stored uploads (product images) at /api/uploads/*.
   // Sits under the same /api path the web app already proxies to the backend.
+  //
+  // Kept even once Supabase Storage is configured. New uploads get an absolute
+  // bucket URL, but every Product.imageUrl written before that change is a
+  // /api/uploads/... path, and those rows are not rewritten — removing this
+  // would break each of them. Retire it only after a backfill.
   app.useStaticAssets(join(process.cwd(), "uploads"), {
     prefix: "/api/uploads",
   });

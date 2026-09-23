@@ -1,0 +1,144 @@
+import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { randomBytes } from 'crypto';
+import { existsSync, mkdirSync } from 'fs';
+import { writeFile } from 'fs/promises';
+import { extname, join } from 'path';
+
+/** Where product images land when there is no object storage configured. */
+export const PRODUCT_UPLOAD_DIR = join(process.cwd(), 'uploads', 'products');
+export const PRODUCT_PUBLIC_PREFIX = '/api/uploads/products';
+
+/** The bucket images go to when Supabase Storage is configured. */
+const DEFAULT_BUCKET = 'product-images';
+
+/** Minimal shape of an in-memory Multer file (avoids needing @types/multer). */
+export interface UploadedImage {
+  originalname: string;
+  mimetype: string;
+  buffer: Buffer;
+  size: number;
+}
+
+/**
+ * Where a product image is kept.
+ *
+ * Render's filesystem is ephemeral, so the local-disk path loses every image
+ * uploaded since the last deploy -- no error, no log, the images simply 404
+ * afterwards. Object storage is the fix, and Supabase Storage is the least new
+ * infrastructure given the database is already there.
+ *
+ * Both paths are kept rather than one replacing the other, because the choice
+ * is a deployment property, not a code one:
+ *
+ *   - configured (`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`) -> the bucket,
+ *     and the stored `imageUrl` is an absolute URL that survives any deploy;
+ *   - not configured -> disk, exactly as before, which is what keeps `npm run
+ *     start:dev` working on a laptop with no cloud credentials.
+ *
+ * The one thing that is *not* kept is the silence. Falling back in production
+ * is logged at error level on the first upload, naming the consequence,
+ * because the whole defect here was that losing the images looked like
+ * nothing happening at all.
+ *
+ * Deliberately not a hard boot failure when unconfigured in production, unlike
+ * JWT_SECRET or CORS_ORIGIN: those are unsafe, whereas this is lossy. Refusing
+ * to start would take a working shop's till offline over product photographs.
+ */
+@Injectable()
+export class ProductImageStorage {
+  private readonly logger = new Logger(ProductImageStorage.name);
+  private readonly client: SupabaseClient | null;
+  private readonly bucket = process.env.SUPABASE_STORAGE_BUCKET || DEFAULT_BUCKET;
+  private warned = false;
+
+  constructor() {
+    const url = process.env.SUPABASE_URL?.trim();
+    // The service-role key, not the anon key: uploads are performed by the API
+    // on the user's behalf after its own role check, so it must not be subject
+    // to storage RLS meant for browser clients. It is a server-side secret and
+    // must never reach the web app.
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+
+    this.client =
+      url && key
+        ? createClient(url, key, { auth: { persistSession: false } })
+        : null;
+
+    if (this.client) {
+      this.logger.log(`Product images -> Supabase Storage bucket "${this.bucket}"`);
+    }
+  }
+
+  /** True when images are being persisted somewhere a deploy won't erase. */
+  get isDurable() {
+    return this.client !== null;
+  }
+
+  /**
+   * Store one image and return the value to persist as `Product.imageUrl`.
+   *
+   * An absolute URL when it went to the bucket, or the `/api/uploads/...` path
+   * when it went to disk. Callers store whichever they are given verbatim, so
+   * rows written before and after this change both keep working -- `main.ts`
+   * still serves the old prefix.
+   */
+  async save(file: UploadedImage): Promise<string> {
+    const ext = extname(file.originalname).toLowerCase();
+    const name = `${randomBytes(16).toString('hex')}${ext}`;
+
+    if (!this.client) {
+      this.warnOnceIfProduction();
+      return this.saveToDisk(name, file.buffer);
+    }
+
+    const { error } = await this.client.storage
+      .from(this.bucket)
+      .upload(name, file.buffer, {
+        contentType: file.mimetype,
+        // Names are 16 random bytes, so a collision means something is wrong;
+        // overwriting would hide it and could clobber another product's image.
+        upsert: false,
+      });
+
+    if (error) {
+      // Don't silently fall back to disk here. The upload was meant to be
+      // durable; writing it somewhere that will be wiped instead, while
+      // telling the user it succeeded, is the exact failure this class exists
+      // to remove.
+      this.logger.error(
+        `Supabase Storage upload failed (bucket "${this.bucket}"): ${error.message}`,
+      );
+      throw new InternalServerErrorException(
+        'Could not store the image. Please try again.',
+      );
+    }
+
+    const { data } = this.client.storage.from(this.bucket).getPublicUrl(name);
+    return data.publicUrl;
+  }
+
+  private async saveToDisk(name: string, buffer: Buffer): Promise<string> {
+    if (!existsSync(PRODUCT_UPLOAD_DIR)) {
+      mkdirSync(PRODUCT_UPLOAD_DIR, { recursive: true });
+    }
+    await writeFile(join(PRODUCT_UPLOAD_DIR, name), buffer);
+    return `${PRODUCT_PUBLIC_PREFIX}/${name}`;
+  }
+
+  /**
+   * Say it once, loudly, on the first upload rather than at boot: a deploy
+   * that never receives an image never had a problem, and an error logged at
+   * startup on every instance is the kind that gets filtered out.
+   */
+  private warnOnceIfProduction() {
+    if (this.warned || process.env.NODE_ENV !== 'production') return;
+    this.warned = true;
+    this.logger.error(
+      'Product images are being written to local disk because SUPABASE_URL / ' +
+        'SUPABASE_SERVICE_ROLE_KEY are not set. On an ephemeral filesystem ' +
+        '(Render, Fly, Heroku) every image uploaded since the last deploy is ' +
+        'destroyed by the next one. Configure object storage.',
+    );
+  }
+}

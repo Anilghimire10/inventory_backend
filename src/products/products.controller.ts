@@ -20,11 +20,8 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { GenerateVariantsDto } from './dto/generate-variants.dto';
-import {
-  PRODUCT_PUBLIC_PREFIX,
-  productImageMulterOptions,
-  UploadedImage,
-} from './upload.config';
+import { productImageMulterOptions, type UploadedImage } from './upload.config';
+import { ProductImageStorage } from './product-image.storage';
 import { UserRole } from '@prisma/client';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -50,7 +47,10 @@ export class ImportProductsDto {
 @ApiBearerAuth()
 @Controller('products')
 export class ProductsController {
-  constructor(private readonly products: ProductsService) {}
+  constructor(
+    private readonly products: ProductsService,
+    private readonly images: ProductImageStorage,
+  ) {}
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
   @Post()
@@ -63,9 +63,11 @@ export class ProductsController {
   @Post('upload-image')
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('image', productImageMulterOptions))
-  uploadImage(@UploadedFile() file?: UploadedImage) {
+  async uploadImage(@UploadedFile() file?: UploadedImage) {
     if (!file) throw new BadRequestException('No image uploaded');
-    return { imageUrl: `${PRODUCT_PUBLIC_PREFIX}/${file.filename}` };
+    // Whether this is a bucket URL or a local /api/uploads path depends on
+    // deployment config; either way it is stored on Product.imageUrl verbatim.
+    return { imageUrl: await this.images.save(file) };
   }
 
   /** Bulk import products from parsed CSV rows (upsert by SKU). */

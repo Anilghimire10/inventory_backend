@@ -1,38 +1,29 @@
 import { BadRequestException } from '@nestjs/common';
-import { randomBytes } from 'crypto';
-import { existsSync, mkdirSync } from 'fs';
-import { extname, join } from 'path';
-import { diskStorage } from 'multer';
+import { extname } from 'path';
+import { memoryStorage } from 'multer';
 
-/** Where product images live on disk and the public path they are served from. */
-export const PRODUCT_UPLOAD_DIR = join(process.cwd(), 'uploads', 'products');
-export const PRODUCT_PUBLIC_PREFIX = '/api/uploads/products';
+export {
+  PRODUCT_UPLOAD_DIR,
+  PRODUCT_PUBLIC_PREFIX,
+  type UploadedImage,
+} from './product-image.storage';
 
 const ALLOWED = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 
-/** Minimal shape of a Multer file (avoids needing @types/multer). */
-export interface UploadedImage {
-  filename: string;
-  mimetype: string;
-}
-
+/**
+ * Multer options for a product image.
+ *
+ * `memoryStorage`, not `diskStorage`: where the image ends up is
+ * `ProductImageStorage`'s decision -- the bucket when object storage is
+ * configured, local disk otherwise -- and multer writing it to disk first
+ * would make the durable path a copy-then-delete dance for no reason.
+ *
+ * Holding the file in memory is safe at this size: the 5 MB limit is enforced
+ * by multer before the buffer is handed over, and one image at a time per
+ * request is nothing beside what the report endpoints used to allocate.
+ */
 export const productImageMulterOptions = {
-  storage: diskStorage({
-    destination: (_req: unknown, _file: unknown, cb: (e: Error | null, dest: string) => void) => {
-      if (!existsSync(PRODUCT_UPLOAD_DIR)) {
-        mkdirSync(PRODUCT_UPLOAD_DIR, { recursive: true });
-      }
-      cb(null, PRODUCT_UPLOAD_DIR);
-    },
-    filename: (
-      _req: unknown,
-      file: { originalname: string },
-      cb: (e: Error | null, name: string) => void,
-    ) => {
-      const ext = extname(file.originalname).toLowerCase();
-      cb(null, `${randomBytes(16).toString('hex')}${ext}`);
-    },
-  }),
+  storage: memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
   fileFilter: (
     _req: unknown,
