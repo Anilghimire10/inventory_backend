@@ -49,6 +49,18 @@ export class ReportsController {
     return this.reports.taxReport(u.businessId, { from, to, storeId });
   }
 
+  /**
+   * Outstanding customer credit, aged into 0-30 / 30-60 / 60+ day buckets.
+   * Management-only: it is a financial position, like the other reports here.
+   */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Get('credit-ageing')
+  creditAgeing(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
+    return this.reports.creditAgeing(u.businessId, {
+      storeId: scopeToStore(u, storeId),
+    });
+  }
+
   @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get('analytics')
   analytics(

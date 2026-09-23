@@ -1,5 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma, SaleStatus, StockMovementType } from '@prisma/client';
+import {
+  PaymentMethod,
+  Prisma,
+  SaleStatus,
+  StockMovementType,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 
@@ -69,13 +74,17 @@ export class ReportsService {
         this.slowProducts(businessId, storeId, 5),
       ]);
 
-    // Charts below are revenue-based, so owner-only.
-    const [salesTrend, hourlyToday] = includeFinancials
+    // Charts and the credit position below are financial, so owner/manager
+    // only. Credit is here rather than buried in Analytics because what is
+    // owed is money already out the door -- for a shop running udhaaro it is
+    // usually a more pressing number than margin.
+    const [salesTrend, hourlyToday, credit] = includeFinancials
       ? await Promise.all([
           this.salesTrend(businessId, storeId, 14),
           this.hourlyToday(businessId, storeId, startOfToday),
+          this.creditAgeing(businessId, { storeId }),
         ])
-      : [undefined, undefined];
+      : [undefined, undefined, undefined];
 
     return {
       totalSalesCount: sales._count,
@@ -90,8 +99,153 @@ export class ReportsService {
             inventoryValue,
             salesTrend,
             hourlyToday,
+            creditOutstanding: credit?.total ?? 0,
+            creditOverdue: credit?.overdue ?? 0,
+            creditCustomersOwing: credit?.customersOwing ?? 0,
           }
         : {}),
+    };
+  }
+
+  /**
+   * Outstanding customer credit (udhaaro), aged.
+   *
+   * The money already out the door. `Customer.creditBalance` is the
+   * authoritative figure -- `payCredit` decrements it in one guarded
+   * statement and attributes the payment to no particular sale -- so this
+   * cannot simply sum what each invoice still shows unpaid: after a payment
+   * the invoices would add up to more than the customer actually owes.
+   *
+   * Instead the balance is *allocated* across that customer's credit sales
+   * newest-first, which is the same thing as assuming payments settled the
+   * oldest debt first (FIFO, how a shopkeeper actually runs a khata). What is
+   * left unsettled is therefore the most recent sales, and each allocated
+   * slice is aged by the date of the sale it landed on.
+   *
+   * Arithmetic is in integer paisa throughout. Allocating in floats lets the
+   * buckets drift a cent or two away from the balance they were carved from,
+   * and the one property this report must have is that its parts add up to
+   * `SELECT sum("creditBalance")`.
+   *
+   * A balance bigger than the credit sales can explain -- an opening balance,
+   * a manual adjustment -- has no sale to age against and is reported
+   * separately as `unattributed` rather than being quietly dropped or parked
+   * in an arbitrary bucket.
+   */
+  async creditAgeing(
+    businessId: string,
+    opts: { storeId?: string; asOf?: Date } = {},
+  ) {
+    const now = opts.asOf ?? new Date();
+    const creditSale = {
+      status: BOOKED,
+      paymentMethod: { in: [PaymentMethod.CREDIT, PaymentMethod.MIXED] },
+      ...(opts.storeId ? { storeId: opts.storeId } : {}),
+    };
+
+    const customers = await this.prisma.customer.findMany({
+      where: {
+        businessId,
+        creditBalance: { gt: 0 },
+        // Same rule as CreditService.receivables: a store filter narrows
+        // *which* customers are listed, never what they owe. The balance is
+        // one number per customer for the whole business, so a branch's share
+        // of it does not exist to be reported.
+        ...(opts.storeId ? { sales: { some: creditSale } } : {}),
+      },
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        creditBalance: true,
+        sales: {
+          where: creditSale,
+          orderBy: { createdAt: 'desc' },
+          select: {
+            id: true,
+            receiptNo: true,
+            createdAt: true,
+            total: true,
+            refundedTotal: true,
+            amountPaid: true,
+          },
+        },
+      },
+    });
+
+    const paisa = (d: Prisma.Decimal | number) => Math.round(Number(d) * 100);
+    const rupees = (p: number) => round2(p / 100);
+    const DAY = 24 * 60 * 60 * 1000;
+
+    let current = 0; // 0-30 days
+    let days30 = 0; // 31-60 days
+    let days60Plus = 0; // over 60 days
+    let unattributed = 0;
+
+    const debtors = customers.map((c) => {
+      let remaining = paisa(c.creditBalance);
+      const own = { current: 0, days30: 0, days60Plus: 0 };
+      let oldestUnpaidAt: Date | null = null;
+
+      // Newest first: the tail of the debt is what survives FIFO payments.
+      for (const sale of c.sales) {
+        if (remaining <= 0) break;
+        const outstanding =
+          paisa(sale.total) - paisa(sale.refundedTotal) - paisa(sale.amountPaid);
+        if (outstanding <= 0) continue;
+
+        const allocated = Math.min(remaining, outstanding);
+        remaining -= allocated;
+
+        const age = Math.floor((now.getTime() - sale.createdAt.getTime()) / DAY);
+        if (age <= 30) own.current += allocated;
+        else if (age <= 60) own.days30 += allocated;
+        else own.days60Plus += allocated;
+
+        // Walking newest-first, the last sale we touch is the oldest one
+        // still carrying money.
+        oldestUnpaidAt = sale.createdAt;
+      }
+
+      current += own.current;
+      days30 += own.days30;
+      days60Plus += own.days60Plus;
+      unattributed += remaining;
+
+      return {
+        id: c.id,
+        name: c.name,
+        phone: c.phone,
+        balance: rupees(paisa(c.creditBalance)),
+        current: rupees(own.current),
+        days30: rupees(own.days30),
+        days60Plus: rupees(own.days60Plus),
+        unattributed: rupees(remaining),
+        oldestUnpaidAt,
+        oldestUnpaidDays: oldestUnpaidAt
+          ? Math.floor((now.getTime() - oldestUnpaidAt.getTime()) / DAY)
+          : null,
+      };
+    });
+
+    const total = current + days30 + days60Plus + unattributed;
+
+    return {
+      total: rupees(total),
+      // Anything past 30 days. This is the number worth chasing.
+      overdue: rupees(days30 + days60Plus),
+      buckets: {
+        current: rupees(current),
+        days30: rupees(days30),
+        days60Plus: rupees(days60Plus),
+      },
+      unattributed: rupees(unattributed),
+      customersOwing: customers.length,
+      /** True when the figures are business-wide despite a store filter. */
+      balancesAreBusinessWide: !!opts.storeId,
+      topDebtors: [...debtors]
+        .sort((a, b) => b.balance - a.balance)
+        .slice(0, 10),
     };
   }
 
