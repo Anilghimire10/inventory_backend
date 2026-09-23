@@ -130,6 +130,9 @@ model Business {
   type            BusinessType @default(OTHER)
   salesModel      SalesModel   @default(RETAIL)
   currency        String       @default("USD")
+  /// IANA zone the shop's day is cut on -- reports, day buckets and the
+  /// hour-of-day chart all key off this, not off the server's UTC clock.
+  timezone        String       @default("Asia/Kathmandu")
   taxId           String? // PAN/VAT registration number
   showTaxIdOnBill Boolean      @default(false) // when on, the PAN/VAT number prints on bills
   taxInclusive    Boolean      @default(false)

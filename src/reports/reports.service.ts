@@ -7,8 +7,64 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import {
+  DEFAULT_TIMEZONE,
+  addDays,
+  dayKey,
+  dayKeysBetween,
+  startOfDay,
+  startOfDayKey,
+  type DayKey,
+} from '../common/timezone';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/**
+ * A timestamp column read as a local wall-clock time in `tz`.
+ *
+ * Columns are `timestamp(3)` without a zone, holding UTC. `AT TIME ZONE 'UTC'`
+ * says so explicitly, turning it into a `timestamptz`; the second
+ * `AT TIME ZONE` then reads that instant off the shop's clock. Both halves are
+ * needed -- one alone would reinterpret the value rather than convert it.
+ */
+const localTime = (col: Prisma.Sql, tz: string) =>
+  Prisma.sql`(${col} AT TIME ZONE 'UTC' AT TIME ZONE ${tz})`;
+
+/** That local time as a `YYYY-MM-DD` day key, matching `dayKey()` in JS. */
+const localDay = (col: Prisma.Sql, tz: string) =>
+  Prisma.sql`to_char(${localTime(col, tz)}, 'YYYY-MM-DD')`;
+
+/** That local time's hour of day, 0-23, matching `hourOfDay()` in JS. */
+const localHour = (col: Prisma.Sql, tz: string) =>
+  Prisma.sql`EXTRACT(HOUR FROM ${localTime(col, tz)})::int`;
+
+/** Postgres returns SUM/COUNT as Decimal or BigInt; reports want numbers. */
+const num = (v: Prisma.Decimal | bigint | number | null | undefined) =>
+  Number(v ?? 0);
+
+/**
+ * The line-level arithmetic every sale rollup shares, written once.
+ *
+ * All three assume a query that joins `SaleItem si` to `Sale s`, and the cost
+ * one also to `Product p`.
+ */
+
+/** Units on a line that were kept, i.e. not handed back. */
+const SOLD_QTY = Prisma.sql`(si.quantity - si."returnedQty")`;
+
+/** What those units brought in, before tax. */
+const LINE_REVENUE = Prisma.sql`${SOLD_QTY} * si."unitPrice"`;
+
+/**
+ * What those units cost.
+ *
+ * Prefers the cost snapshotted on the line at sale time and falls back to the
+ * product's current cost. `NULLIF(..., 0)` is what triggers the fallback:
+ * lines written before cost-snapshotting existed carry 0 rather than null,
+ * which is exactly what `Number(it.unitCost) || Number(product.costPrice)`
+ * meant in the JS this replaced.
+ */
+const LINE_COST = Prisma.sql`${SOLD_QTY} * COALESCE(NULLIF(si."unitCost", 0), p."costPrice")`;
 
 /**
  * Sales that count towards the books.
@@ -34,6 +90,46 @@ export class ReportsService {
   ) {}
 
   /**
+   * The zone this business's days are cut on.
+   *
+   * One indexed primary-key lookup per report. Worth not caching: a shop that
+   * corrects its zone should see the next report land on the right days, and
+   * this read is nothing beside the aggregation it precedes. Falls back to
+   * Nepal rather than to UTC if the row has somehow gone -- UTC is the wrong
+   * answer for every business on the system, and a report cut on the wrong
+   * day is worse than one that errors.
+   */
+  private async timezone(businessId: string): Promise<string> {
+    const b = await this.prisma.business.findUnique({
+      where: { id: businessId },
+      select: { timezone: true },
+    });
+    return b?.timezone || DEFAULT_TIMEZONE;
+  }
+
+  /**
+   * The `WHERE` shared by every sale rollup, as SQL.
+   *
+   * Kept next to the Prisma `saleWhere` it mirrors so the two can be read
+   * against each other -- a rollup that filtered differently from the totals
+   * it sits beside would be the hardest kind of bug to spot on a chart.
+   */
+  private saleFilterSql(
+    businessId: string,
+    opts: { storeId?: string; from?: string; to?: string },
+    alias = 's',
+  ) {
+    const col = (name: string) => Prisma.raw(`"${alias}"."${name}"`);
+    return Prisma.sql`
+      ${col('businessId')} = ${businessId}
+      AND ${col('status')} <> ${SaleStatus.HELD}::"SaleStatus"
+      ${opts.storeId ? Prisma.sql`AND ${col('storeId')} = ${opts.storeId}` : Prisma.empty}
+      ${opts.from ? Prisma.sql`AND ${col('createdAt')} >= ${new Date(opts.from)}` : Prisma.empty}
+      ${opts.to ? Prisma.sql`AND ${col('createdAt')} <= ${new Date(opts.to)}` : Prisma.empty}
+    `;
+  }
+
+  /**
    * Home-screen snapshot: today's takings + alerts + value + best sellers.
    * Financial figures are included only when `includeFinancials` is true
    * (owner). Other roles still see the operational widgets.
@@ -43,8 +139,10 @@ export class ReportsService {
     storeId?: string,
     includeFinancials = true,
   ) {
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const tz = await this.timezone(businessId);
+    // Local midnight, not the server's. On a US-hosted box serving Kathmandu
+    // these are 5h45m apart, which is the whole early trade of the day.
+    const startOfToday = startOfDay(tz);
 
     const saleWhere = {
       businessId,
@@ -80,8 +178,8 @@ export class ReportsService {
     // usually a more pressing number than margin.
     const [salesTrend, hourlyToday, credit] = includeFinancials
       ? await Promise.all([
-          this.salesTrend(businessId, storeId, 14),
-          this.hourlyToday(businessId, storeId, startOfToday),
+          this.salesTrend(businessId, storeId, 14, tz),
+          this.hourlyToday(businessId, storeId, startOfToday, tz),
           this.creditAgeing(businessId, { storeId }),
         ])
       : [undefined, undefined, undefined];
@@ -254,63 +352,62 @@ export class ReportsService {
     businessId: string,
     opts: { from?: string; to?: string; storeId?: string },
   ) {
-    const where = {
-      businessId,
-      ...(opts.storeId ? { storeId: opts.storeId } : {}),
-      status: BOOKED,
-      ...(opts.from || opts.to
-        ? {
-            createdAt: {
-              ...(opts.from ? { gte: new Date(opts.from) } : {}),
-              ...(opts.to ? { lte: new Date(opts.to) } : {}),
-            },
-          }
-        : {}),
-    };
+    const tz = await this.timezone(businessId);
 
-    const sales = await this.prisma.sale.findMany({
-      where,
-      select: {
-        total: true,
-        refundedTotal: true,
-        tax: true,
-        discount: true,
-        createdAt: true,
-      },
-      orderBy: { createdAt: 'asc' },
-    });
+    // One GROUP BY rather than every sale in the range pulled into memory and
+    // reduced. The totals are then the sum of the buckets, so the header
+    // figure and the chart under it cannot disagree.
+    const rows = await this.prisma.$queryRaw<
+      { date: DayKey; total: Prisma.Decimal | null; count: bigint }[]
+    >`
+      SELECT ${localDay(Prisma.sql`s."createdAt"`, tz)} AS date,
+             SUM(s.total - s."refundedTotal") AS total,
+             COUNT(*)                         AS count
+      FROM "Sale" s
+      WHERE ${this.saleFilterSql(businessId, opts)}
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `;
 
-    const byDay: Record<string, { total: number; count: number }> = {};
-    let revenue = 0;
-    for (const s of sales) {
-      const day = s.createdAt.toISOString().slice(0, 10);
-      const net = Number(s.total) - Number(s.refundedTotal);
-      byDay[day] ??= { total: 0, count: 0 };
-      byDay[day].total = Math.round((byDay[day].total + net) * 100) / 100;
-      byDay[day].count += 1;
-      revenue += net;
-    }
+    const byDay = rows.map((r) => ({
+      date: r.date,
+      total: round2(num(r.total)),
+      count: Number(r.count),
+    }));
 
     return {
-      count: sales.length,
-      revenue: Math.round(revenue * 100) / 100,
-      byDay: Object.entries(byDay).map(([date, v]) => ({ date, ...v })),
+      count: byDay.reduce((s, d) => s + d.count, 0),
+      revenue: round2(byDay.reduce((s, d) => s + d.total, 0)),
+      byDay,
     };
   }
 
   /**
    * Full analytics for the Analytics page: totals (gross sales, net revenue,
-   * cost, profit, margin), sales-by-item, by-day, and by-payment-method.
+   * cost, profit, margin), plus per-product, per-day, per-category, per-hour,
+   * per-payment-method and per-cashier rollups.
    *
-   * Profit uses each product's CURRENT cost price (the schema doesn't snapshot
-   * cost at sale time), and quantities are net of returns. Revenue here is
-   * net of tax; "gross sales" is the customer-facing total incl. tax/discount.
+   * Every rollup here is a `GROUP BY`. This function used to load every `Sale`
+   * *and every `SaleItem`* in the range -- with a nested `product.categories`
+   * join on each item -- and reduce them in JS, so "All time" meant the entire
+   * trading history in the API process's heap at once. The rollups were all
+   * plain aggregates, so they belong in the database; and with them there,
+   * there is nothing left to cap. "All time" is a scan now, not a download.
+   *
+   * Days and hours are cut on the business's own time zone, so a shop in
+   * Kathmandu sees its own trading day rather than the server's UTC one.
+   *
+   * Profit prefers the cost snapshotted on each line at sale time and falls
+   * back to the product's current cost for sales recorded before snapshotting
+   * existed. Quantities are net of returns. Revenue here is net of tax;
+   * "gross sales" is the customer-facing total incl. tax and discount.
    */
   async analytics(
     businessId: string,
     opts: { from?: string; to?: string; storeId?: string },
   ) {
     const { from, to } = opts;
+    const tz = await this.timezone(businessId);
     const saleWhere: Prisma.SaleWhereInput = {
       businessId,
       ...(opts.storeId ? { storeId: opts.storeId } : {}),
@@ -324,6 +421,9 @@ export class ReportsService {
           }
         : {}),
     };
+    const filter = this.saleFilterSql(businessId, opts);
+    const saleDay = localDay(Prisma.sql`s."createdAt"`, tz);
+    const saleHour = localHour(Prisma.sql`s."createdAt"`, tz);
 
     // The equal-length window immediately before the selected one, for
     // % change on the KPI cards. Null when there's no finite start (All time).
@@ -340,7 +440,20 @@ export class ReportsService {
           })()
         : null;
 
-    const [agg, byPaymentRaw, sales, items, prev] = await Promise.all([
+    const [
+      agg,
+      byPaymentRaw,
+      productRows,
+      dayRows,
+      dayUnitRows,
+      categoryRows,
+      hourRows,
+      hourUnitRows,
+      staffSaleRows,
+      shiftRows,
+      stockCostRows,
+      prev,
+    ] = await Promise.all([
       this.prisma.sale.aggregate({
         where: saleWhere,
         _sum: { total: true, refundedTotal: true },
@@ -352,69 +465,205 @@ export class ReportsService {
         _sum: { total: true, refundedTotal: true },
         _count: true,
       }),
-      this.prisma.sale.findMany({
-        where: saleWhere,
-        select: { total: true, refundedTotal: true, createdAt: true },
-        orderBy: { createdAt: 'asc' },
-      }),
-      this.prisma.saleItem.findMany({
-        where: { sale: saleWhere },
-        select: {
-          productId: true,
-          name: true,
-          quantity: true,
-          returnedQty: true,
-          unitPrice: true,
-          unitCost: true,
-          sale: { select: { createdAt: true } },
-          product: {
-            select: {
-              name: true,
-              costPrice: true,
-              categories: { select: { name: true } },
-            },
-          },
-        },
-      }),
+
+      // Per product. The name comes from the catalog, not from
+      // `SaleItem.name`, which is the snapshot taken at sale time -- otherwise
+      // a renamed product reads one way here and another on the dashboard.
+      this.prisma.$queryRaw<
+        {
+          productId: string;
+          name: string;
+          quantitySold: Prisma.Decimal | null;
+          revenue: Prisma.Decimal | null;
+          cost: Prisma.Decimal | null;
+        }[]
+      >`
+        SELECT si."productId"  AS "productId",
+               p.name          AS name,
+               SUM(${SOLD_QTY})     AS "quantitySold",
+               SUM(${LINE_REVENUE}) AS revenue,
+               SUM(${LINE_COST})    AS cost
+        FROM "SaleItem" si
+        JOIN "Sale"    s ON s.id = si."saleId"
+        JOIN "Product" p ON p.id = si."productId"
+        WHERE ${filter} AND ${SOLD_QTY} > 0
+        GROUP BY si."productId", p.name
+      `,
+
+      // Per day: revenue and order count off the sales themselves...
+      this.prisma.$queryRaw<
+        { date: DayKey; total: Prisma.Decimal | null; count: bigint }[]
+      >`
+        SELECT ${saleDay} AS date,
+               SUM(s.total - s."refundedTotal") AS total,
+               COUNT(*)                         AS count
+        FROM "Sale" s
+        WHERE ${filter}
+        GROUP BY 1
+        ORDER BY 1 ASC
+      `,
+      // ...and units off the lines. Two rollups rather than one join so the
+      // order count stays a count of sales: joining the lines in first would
+      // multiply each sale by the number of items on it.
+      this.prisma.$queryRaw<{ date: DayKey; units: Prisma.Decimal | null }[]>`
+        SELECT ${saleDay} AS date, SUM(${SOLD_QTY}) AS units
+        FROM "SaleItem" si
+        JOIN "Sale" s ON s.id = si."saleId"
+        WHERE ${filter}
+        GROUP BY 1
+      `,
+
+      // Per category, attributed to the product's first category. "First" was
+      // whatever Prisma's join happened to return; it is pinned to the
+      // earliest-created category here so the same sale lands in the same
+      // slice on every run.
+      this.prisma.$queryRaw<
+        {
+          category: string;
+          revenue: Prisma.Decimal | null;
+          units: Prisma.Decimal | null;
+        }[]
+      >`
+        SELECT COALESCE(c.name, 'Uncategorized') AS category,
+               SUM(${LINE_REVENUE}) AS revenue,
+               SUM(${SOLD_QTY})     AS units
+        FROM "SaleItem" si
+        JOIN "Sale" s ON s.id = si."saleId"
+        LEFT JOIN LATERAL (
+          SELECT cat.name
+          FROM "_ProductCategories" pc
+          JOIN "Category" cat ON cat.id = pc."A"
+          WHERE pc."B" = si."productId"
+          ORDER BY cat.id ASC
+          LIMIT 1
+        ) c ON TRUE
+        WHERE ${filter} AND ${SOLD_QTY} > 0
+        GROUP BY 1
+      `,
+
+      // Per hour of the local day, across the whole range.
+      this.prisma.$queryRaw<
+        { hour: number; total: Prisma.Decimal | null; count: bigint }[]
+      >`
+        SELECT ${saleHour} AS hour,
+               SUM(s.total - s."refundedTotal") AS total,
+               COUNT(*)                         AS count
+        FROM "Sale" s
+        WHERE ${filter}
+        GROUP BY 1
+      `,
+      this.prisma.$queryRaw<{ hour: number; units: Prisma.Decimal | null }[]>`
+        SELECT ${saleHour} AS hour, SUM(${SOLD_QTY}) AS units
+        FROM "SaleItem" si
+        JOIN "Sale" s ON s.id = si."saleId"
+        WHERE ${filter}
+        GROUP BY 1
+      `,
+
+      // Per cashier. Sales carry `userId`, so who rang what has always been on
+      // disk -- nothing read it. Sales from before staff attribution existed
+      // have a null `userId` and are grouped under it rather than dropped, so
+      // these rows still sum to the period's net revenue.
+      this.prisma.$queryRaw<
+        {
+          userId: string | null;
+          name: string | null;
+          revenue: Prisma.Decimal | null;
+          transactions: bigint;
+        }[]
+      >`
+        SELECT s."userId" AS "userId",
+               u.name     AS name,
+               SUM(s.total - s."refundedTotal") AS revenue,
+               COUNT(*)                         AS transactions
+        FROM "Sale" s
+        LEFT JOIN "User" u ON u.id = s."userId"
+        WHERE ${filter}
+        GROUP BY 1, 2
+      `,
+
+      // Drawer variance per cashier, over the shifts that *closed* in the
+      // window -- a shift's variance only exists once it is counted, so
+      // closedAt is the date that puts it in a period, not openedAt.
+      this.prisma.$queryRaw<
+        {
+          userId: string;
+          name: string;
+          shifts: bigint;
+          totalVariance: Prisma.Decimal | null;
+          meanVariance: Prisma.Decimal | null;
+          worstVariance: Prisma.Decimal | null;
+        }[]
+      >`
+        SELECT sh."userId" AS "userId",
+               u.name      AS name,
+               COUNT(*)         AS shifts,
+               SUM(sh.variance) AS "totalVariance",
+               AVG(sh.variance) AS "meanVariance",
+               MIN(sh.variance) AS "worstVariance"
+        FROM "Shift" sh
+        JOIN "User" u ON u.id = sh."userId"
+        WHERE sh."businessId" = ${businessId}
+          AND sh."closedAt" IS NOT NULL
+          AND sh.variance IS NOT NULL
+          ${opts.storeId ? Prisma.sql`AND sh."storeId" = ${opts.storeId}` : Prisma.empty}
+          ${from ? Prisma.sql`AND sh."closedAt" >= ${new Date(from)}` : Prisma.empty}
+          ${to ? Prisma.sql`AND sh."closedAt" <= ${new Date(to)}` : Prisma.empty}
+        GROUP BY 1, 2
+      `,
+
+      // Closing inventory cost per product, for GMROI below.
+      this.prisma.$queryRaw<
+        { productId: string; value: Prisma.Decimal | null }[]
+      >`
+        SELECT st."productId" AS "productId",
+               SUM(st.quantity * p."costPrice") AS value
+        FROM "StockItem" st
+        JOIN "Product" p ON p.id = st."productId"
+        WHERE st."businessId" = ${businessId}
+          ${opts.storeId ? Prisma.sql`AND st."storeId" = ${opts.storeId}` : Prisma.empty}
+        GROUP BY 1
+      `,
+
       prevWindow
         ? (async () => {
-            const prevWhere: Prisma.SaleWhereInput = {
-              businessId,
-              ...(opts.storeId ? { storeId: opts.storeId } : {}),
-              status: BOOKED,
-              createdAt: {
-                gte: new Date(prevWindow.from),
-                lte: new Date(prevWindow.to),
-              },
+            const prevOpts = {
+              storeId: opts.storeId,
+              from: prevWindow.from,
+              to: prevWindow.to,
             };
-            const [prevAgg, prevItems] = await Promise.all([
+            const prevFilter = this.saleFilterSql(businessId, prevOpts);
+            const [prevAgg, prevLines] = await Promise.all([
               this.prisma.sale.aggregate({
-                where: prevWhere,
+                where: {
+                  businessId,
+                  ...(opts.storeId ? { storeId: opts.storeId } : {}),
+                  status: BOOKED,
+                  createdAt: {
+                    gte: new Date(prevWindow.from),
+                    lte: new Date(prevWindow.to),
+                  },
+                },
                 _sum: { total: true, refundedTotal: true },
                 _count: true,
               }),
-              this.prisma.saleItem.findMany({
-                where: { sale: prevWhere },
-                select: {
-                  quantity: true,
-                  returnedQty: true,
-                  unitPrice: true,
-                  unitCost: true,
-                  product: { select: { costPrice: true } },
-                },
-              }),
+              // Same `SOLD_QTY > 0` filter as the selected window. Without it
+              // the comparison counted fully-returned lines on one side and
+              // not the other, so the % change was measured against a figure
+              // the current period never reported.
+              this.prisma.$queryRaw<
+                { revenue: Prisma.Decimal | null; cost: Prisma.Decimal | null }[]
+              >`
+                SELECT SUM(${LINE_REVENUE}) AS revenue,
+                       SUM(${LINE_COST})    AS cost
+                FROM "SaleItem" si
+                JOIN "Sale"    s ON s.id = si."saleId"
+                JOIN "Product" p ON p.id = si."productId"
+                WHERE ${prevFilter} AND ${SOLD_QTY} > 0
+              `,
             ]);
-            const prevCost = prevItems.reduce(
-              (s, it) =>
-                s +
-                (Number(it.quantity) - Number(it.returnedQty)) *
-                  (Number(it.unitCost) || Number(it.product.costPrice)),
-              0,
-            );
-            const prevRevenue = prevItems.reduce(
-              (s, it) => s + (Number(it.quantity) - Number(it.returnedQty)) * Number(it.unitPrice),
-              0,
-            );
+            const prevRevenue = num(prevLines[0]?.revenue);
+            const prevCost = num(prevLines[0]?.cost);
             return {
               revenue: bookedRevenue(prevAgg),
               orders: prevAgg._count,
@@ -425,45 +674,36 @@ export class ReportsService {
         : Promise.resolve(null),
     ]);
 
-    // Sales by item (net of returns)
-    const map = new Map<
-      string,
-      { productId: string; name: string; quantitySold: number; revenue: number; cost: number; profit: number }
-    >();
-    for (const it of items) {
-      const soldQty = Number(it.quantity) - Number(it.returnedQty);
-      if (soldQty <= 0) continue;
-      const revenue = soldQty * Number(it.unitPrice);
-      // Prefer the cost snapshotted at sale time; fall back to current cost
-      // for sales recorded before cost-snapshotting existed.
-      const unitCost = Number(it.unitCost) || Number(it.product.costPrice);
-      const cost = soldQty * unitCost;
-      const cur =
-        map.get(it.productId) ??
-        {
-          productId: it.productId,
-          // The catalog's current name, not `it.name`, which is the snapshot
-          // taken at sale time -- otherwise a renamed product reads one way
-          // here and another on the dashboard, which groups by product.
-          name: it.product.name,
-          quantitySold: 0,
-          revenue: 0,
-          cost: 0,
-          profit: 0,
+    const stockCost = new Map(
+      stockCostRows.map((r) => [r.productId, num(r.value)]),
+    );
+
+    const byProduct = productRows
+      .map((r) => {
+        const revenue = round2(num(r.revenue));
+        const cost = round2(num(r.cost));
+        const profit = round2(revenue - cost);
+        // GMROI: gross profit per rupee tied up in the product. Margin says
+        // what is profitable; this says what earns its shelf space -- a
+        // 12%-margin item that sells daily beats a 40%-margin one that moves
+        // twice a month. Simplification: the divisor is *closing* inventory
+        // cost, not the average held over the range, because stock levels
+        // aren't historised. It is a fair proxy for a shop that reorders to a
+        // level, and overstates GMROI for anything run down to nothing during
+        // the period. Null, not Infinity, when nothing is left on the shelf:
+        // a return on no investment is not a number worth ranking on.
+        const inventoryCost = stockCost.get(r.productId) ?? 0;
+        return {
+          productId: r.productId,
+          name: r.name,
+          quantitySold: num(r.quantitySold),
+          revenue,
+          cost,
+          profit,
+          inventoryCost: round2(inventoryCost),
+          gmroi: inventoryCost > 0 ? round2(profit / inventoryCost) : null,
         };
-      cur.quantitySold += soldQty;
-      cur.revenue += revenue;
-      cur.cost += cost;
-      cur.profit += revenue - cost;
-      map.set(it.productId, cur);
-    }
-    const byProduct = [...map.values()]
-      .map((p) => ({
-        ...p,
-        revenue: round2(p.revenue),
-        cost: round2(p.cost),
-        profit: round2(p.profit),
-      }))
+      })
       .sort((a, b) => b.profit - a.profit);
 
     const netRevenue = round2(byProduct.reduce((s, p) => s + p.revenue, 0));
@@ -471,55 +711,34 @@ export class ReportsService {
     const profit = round2(netRevenue - cost);
 
     // By day: revenue + order count (from sales) and units (from items)
-    const byDayMap: Record<string, { total: number; count: number; units: number }> = {};
-    for (const s of sales) {
-      const day = s.createdAt.toISOString().slice(0, 10);
-      byDayMap[day] ??= { total: 0, count: 0, units: 0 };
-      byDayMap[day].total = round2(
-        byDayMap[day].total + Number(s.total) - Number(s.refundedTotal),
-      );
-      byDayMap[day].count += 1;
-    }
-    for (const it of items) {
-      const day = it.sale.createdAt.toISOString().slice(0, 10);
-      const bucket = byDayMap[day];
-      if (bucket) bucket.units += Number(it.quantity) - Number(it.returnedQty);
-    }
+    const dayUnits = new Map(dayUnitRows.map((r) => [r.date, num(r.units)]));
+    const byDay = dayRows.map((r) => ({
+      date: r.date,
+      total: round2(num(r.total)),
+      count: Number(r.count),
+      units: dayUnits.get(r.date) ?? 0,
+    }));
 
-    // Sales by category (net of returns), attributed to the first category
-    const catMap = new Map<string, { category: string; revenue: number; units: number }>();
-    for (const it of items) {
-      const soldQty = Number(it.quantity) - Number(it.returnedQty);
-      if (soldQty <= 0) continue;
-      const category = it.product.categories[0]?.name ?? 'Uncategorized';
-      const cur = catMap.get(category) ?? { category, revenue: 0, units: 0 };
-      cur.revenue += soldQty * Number(it.unitPrice);
-      cur.units += soldQty;
-      catMap.set(category, cur);
-    }
-    const catTotal = [...catMap.values()].reduce((s, c) => s + c.revenue, 0) || 1;
-    const byCategory = [...catMap.entries()]
-      .map(([category, v]) => ({
-        category,
-        revenue: round2(v.revenue),
-        units: v.units,
-        share: round2((v.revenue / catTotal) * 100),
+    const catTotal =
+      categoryRows.reduce((s, c) => s + num(c.revenue), 0) || 1;
+    const byCategory = categoryRows
+      .map((c) => ({
+        category: c.category,
+        revenue: round2(num(c.revenue)),
+        units: num(c.units),
+        share: round2((num(c.revenue) / catTotal) * 100),
       }))
       .sort((a, b) => b.revenue - a.revenue);
 
-    // Hour-of-day buckets across the whole range
-    const hours = Array.from({ length: 24 }, (_, hour) => ({ hour, total: 0, count: 0, units: 0 }));
-    for (const s of sales) {
-      const h = s.createdAt.getHours();
-      hours[h].total = round2(
-        hours[h].total + Number(s.total) - Number(s.refundedTotal),
-      );
-      hours[h].count += 1;
-    }
-    for (const it of items) {
-      const h = it.sale.createdAt.getHours();
-      hours[h].units += Number(it.quantity) - Number(it.returnedQty);
-    }
+    // Hour-of-day buckets across the whole range, zero-filled to 24.
+    const hourUnits = new Map(hourUnitRows.map((r) => [r.hour, num(r.units)]));
+    const hourTotals = new Map(hourRows.map((r) => [r.hour, r]));
+    const hours = Array.from({ length: 24 }, (_, hour) => ({
+      hour,
+      total: round2(num(hourTotals.get(hour)?.total)),
+      count: Number(hourTotals.get(hour)?.count ?? 0),
+      units: hourUnits.get(hour) ?? 0,
+    }));
 
     // Payment methods with % share
     const payTotal = byPaymentRaw.reduce((s, p) => s + bookedRevenue(p), 0) || 1;
@@ -532,10 +751,52 @@ export class ReportsService {
       }))
       .sort((a, b) => b.total - a.total);
 
+    // Per cashier: what they sold, and how straight their drawer came out.
+    // The two halves are joined on the user rather than queried together
+    // because a cashier can sell without ever closing a shift, and an owner
+    // can close one having rung up nothing.
+    const variance = new Map(shiftRows.map((r) => [r.userId, r]));
+    const staffIds = new Set<string>([
+      ...staffSaleRows.map((r) => r.userId).filter((id): id is string => !!id),
+      ...shiftRows.map((r) => r.userId),
+    ]);
+    const salesByUser = new Map(staffSaleRows.map((r) => [r.userId, r]));
+    const byStaff = [...staffIds]
+      .map((userId) => {
+        const sold = salesByUser.get(userId);
+        const v = variance.get(userId);
+        const revenue = round2(num(sold?.revenue));
+        const transactions = Number(sold?.transactions ?? 0);
+        return {
+          userId,
+          name: sold?.name ?? v?.name ?? 'Unknown user',
+          revenue,
+          transactions,
+          averageBasket: transactions > 0 ? round2(revenue / transactions) : 0,
+          shifts: Number(v?.shifts ?? 0),
+          // Negative is short in the drawer, which is the direction that
+          // matters; `worstVariance` is the single worst count, not the net,
+          // because a short day cancelled out by a long one is still two
+          // days that didn't reconcile.
+          totalVariance: v ? round2(num(v.totalVariance)) : null,
+          meanVariance: v ? round2(num(v.meanVariance)) : null,
+          worstVariance: v ? round2(num(v.worstVariance)) : null,
+        };
+      })
+      .sort((a, b) => b.revenue - a.revenue);
+
+    // Sales with no cashier on them (recorded before staff attribution, or by
+    // a deleted user) are reported separately so `byStaff` can be read as
+    // "per cashier" while the two together still reconcile: every
+    // `byStaff.revenue` plus `unattributed.revenue` equals
+    // `totals.grossSales`, both being SUM(total - refundedTotal). They do not
+    // sum to `totals.netRevenue`, which is a line-level figure net of tax.
+    const unattributedSales = staffSaleRows.find((r) => r.userId === null);
+
     // Inventory performance (across the selected period)
     const [inventoryValue, movements, needs] = await Promise.all([
       this.inventoryValue(businessId, opts.storeId),
-      this.stockMovementDaily(businessId, opts.storeId, from, to),
+      this.stockMovementDaily(businessId, opts.storeId, tz, from, to),
       this.needsAttention(businessId, opts.storeId),
     ]);
     const totalUnits = byProduct.reduce((s, p) => s + p.quantitySold, 0);
@@ -547,6 +808,7 @@ export class ReportsService {
         : 0;
 
     return {
+      timezone: tz,
       totals: {
         transactions: agg._count,
         grossSales: bookedRevenue(agg),
@@ -565,9 +827,16 @@ export class ReportsService {
           }
         : null,
       byProduct,
-      byDay: Object.entries(byDayMap).map(([date, v]) => ({ date, ...v })),
+      byDay,
       byCategory,
       byPaymentMethod,
+      byStaff,
+      unattributed: unattributedSales
+        ? {
+            revenue: round2(num(unattributedSales.revenue)),
+            transactions: Number(unattributedSales.transactions),
+          }
+        : null,
       hourly: hours,
       inventory: {
         value: inventoryValue,
@@ -584,6 +853,7 @@ export class ReportsService {
       },
     };
   }
+
 
   /**
    * VAT / tax report for a period: tax collected on sales, the taxable base,
@@ -767,74 +1037,70 @@ export class ReportsService {
       .slice(0, take);
   }
 
-  /** Daily sales totals for the last `days` days (continuous, zero-filled). */
+  /**
+   * Daily sales totals for the last `days` local days (continuous,
+   * zero-filled). The window starts at local midnight `days - 1` days back,
+   * so "last 14 days" means fourteen of the shop's own trading days.
+   */
   private async salesTrend(
     businessId: string,
     storeId: string | undefined,
     days: number,
+    tz: string,
   ) {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    start.setDate(start.getDate() - (days - 1));
+    const today = dayKey(tz, new Date());
+    const firstDay = addDays(today, -(days - 1));
+    const start = startOfDayKey(tz, firstDay);
 
-    const sales = await this.prisma.sale.findMany({
-      where: {
-        businessId,
-        ...(storeId ? { storeId } : {}),
-        status: BOOKED,
-        createdAt: { gte: start },
-      },
-      select: { total: true, refundedTotal: true, createdAt: true },
-    });
+    const rows = await this.prisma.$queryRaw<
+      { date: DayKey; total: Prisma.Decimal | null; count: bigint }[]
+    >`
+      SELECT ${localDay(Prisma.sql`s."createdAt"`, tz)} AS date,
+             SUM(s.total - s."refundedTotal") AS total,
+             COUNT(*)                         AS count
+      FROM "Sale" s
+      WHERE ${this.saleFilterSql(businessId, { storeId })}
+        AND s."createdAt" >= ${start}
+      GROUP BY 1
+    `;
 
-    const byDay = new Map<string, { total: number; count: number }>();
-    for (let i = 0; i < days; i++) {
-      const d = new Date(start);
-      d.setDate(start.getDate() + i);
-      byDay.set(d.toISOString().slice(0, 10), { total: 0, count: 0 });
-    }
-    for (const s of sales) {
-      const key = s.createdAt.toISOString().slice(0, 10);
-      const bucket = byDay.get(key);
-      if (bucket) {
-        bucket.total = round2(
-          bucket.total + Number(s.total) - Number(s.refundedTotal),
-        );
-        bucket.count += 1;
-      }
-    }
-    return [...byDay.entries()].map(([date, v]) => ({ date, ...v }));
+    const byDay = new Map(
+      rows.map((r) => [
+        r.date,
+        { total: round2(num(r.total)), count: Number(r.count) },
+      ]),
+    );
+    return dayKeysBetween(firstDay, today).map((date) => ({
+      date,
+      ...(byDay.get(date) ?? { total: 0, count: 0 }),
+    }));
   }
 
-  /** Today's sales totals bucketed by hour (0–23, zero-filled). */
+  /** Today's sales totals bucketed by local hour (0–23, zero-filled). */
   private async hourlyToday(
     businessId: string,
     storeId: string | undefined,
     startOfToday: Date,
+    tz: string,
   ) {
-    const sales = await this.prisma.sale.findMany({
-      where: {
-        businessId,
-        ...(storeId ? { storeId } : {}),
-        status: BOOKED,
-        createdAt: { gte: startOfToday },
-      },
-      select: { total: true, refundedTotal: true, createdAt: true },
-    });
+    const rows = await this.prisma.$queryRaw<
+      { hour: number; total: Prisma.Decimal | null; count: bigint }[]
+    >`
+      SELECT ${localHour(Prisma.sql`s."createdAt"`, tz)} AS hour,
+             SUM(s.total - s."refundedTotal") AS total,
+             COUNT(*)                         AS count
+      FROM "Sale" s
+      WHERE ${this.saleFilterSql(businessId, { storeId })}
+        AND s."createdAt" >= ${startOfToday}
+      GROUP BY 1
+    `;
 
-    const hours = Array.from({ length: 24 }, (_, hour) => ({
+    const byHour = new Map(rows.map((r) => [r.hour, r]));
+    return Array.from({ length: 24 }, (_, hour) => ({
       hour,
-      total: 0,
-      count: 0,
+      total: round2(num(byHour.get(hour)?.total)),
+      count: Number(byHour.get(hour)?.count ?? 0),
     }));
-    for (const s of sales) {
-      const h = s.createdAt.getHours();
-      hours[h].total = round2(
-        hours[h].total + Number(s.total) - Number(s.refundedTotal),
-      );
-      hours[h].count += 1;
-    }
-    return hours;
   }
 
   /**
@@ -844,51 +1110,56 @@ export class ReportsService {
   private async stockMovementDaily(
     businessId: string,
     storeId: string | undefined,
+    tz: string,
     from?: string,
     to?: string,
   ) {
-    const movements = await this.prisma.stockMovement.findMany({
-      where: {
-        businessId,
-        ...(storeId ? { storeId } : {}),
-        ...(from || to
-          ? {
-              createdAt: {
-                ...(from ? { gte: new Date(from) } : {}),
-                ...(to ? { lte: new Date(to) } : {}),
-              },
-            }
-          : {}),
-      },
-      select: { type: true, quantity: true, createdAt: true },
-      orderBy: { createdAt: 'asc' },
-    });
+    const day = localDay(Prisma.sql`m."createdAt"`, tz);
+    const rows = await this.prisma.$queryRaw<
+      {
+        date: DayKey;
+        purchases: Prisma.Decimal | null;
+        sales: Prisma.Decimal | null;
+        adjustments: Prisma.Decimal | null;
+        net: Prisma.Decimal | null;
+      }[]
+    >`
+      SELECT ${day} AS date,
+             SUM(m.quantity) FILTER (WHERE m.type = ${StockMovementType.PURCHASE}::"StockMovementType")  AS purchases,
+             SUM(-m.quantity) FILTER (WHERE m.type = ${StockMovementType.SALE}::"StockMovementType")     AS sales,
+             SUM(m.quantity) FILTER (
+               WHERE m.type NOT IN (
+                 ${StockMovementType.PURCHASE}::"StockMovementType",
+                 ${StockMovementType.SALE}::"StockMovementType"
+               )
+             ) AS adjustments,
+             SUM(m.quantity) AS net
+      FROM "StockMovement" m
+      WHERE m."businessId" = ${businessId}
+        ${storeId ? Prisma.sql`AND m."storeId" = ${storeId}` : Prisma.empty}
+        ${from ? Prisma.sql`AND m."createdAt" >= ${new Date(from)}` : Prisma.empty}
+        ${to ? Prisma.sql`AND m."createdAt" <= ${new Date(to)}` : Prisma.empty}
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `;
 
-    const byDay = new Map<
-      string,
-      { date: string; purchases: number; sales: number; adjustments: number }
-    >();
+    // The closing index is a running total across the window, so it stays in
+    // JS -- a window function could do it, but the rows are one per day and
+    // the arithmetic is clearer here. It counts from zero at the start of the
+    // range rather than from the stock on hand then, which is what made it an
+    // index of movement rather than a stock level; unchanged, but worth
+    // saying out loud now the rest of this is exact.
     let closing = 0;
-    const closingMap = new Map<string, number>();
-    for (const m of movements) {
-      const day = m.createdAt.toISOString().slice(0, 10);
-      const bucket = byDay.get(day) ?? { date: day, purchases: 0, sales: 0, adjustments: 0 };
-      const qty = Number(m.quantity);
-      if (m.type === StockMovementType.PURCHASE) bucket.purchases += qty;
-      else if (m.type === StockMovementType.SALE) bucket.sales += -qty;
-      else bucket.adjustments += qty;
-      closing += qty;
-      byDay.set(day, bucket);
-      closingMap.set(day, closing);
-    }
-
-    return [...byDay.entries()].map(([date, v]) => ({
-      ...v,
-      purchases: round2(v.purchases),
-      sales: round2(v.sales),
-      adjustments: round2(v.adjustments),
-      closing: round2(closingMap.get(date) ?? 0),
-    }));
+    return rows.map((r) => {
+      closing += num(r.net);
+      return {
+        date: r.date,
+        purchases: round2(num(r.purchases)),
+        sales: round2(num(r.sales)),
+        adjustments: round2(num(r.adjustments)),
+        closing: round2(closing),
+      };
+    });
   }
 
   /**

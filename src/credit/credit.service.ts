@@ -105,9 +105,24 @@ export class CreditService {
         businessId,
         status: { not: PurchaseStatus.CANCELLED },
         ...(storeId ? { storeId } : {}),
+        // Only what is still owed. This used to load every non-cancelled
+        // purchase the business had ever recorded and drop the settled ones
+        // in JS -- and the settled ones are almost all of them, growing with
+        // every invoice ever paid. `total` and `amountPaid` are Decimal(12,2),
+        // so the comparison is exact and needs no epsilon.
+        total: { gt: this.prisma.purchase.fields.amountPaid },
       },
       orderBy: { createdAt: 'desc' },
-      include: { supplier: { select: { id: true, name: true } } },
+      select: {
+        id: true,
+        reference: true,
+        total: true,
+        amountPaid: true,
+        status: true,
+        createdAt: true,
+        supplierId: true,
+        supplier: { select: { id: true, name: true } },
+      },
     });
 
     const groups = new Map<
@@ -130,7 +145,10 @@ export class CreditService {
 
     for (const p of purchases) {
       const outstanding = round2(Number(p.total) - Number(p.amountPaid));
-      if (outstanding <= 0.001) continue;
+      // The `total > amountPaid` filter already dropped the settled invoices;
+      // this catches the one it can't -- a balance under half a paisa, which
+      // rounds to zero here and would otherwise show as an invoice owing 0.
+      if (outstanding <= 0) continue;
 
       const key = p.supplierId ?? '__none__';
       if (!groups.has(key)) {
