@@ -20,9 +20,21 @@ export class NotificationsService {
     private inventory: InventoryService,
   ) {}
 
-  /** List active (non-dismissed) notifications, newest first, plus the unread count. */
+  /**
+   * List active (non-dismissed) notifications, newest first, plus the unread
+   * count.
+   *
+   * This is a **pure read**. It used to call `sync()` first, which made the
+   * single most expensive endpoint in the system out of a bell that every
+   * signed-in browser polls once a minute: each poll ran a full low-stock
+   * scan, an expiring-batch scan, a `deleteMany` and one sequential `upsert`
+   * per alert -- a GET that wrote, multiplied by the number of staff online,
+   * against a connection pool capped at 15 clients.
+   *
+   * Reconciliation now runs on a timer instead (`AlertSyncCron`), so the cost
+   * is per business every 10 minutes rather than per user every minute.
+   */
   async list(businessId: string) {
-    await this.sync(businessId);
     const items = await this.prisma.notification.findMany({
       where: { businessId, dismissedAt: null },
       orderBy: { createdAt: 'desc' },
@@ -66,8 +78,11 @@ export class NotificationsService {
    *  - refresh the text of conditions that still hold (preserving read/dismissed),
    *  - delete rows whose condition has resolved.
    * GENERAL notifications are never touched here.
+   *
+   * Public because `AlertSyncCron` drives it now -- `list()` deliberately does
+   * not, see the note there.
    */
-  private async sync(businessId: string) {
+  async sync(businessId: string) {
     const [low, expiring] = await Promise.all([
       this.inventory.lowStock(businessId),
       this.inventory.expiringBatches(businessId, { days: EXPIRY_WINDOW_DAYS }),
@@ -111,22 +126,35 @@ export class NotificationsService {
       },
     });
 
-    // Upsert current alerts. `update` deliberately leaves readAt/dismissedAt alone.
-    for (const d of desired) {
-      await this.prisma.notification.upsert({
-        where: {
-          businessId_dedupeKey: { businessId, dedupeKey: d.dedupeKey },
-        },
-        create: {
-          businessId,
-          type: d.type,
-          title: d.title,
-          body: d.body,
-          link: d.link,
-          dedupeKey: d.dedupeKey,
-        },
-        update: { title: d.title, body: d.body, link: d.link, type: d.type },
-      });
+    // Upsert current alerts. `update` deliberately leaves readAt/dismissedAt
+    // alone.
+    //
+    // Batched into one `$transaction` rather than awaited one at a time: this
+    // was a sequential round trip per alert, so a business sitting on 40
+    // low-stock rows paid 40 round trips to Supabase Seoul every sync. The
+    // array form pipelines them over a single connection. `upsert` is kept
+    // over createMany/updateMany because the create and update halves write
+    // different column sets, and the unique `businessId_dedupeKey` is what
+    // makes it race-safe against a concurrent sweep.
+    if (desired.length) {
+      await this.prisma.$transaction(
+        desired.map((d) =>
+          this.prisma.notification.upsert({
+            where: {
+              businessId_dedupeKey: { businessId, dedupeKey: d.dedupeKey },
+            },
+            create: {
+              businessId,
+              type: d.type,
+              title: d.title,
+              body: d.body,
+              link: d.link,
+              dedupeKey: d.dedupeKey,
+            },
+            update: { title: d.title, body: d.body, link: d.link, type: d.type },
+          }),
+        ),
+      );
     }
   }
 
