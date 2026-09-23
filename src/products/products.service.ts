@@ -115,17 +115,55 @@ export class ProductsService {
         : {}),
     };
 
+    const page = { where, skip: q.skip, take: q.limit, orderBy: { name: 'asc' as const } };
+
+    // Unscoped: no store, so there is no single on-hand figure to report.
+    if (!q.storeId) {
+      const [data, total] = await Promise.all([
+        this.prisma.product.findMany({ ...page, include: this.detailInclude }),
+        this.prisma.product.count({ where }),
+      ]);
+      return paginate(data, total, q.page, q.limit);
+    }
+
+    // Scoped to a store: carry that store's stock on the row.
+    //
+    // The POS used to mirror the store's entire StockItem table into the
+    // browser to get these two numbers -- 100 rows per request, `ceil(N/100)`
+    // requests in parallel, re-fired after every sale, adjustment, receive,
+    // transfer and stock take. With the throttler at 120 requests/minute per
+    // IP and every till in a shop behind one NAT address, a 5,000-SKU store
+    // throttled itself out at roughly two sales a minute.
+    //
+    // The join costs nothing extra: `where` above already filters on
+    // `stockItems: { some: { storeId } }`, so the row is being visited anyway.
+    // `@@unique([storeId, productId])` means at most one row comes back.
     const [data, total] = await Promise.all([
       this.prisma.product.findMany({
-        where,
-        skip: q.skip,
-        take: q.limit,
-        orderBy: { name: 'asc' },
-        include: this.detailInclude,
+        ...page,
+        include: {
+          ...this.detailInclude,
+          stockItems: {
+            where: { storeId: q.storeId },
+            select: { quantity: true, reorderLevel: true },
+          },
+        },
       }),
       this.prisma.product.count({ where }),
     ]);
-    return paginate(data, total, q.page, q.limit);
+
+    const rows = data.map(({ stockItems, ...product }) => {
+      const here = stockItems[0];
+      return {
+        ...product,
+        onHandQty: here?.quantity ?? new Prisma.Decimal(0),
+        // Per-store override when set, otherwise the product default -- the
+        // same rule as InventoryService.lowStock()'s
+        // COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel").
+        effectiveReorderLevel: here?.reorderLevel || product.reorderLevel,
+      };
+    });
+    return paginate(rows, total, q.page, q.limit);
   }
 
   /**
@@ -485,6 +523,19 @@ export class ProductsService {
   /**
    * Upsert products from imported rows, keyed by SKU within the business.
    * Rows without an SKU are always created. Returns a per-row summary.
+   *
+   * Planned, then written in chunks. The original walked the rows one at a
+   * time -- a `findFirst` plus a `create`/`update` plus a `seedStockRows` per
+   * row, each awaited -- so the advertised 5,000-row import was 15,000+
+   * sequential round trips to Supabase. It could not finish inside any
+   * sensible proxy timeout, and because nothing was transactional a timeout
+   * left a half-imported catalog with nothing to roll back to.
+   *
+   * Three passes now:
+   *   1. parse and validate every row in memory, resolving all existing SKUs
+   *      in a single query;
+   *   2. write the plan in chunks, each chunk one pipelined transaction;
+   *   3. seed stock rows for everything created, as one `createMany`.
    */
   async bulkImport(businessId: string, items: Record<string, unknown>[]) {
     if (items.length > 5000) {
@@ -505,16 +556,35 @@ export class ProductsService {
       return '';
     };
 
-    let created = 0;
-    let updated = 0;
     const errors: { row: number; error: string }[] = [];
 
+    // ---- Pass 1: parse ----------------------------------------------------
+    type Parsed = {
+      row: number;
+      sku: string | null;
+      data: {
+        name: string;
+        barcode: string | null;
+        brand: string | null;
+        unit: string;
+        costPrice: number;
+        sellingPrice: number;
+        taxRate: number;
+        reorderLevel: number;
+      };
+    };
+    const parsed: Parsed[] = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
-      try {
-        const name = str(it.name);
-        if (!name) throw new Error('Name is required');
-        const data = {
+      const name = str(it.name);
+      if (!name) {
+        errors.push({ row: i + 1, error: 'Name is required' });
+        continue;
+      }
+      parsed.push({
+        row: i + 1,
+        sku: str(it.sku) || null,
+        data: {
           name,
           barcode: str(it.barcode) || null,
           brand: str(it.brand) || null,
@@ -523,27 +593,134 @@ export class ProductsService {
           sellingPrice: num(it.sellingPrice),
           taxRate: num(it.taxRate),
           reorderLevel: Math.round(num(it.reorderLevel)),
-        };
-        const sku = str(it.sku) || null;
-        const existing = sku
-          ? await this.prisma.product.findFirst({ where: { businessId, sku } })
-          : null;
-        if (existing) {
-          await this.prisma.product.update({ where: { id: existing.id }, data });
-          updated++;
-        } else {
-          const product = await this.prisma.product.create({
-            data: { businessId, sku, ...data },
+        },
+      });
+    }
+
+    // Every existing SKU in one query instead of a findFirst per row.
+    const skus = [...new Set(parsed.map((r) => r.sku).filter((v): v is string => !!v))];
+    const existing = skus.length
+      ? await this.prisma.product.findMany({
+          where: { businessId, sku: { in: skus } },
+          select: { id: true, sku: true },
+        })
+      : [];
+    const idBySku = new Map(existing.map((p) => [p.sku as string, p.id]));
+
+    // ---- Pass 2: plan -----------------------------------------------------
+    // A SKU repeated inside one file collapses to its last row, which is what
+    // the row-at-a-time version ended up with: each later occurrence found the
+    // product the earlier one had just written and overwrote it. The counts
+    // are reported the same way too -- one create plus an update per repeat
+    // for a new SKU, an update per row for one that already existed.
+    type Op = { row: number; repeats: number; data: Parsed['data'] } & (
+      | { kind: 'create'; sku: string | null }
+      | { kind: 'update'; id: string }
+    );
+
+    const ops: Op[] = [];
+    const seen = new Map<string, number>();
+    for (const r of parsed) {
+      if (!r.sku) {
+        // No SKU is no identity: always a new product, never deduped.
+        ops.push({ kind: 'create', row: r.row, repeats: 0, sku: null, data: r.data });
+        continue;
+      }
+      const at = seen.get(r.sku);
+      if (at !== undefined) {
+        // Last row wins, and the repeat is counted -- but only once the write
+        // succeeds, so a chunk that fails doesn't inflate the summary.
+        ops[at] = { ...ops[at], row: r.row, repeats: ops[at].repeats + 1, data: r.data };
+        continue;
+      }
+      seen.set(r.sku, ops.length);
+      const id = idBySku.get(r.sku);
+      ops.push(
+        id
+          ? { kind: 'update', row: r.row, repeats: 0, id, data: r.data }
+          : { kind: 'create', row: r.row, repeats: 0, sku: r.sku, data: r.data },
+      );
+    }
+
+    // ---- Pass 3: write ----------------------------------------------------
+    // 200 rows per transaction. Small enough that a chunk's locks are held
+    // briefly and a failure costs one chunk rather than the import; large
+    // enough that 5,000 rows is ~25 batches rather than 5,000 round trips.
+    const CHUNK = 200;
+    let created = 0;
+    let updated = 0;
+    const newProductIds: string[] = [];
+
+    const tally = (op: Op, id: string) => {
+      if (op.kind === 'create') {
+        created++;
+        newProductIds.push(id);
+      } else {
+        updated++;
+      }
+      // Each collapsed repeat of this SKU was an update in the old row-at-a-
+      // time version, so it still reads as one.
+      updated += op.repeats;
+    };
+
+    const runOp = (op: Op) =>
+      op.kind === 'create'
+        ? this.prisma.product.create({
+            data: { businessId, sku: op.sku, ...op.data },
+            select: { id: true },
+          })
+        : this.prisma.product.update({
+            where: { id: op.id },
+            data: op.data,
+            select: { id: true },
           });
-          // A CSV row names no store, so an imported product is stocked
-          // everywhere; narrow it afterwards from the product's store list.
-          await this.seedStockRows(businessId, product.id);
-          created++;
+
+    for (let start = 0; start < ops.length; start += CHUNK) {
+      const slice = ops.slice(start, start + CHUNK);
+      try {
+        // Array form, not an interactive callback: Prisma pipelines the whole
+        // batch over one connection instead of awaiting each statement, and
+        // `create` still hands back the ids the stock seeding needs.
+        const written = await this.prisma.$transaction(slice.map(runOp));
+        for (let i = 0; i < slice.length; i++) tally(slice[i], written[i].id);
+      } catch {
+        // The batch is all-or-nothing, so one bad row (a duplicate barcode,
+        // say) would take its whole chunk down and leave the operator with no
+        // idea which row was at fault. Replay the chunk row by row: slower,
+        // but only for a chunk that actually failed, and every surviving row
+        // still lands with the offender named.
+        for (const op of slice) {
+          try {
+            tally(op, (await runOp(op)).id);
+          } catch (e) {
+            errors.push({ row: op.row, error: this.handleUnique(e).message });
+          }
         }
-      } catch (e) {
-        errors.push({ row: i + 1, error: (e as Error).message });
       }
     }
+
+    // One createMany for (new products x stores) rather than a query pair per
+    // product. A CSV row names no store, so an imported product is stocked
+    // everywhere; narrow it afterwards from the product's store list.
+    if (newProductIds.length) {
+      const stores = await this.prisma.store.findMany({
+        where: { businessId },
+        select: { id: true },
+      });
+      if (stores.length) {
+        const rows = newProductIds.flatMap((productId) =>
+          stores.map((s) => ({ businessId, storeId: s.id, productId, quantity: 0 })),
+        );
+        for (let start = 0; start < rows.length; start += 1000) {
+          await this.prisma.stockItem.createMany({
+            data: rows.slice(start, start + 1000),
+            skipDuplicates: true,
+          });
+        }
+      }
+    }
+
+    errors.sort((a, b) => a.row - b.row);
     return { created, updated, errors };
   }
 
