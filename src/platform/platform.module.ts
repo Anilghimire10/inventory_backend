@@ -3,6 +3,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthModule } from '../auth/auth.module';
+import { platformJwtSecret } from '../common/env.validation';
 import { PlatformAuthController } from './platform-auth.controller';
 import { PlatformAuthService } from './platform-auth.service';
 import { PlatformController } from './platform.controller';
@@ -24,8 +25,8 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        // Validated at boot by validateEnv() — never falls back to a literal.
-        secret: config.getOrThrow<string>('JWT_SECRET'),
+        // Its own key, not JWT_SECRET, so shop tokens can't verify here.
+        secret: platformJwtSecret((k) => config.get<string>(k)),
         // Shorter than a shop user's session: an admin token opens every business.
         signOptions: { expiresIn: config.get<string>('PLATFORM_JWT_EXPIRES_IN') ?? '12h' },
       }),

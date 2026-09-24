@@ -9,7 +9,31 @@
  * can read this repo.
  */
 
+import { createHmac } from 'crypto';
+
 const MIN_SECRET_LENGTH = 32;
+
+/**
+ * The key platform (super-admin) tokens are signed and verified with.
+ *
+ * Kept apart from JWT_SECRET so the two kinds of token can never verify under
+ * each other's strategy -- today only the `scope: 'platform'` claim check and
+ * the id living in a different table stand between them, and a key that
+ * differs makes that a cryptographic property rather than a code-path one.
+ *
+ * PLATFORM_JWT_SECRET is used when set. Otherwise the key is derived from
+ * JWT_SECRET with HMAC, which already separates the two without a new env var
+ * to forget on deploy; set PLATFORM_JWT_SECRET to also keep admin tokens safe
+ * if JWT_SECRET alone ever leaks. Either way, changing it signs every platform
+ * admin out once.
+ */
+export function platformJwtSecret(get: (key: string) => string | undefined) {
+  const explicit = get('PLATFORM_JWT_SECRET')?.trim();
+  if (explicit) return explicit;
+  const base = get('JWT_SECRET')?.trim();
+  if (!base) throw new Error('JWT_SECRET is required');
+  return createHmac('sha256', base).update('platform-jwt').digest('hex');
+}
 
 /** Secrets that ship in the repo/docs and must never reach production. */
 const KNOWN_PLACEHOLDERS = [
@@ -46,6 +70,27 @@ export function validateEnv(config: Record<string, unknown>) {
       `JWT_SECRET must be at least ${MIN_SECRET_LENGTH} characters (got ${secret.length}). ` +
         'Generate one with: openssl rand -base64 48',
     );
+  }
+
+  // Optional (see platformJwtSecret), but held to the same bar when given,
+  // and it must actually differ from JWT_SECRET or it separates nothing.
+  const platformSecret = get('PLATFORM_JWT_SECRET');
+  if (platformSecret) {
+    if (KNOWN_PLACEHOLDERS.includes(platformSecret.toLowerCase())) {
+      errors.push(
+        'PLATFORM_JWT_SECRET is set to a placeholder value. ' +
+          'Generate a real one with: openssl rand -base64 48',
+      );
+    } else if (platformSecret.length < MIN_SECRET_LENGTH) {
+      errors.push(
+        `PLATFORM_JWT_SECRET must be at least ${MIN_SECRET_LENGTH} characters (got ${platformSecret.length}).`,
+      );
+    } else if (platformSecret === secret) {
+      errors.push(
+        'PLATFORM_JWT_SECRET must differ from JWT_SECRET — the point of it is ' +
+          'that the two kinds of token cannot verify under each other.',
+      );
+    }
   }
 
   // In dev, CORS reflects whatever origin asks, which is what makes a

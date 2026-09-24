@@ -27,7 +27,11 @@ export class PlatformAuthController {
   @ApiBearerAuth()
   @Get('me')
   me(@CurrentAdmin() admin: PlatformPrincipal) {
-    return admin;
+    // Same shape as login's `admin`, so the panel's AdminInfo is the same
+    // whether it came from signing in or from a page reload. Returning the
+    // principal as-is sent `adminId`, and `admin.id` was undefined after
+    // every refresh.
+    return { id: admin.adminId, email: admin.email, name: admin.name };
   }
 
   /** Returns a new accessToken: tokens issued before the change stop working. */

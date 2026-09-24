@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../../prisma/prisma.service';
+import { platformJwtSecret } from '../../common/env.validation';
 
 export interface PlatformJwtPayload {
   sub: string; // platform admin id
@@ -32,8 +33,8 @@ export class PlatformJwtStrategy extends PassportStrategy(
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      // Validated at boot by validateEnv() — never falls back to a literal.
-      secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
+      // Must match PlatformModule's signing key; see platformJwtSecret().
+      secretOrKey: platformJwtSecret((k) => config.get<string>(k)),
     });
   }
 
