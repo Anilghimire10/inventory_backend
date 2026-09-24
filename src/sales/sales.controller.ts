@@ -9,7 +9,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { IsEmail, IsOptional } from 'class-validator';
+import { IsEmail, IsOptional, MaxLength } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { SalesService } from './sales.service';
 import { CreateSaleDto } from './dto/create-sale.dto';
@@ -25,6 +25,7 @@ export class EmailReceiptDto {
   @ApiPropertyOptional({ description: 'Override recipient; defaults to the customer email' })
   @IsOptional()
   @IsEmail()
+  @MaxLength(254)
   email?: string;
 }
 

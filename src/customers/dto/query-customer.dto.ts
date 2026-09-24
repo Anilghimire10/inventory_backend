@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsOptional, IsString } from 'class-validator';
+import { IsOptional, IsString, MaxLength } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
 export class QueryCustomerDto extends PaginationDto {
@@ -10,5 +10,6 @@ export class QueryCustomerDto extends PaginationDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 }

@@ -8,7 +8,7 @@ import {
   Post,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiProperty, ApiPropertyOptional, ApiTags, PartialType } from '@nestjs/swagger';
-import { IsBoolean, IsNumber, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsNumber, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { TaxesService } from './taxes.service';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -18,6 +18,7 @@ import { AuthUser } from '../common/types/auth-user';
 export class CreateTaxDto {
   @ApiProperty({ example: 'VAT' })
   @IsString()
+  @MaxLength(200)
   @MinLength(1)
   name: string;
 

@@ -28,19 +28,25 @@ import { PaginationDto } from '../../common/dto/pagination.dto';
 
 export class PlatformLoginDto {
   @IsEmail()
+  @MaxLength(254)
   email: string;
 
   @IsString()
+  // Checked against an existing hash, so only a DoS bound -- a password
+  // set before new ones were capped at 128 must still sign in.
+  @MaxLength(1024)
   password: string;
 }
 
 export class ChangePasswordDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(1024)
   currentPassword: string;
 
   @ApiProperty({ minLength: 8 })
   @IsString()
+  @MaxLength(128)
   @MinLength(8)
   newPassword: string;
 }
@@ -48,15 +54,18 @@ export class ChangePasswordDto {
 export class CreateAdminDto {
   @ApiProperty()
   @IsEmail()
+  @MaxLength(254)
   email: string;
 
   @ApiProperty()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   name: string;
 
   @ApiProperty({ minLength: 8 })
   @IsString()
+  @MaxLength(128)
   @MinLength(8)
   password: string;
 }
@@ -65,6 +74,7 @@ export class UpdateAdminDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   name?: string;
 
@@ -76,6 +86,7 @@ export class UpdateAdminDto {
   @ApiPropertyOptional({ minLength: 8, description: 'Set a new password for this admin' })
   @IsOptional()
   @IsString()
+  @MaxLength(128)
   @MinLength(8)
   password?: string;
 }
@@ -84,11 +95,13 @@ export class QueryAuditLogDto extends PaginationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   adminId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   businessId?: string;
 }
 
@@ -140,6 +153,7 @@ export class QueryBusinessesDto extends PaginationDto {
 export class CreateBusinessDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   businessName: string;
 
@@ -161,11 +175,13 @@ export class CreateBusinessDto {
 
   @ApiProperty()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   ownerName: string;
 
   @ApiProperty()
   @IsEmail()
+  @MaxLength(254)
   ownerEmail: string;
 
   @ApiPropertyOptional({
@@ -175,6 +191,7 @@ export class CreateBusinessDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(128)
   @MinLength(8)
   password?: string;
 
@@ -188,6 +205,7 @@ export class UpdateBusinessDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   name?: string;
 
@@ -210,6 +228,7 @@ export class UpdateBusinessDto {
   @ApiPropertyOptional({ description: 'PAN/VAT registration number' })
   @IsOptional()
   @IsString()
+  @MaxLength(50)
   taxId?: string;
 }
 
@@ -255,6 +274,7 @@ export class RecordPaymentDto {
   @ApiPropertyOptional({ description: 'Receipt number or bank reference' })
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   reference?: string;
 
   @ApiPropertyOptional({
@@ -283,6 +303,7 @@ export class RecordPaymentDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 }
 
@@ -292,12 +313,14 @@ export class UpdateTenantUserDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   name?: string;
 
   @ApiPropertyOptional({ description: 'Fix a mistyped email. The new address must be verified again.' })
   @IsOptional()
   @IsEmail()
+  @MaxLength(254)
   email?: string;
 
   @ApiPropertyOptional()

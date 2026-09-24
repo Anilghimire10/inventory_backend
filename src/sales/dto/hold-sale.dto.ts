@@ -6,6 +6,7 @@ import {
   IsOptional,
   IsNumber,
   IsString,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -16,11 +17,13 @@ export class HoldSaleDto {
   @ApiPropertyOptional({ description: "Defaults to the cashier's store" })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   customerId?: string;
 
   @ApiPropertyOptional({ description: 'Bill-level discount amount', default: 0 })
@@ -32,11 +35,13 @@ export class HoldSaleDto {
   @ApiPropertyOptional({ description: 'Pharmacy: prescription reference' })
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   prescriptionRef?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiProperty({ type: [SaleItemDto] })

@@ -7,12 +7,14 @@ import {
   IsOptional,
   IsPositive,
   IsString,
+  MaxLength,
   ValidateNested,
 } from 'class-validator';
 
 export class ReturnItemDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   saleItemId: string;
 
   @ApiProperty({ example: 1, description: 'Quantity to return' })
@@ -28,6 +30,7 @@ export class ReturnItemDto {
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   serials?: string[];
 }
 

@@ -8,7 +8,7 @@ import {
   Post,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
-import { IsOptional, IsString, MinLength } from 'class-validator';
+import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import { PartialType } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { CategoriesService } from './categories.service';
@@ -18,12 +18,14 @@ import { AuthUser } from '../common/types/auth-user';
 
 export class CreateCategoryDto {
   @IsString()
+  @MaxLength(200)
   @MinLength(1)
   name: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   parentId?: string;
 }
 

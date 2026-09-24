@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsArray, IsBoolean, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
 export class QueryProductDto extends PaginationDto {
@@ -10,11 +10,13 @@ export class QueryProductDto extends PaginationDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   categoryId?: string;
 
   @ApiPropertyOptional({ description: 'Only active products', default: true })
@@ -33,6 +35,7 @@ export class QueryProductDto extends PaginationDto {
   )
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(64, { each: true })
   ids?: string[];
 
   @ApiPropertyOptional({
@@ -40,6 +43,7 @@ export class QueryProductDto extends PaginationDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   parentId?: string;
 
   @ApiPropertyOptional({

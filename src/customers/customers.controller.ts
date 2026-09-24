@@ -37,22 +37,26 @@ import { QueryCustomerDto } from './dto/query-customer.dto';
 export class CreateCustomerDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(200)
   @MinLength(1)
   name: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(30)
   phone?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsEmail()
+  @MaxLength(254)
   email?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   address?: string;
 }
 

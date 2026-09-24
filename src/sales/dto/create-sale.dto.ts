@@ -9,6 +9,7 @@ import {
   IsPositive,
   IsOptional,
   IsString,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -16,6 +17,7 @@ import {
 export class SaleItemDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   productId: string;
 
   @ApiProperty({ example: 2, description: 'May be fractional for weighed goods' })
@@ -43,6 +45,7 @@ export class SaleItemDto {
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   serials?: string[];
 }
 
@@ -50,11 +53,13 @@ export class CreateSaleDto {
   @ApiPropertyOptional({ description: 'Defaults to the cashier\'s store' })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   customerId?: string;
 
   @ApiPropertyOptional({
@@ -65,6 +70,7 @@ export class CreateSaleDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   shiftId?: string;
 
   @ApiPropertyOptional({ enum: PaymentMethod, default: PaymentMethod.CASH })
@@ -87,11 +93,13 @@ export class CreateSaleDto {
   @ApiPropertyOptional({ description: 'Pharmacy: prescription reference' })
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   prescriptionRef?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiProperty({ type: [SaleItemDto] })

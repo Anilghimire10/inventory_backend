@@ -5,6 +5,7 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  MaxLength,
 } from 'class-validator';
 import { PaymentMethod } from '@prisma/client';
 import { PaginationDto } from '../../common/dto/pagination.dto';
@@ -13,11 +14,13 @@ export class QuerySaleDto extends PaginationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   customerId?: string;
 
   @ApiPropertyOptional({ example: '2026-06-01' })

@@ -8,6 +8,7 @@ import {
   IsOptional,
   IsPositive,
   IsString,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -15,6 +16,7 @@ import {
 export class TransferItemDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   productId: string;
 
   @ApiProperty({ example: 10, description: 'May be fractional for weighed goods' })
@@ -27,15 +29,18 @@ export class TransferItemDto {
 export class TransferStockDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   fromStoreId: string;
 
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   toStoreId: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiProperty({ type: [TransferItemDto] })
@@ -49,6 +54,7 @@ export class TransferStockDto {
 export class StockCountDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   productId: string;
 
   @ApiProperty({ example: 42, description: 'Physically counted quantity' })
@@ -61,6 +67,7 @@ export class StockCountDto {
 export class StockTakeDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   storeId: string;
 
   @ApiPropertyOptional({
@@ -74,6 +81,7 @@ export class StockTakeDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiProperty({ type: [StockCountDto] })

@@ -9,6 +9,7 @@ import {
   IsOptional,
   IsString,
   Length,
+  MaxLength,
   MinLength,
   Validate,
   ValidatorConstraint,
@@ -42,6 +43,7 @@ export class UpdateBusinessDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   name?: string;
 
@@ -73,6 +75,7 @@ export class UpdateBusinessDto {
   @ApiPropertyOptional({ description: "PAN/VAT registration number" })
   @IsOptional()
   @IsString()
+  @MaxLength(50)
   taxId?: string;
 
   @ApiPropertyOptional({

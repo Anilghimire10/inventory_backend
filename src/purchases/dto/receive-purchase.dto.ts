@@ -4,17 +4,20 @@ import {
   IsArray,
   IsOptional,
   IsString,
+  MaxLength,
   ValidateNested,
 } from 'class-validator';
 
 export class ReceiveSerialsDto {
   @ApiProperty({ description: 'Id of the purchase line these units belong to' })
   @IsString()
+  @MaxLength(64)
   purchaseItemId: string;
 
   @ApiProperty({ type: [String], description: 'One serial/IMEI per unit' })
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   serials: string[];
 }
 

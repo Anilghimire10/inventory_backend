@@ -6,6 +6,7 @@ import {
   IsOptional,
   IsString,
   Length,
+  MaxLength,
   MinLength,
 } from 'class-validator';
 
@@ -13,6 +14,7 @@ import {
 export class RegisterDto {
   @ApiProperty({ example: 'Green Grocer' })
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   businessName: string;
 
@@ -34,15 +36,18 @@ export class RegisterDto {
 
   @ApiProperty({ example: 'owner@example.com' })
   @IsEmail()
+  @MaxLength(254)
   email: string;
 
   @ApiProperty({ example: 'Jane Owner' })
   @IsString()
+  @MaxLength(200)
   @MinLength(2)
   name: string;
 
   @ApiProperty({ minLength: 8, example: 'sup3rsecret' })
   @IsString()
+  @MaxLength(128)
   @MinLength(8)
   password: string;
 }

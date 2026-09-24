@@ -9,6 +9,7 @@ import {
   IsPositive,
   IsOptional,
   IsString,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -16,6 +17,7 @@ import {
 export class PurchaseItemDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   productId: string;
 
   @ApiProperty({ example: 100, description: 'May be fractional for weighed goods' })
@@ -31,6 +33,7 @@ export class PurchaseItemDto {
   @ApiPropertyOptional({ description: 'Batch/lot number (expiry tracking)' })
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   batchNumber?: string;
 
   @ApiPropertyOptional({ example: '2026-12-31' })
@@ -46,27 +49,32 @@ export class PurchaseItemDto {
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   serials?: string[];
 }
 
 export class CreatePurchaseDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   storeId: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   supplierId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   reference?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiPropertyOptional({

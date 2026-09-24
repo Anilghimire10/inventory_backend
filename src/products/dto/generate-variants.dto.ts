@@ -8,6 +8,7 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  MaxLength,
   Min,
   MinLength,
   ValidateNested,
@@ -16,6 +17,7 @@ import {
 export class VariantOptionDto {
   @ApiProperty({ example: 'Colour' })
   @IsString()
+  @MaxLength(100)
   @MinLength(1)
   name: string;
 
@@ -24,6 +26,7 @@ export class VariantOptionDto {
   @ArrayMinSize(1)
   @ArrayUnique()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   values: string[];
 }
 

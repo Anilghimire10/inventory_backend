@@ -14,7 +14,7 @@ import {
   ApiTags,
   PartialType,
 } from '@nestjs/swagger';
-import { IsEmail, IsOptional, IsString, MinLength } from 'class-validator';
+import { IsEmail, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import { UserRole } from '@prisma/client';
 import { SuppliersService } from './suppliers.service';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -24,27 +24,32 @@ import { PaginationDto } from '../common/dto/pagination.dto';
 
 export class CreateSupplierDto {
   @IsString()
+  @MaxLength(200)
   @MinLength(1)
   name: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   contactName?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(30)
   phone?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsEmail()
+  @MaxLength(254)
   email?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   address?: string;
 }
 

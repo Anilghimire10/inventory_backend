@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsEnum, IsInt, IsOptional, IsString, Min } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 import { SerialStatus } from '@prisma/client';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
@@ -8,6 +8,7 @@ export class QueryStockDto extends PaginationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 }
 
@@ -15,11 +16,13 @@ export class QueryMovementsDto extends PaginationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   productId?: string;
 }
 
@@ -34,6 +37,7 @@ export class ExpiringDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 }
 
@@ -42,11 +46,13 @@ export class QuerySerialsDto extends PaginationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   productId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional({ enum: SerialStatus })

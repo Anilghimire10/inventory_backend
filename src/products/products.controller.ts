@@ -36,6 +36,7 @@ export class SetProductStoresDto {
   @ArrayNotEmpty()
   @ArrayUnique()
   @IsString({ each: true })
+  @MaxLength(64, { each: true })
   storeIds: string[];
 }
 

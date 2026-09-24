@@ -7,12 +7,14 @@ import {
   IsOptional,
   IsPositive,
   IsString,
+  MaxLength,
   ValidateNested,
 } from 'class-validator';
 
 export class ReturnPurchaseItemDto {
   @ApiProperty({ description: 'Id of the purchase line being returned' })
   @IsString()
+  @MaxLength(64)
   purchaseItemId: string;
 
   @ApiProperty({ example: 5, description: 'Quantity going back to the supplier' })
@@ -28,6 +30,7 @@ export class ReturnPurchaseItemDto {
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   serials?: string[];
 }
 
@@ -36,6 +39,7 @@ export class ReturnPurchaseDto {
   @ApiPropertyOptional({ description: 'Reason — damaged, wrong item, etc.' })
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 
   @ApiProperty({ type: [ReturnPurchaseItemDto] })

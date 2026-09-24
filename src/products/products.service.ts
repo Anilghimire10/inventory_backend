@@ -581,13 +581,34 @@ export class ProductsService {
         errors.push({ row: i + 1, error: 'Name is required' });
         continue;
       }
+      const sku = str(it.sku);
+      const barcode = str(it.barcode);
+      const brand = str(it.brand);
+      // Same caps as CreateProductDto. Rows never pass through the DTO, and
+      // this route keeps the large body limit, so without this a single cell
+      // could carry megabytes into the product table.
+      const tooLong = (
+        [
+          ['Name', name, 200],
+          ['SKU', sku, 100],
+          ['Barcode', barcode, 100],
+          ['Brand', brand, 200],
+        ] as const
+      ).find(([, value, max]) => value.length > max);
+      if (tooLong) {
+        errors.push({
+          row: i + 1,
+          error: `${tooLong[0]} is longer than ${tooLong[2]} characters`,
+        });
+        continue;
+      }
       parsed.push({
         row: i + 1,
-        sku: str(it.sku) || null,
+        sku: sku || null,
         data: {
           name,
-          barcode: str(it.barcode) || null,
-          brand: str(it.brand) || null,
+          barcode: barcode || null,
+          brand: brand || null,
           unit: normalizeUnit(it.unit) ?? 'pcs',
           costPrice: num(it.costPrice),
           sellingPrice: num(it.sellingPrice),

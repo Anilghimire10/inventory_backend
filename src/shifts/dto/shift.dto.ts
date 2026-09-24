@@ -4,6 +4,7 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  MaxLength,
   Min,
 } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
@@ -12,6 +13,7 @@ export class OpenShiftDto {
   @ApiPropertyOptional({ description: "Defaults to the cashier's store" })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiProperty({ description: 'Cash in the drawer at the start', example: 5000 })
@@ -22,6 +24,7 @@ export class OpenShiftDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 }
 
@@ -34,6 +37,7 @@ export class CloseShiftDto {
   @ApiPropertyOptional({ description: 'Explanation for a variance, etc.' })
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 }
 
@@ -41,11 +45,13 @@ export class QueryShiftDto extends PaginationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   userId?: string;
 
   @ApiPropertyOptional({ example: '2026-06-01' })

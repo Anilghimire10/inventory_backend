@@ -6,16 +6,19 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  MaxLength,
   NotEquals,
 } from 'class-validator';
 
 export class AdjustStockDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   storeId: string;
 
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   productId: string;
 
   @ApiProperty({
@@ -33,16 +36,19 @@ export class AdjustStockDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   note?: string;
 }
 
 export class SetReorderLevelDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   storeId: string;
 
   @ApiProperty()
   @IsString()
+  @MaxLength(64)
   productId: string;
 
   @ApiProperty({ example: 10 })

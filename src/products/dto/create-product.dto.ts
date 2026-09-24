@@ -10,6 +10,7 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  MaxLength,
   Min,
   MinLength,
 } from 'class-validator';
@@ -18,6 +19,7 @@ import { UNITS, normalizeUnit } from '../../common/units';
 export class CreateProductDto {
   @ApiProperty()
   @IsString()
+  @MaxLength(200)
   @MinLength(1)
   name: string;
 
@@ -30,26 +32,31 @@ export class CreateProductDto {
   @IsArray()
   @ArrayUnique()
   @IsString({ each: true })
+  @MaxLength(64, { each: true })
   storeIds?: string[];
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
   description?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   sku?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   barcode?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   brand?: string;
 
   @ApiPropertyOptional({
@@ -60,6 +67,7 @@ export class CreateProductDto {
   @IsArray()
   @ArrayUnique()
   @IsString({ each: true })
+  @MaxLength(64, { each: true })
   categoryIds?: string[];
 
   @ApiPropertyOptional({
@@ -67,6 +75,7 @@ export class CreateProductDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(2048)
   imageUrl?: string;
 
   @ApiPropertyOptional({ description: 'Product expiry date (ISO 8601)' })
@@ -105,6 +114,7 @@ export class CreateProductDto {
   @ApiPropertyOptional({ description: 'Id of an admin-defined tax (sets the rate)' })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   taxId?: string;
 
   @ApiPropertyOptional({
@@ -154,11 +164,13 @@ export class CreateProductDto {
   })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   parentId?: string;
 
   @ApiPropertyOptional({ description: 'Variant label, e.g. "Red / XL"' })
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   variantName?: string;
 
   @ApiPropertyOptional({
