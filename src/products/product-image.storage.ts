@@ -1,9 +1,14 @@
-import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { randomBytes } from 'crypto';
 import { existsSync, mkdirSync } from 'fs';
 import { writeFile } from 'fs/promises';
-import { extname, join } from 'path';
+import { join } from 'path';
 
 /** Where product images land when there is no object storage configured. */
 export const PRODUCT_UPLOAD_DIR = join(process.cwd(), 'uploads', 'products');
@@ -18,6 +23,36 @@ export interface UploadedImage {
   mimetype: string;
   buffer: Buffer;
   size: number;
+}
+
+/**
+ * What an upload actually is, read from its first bytes.
+ *
+ * The filename's extension and the multipart Content-Type are both whatever
+ * the client said, so neither decides what gets stored: an HTML page renamed
+ * `x.png` and sent as `text/html` would otherwise be saved to a public bucket
+ * and served back as a web page. The stored extension and Content-Type both
+ * come from here instead, and anything that isn't one of these four formats is
+ * refused. Returns null for everything else.
+ */
+export function sniffImage(buf: Buffer): { ext: string; mime: string } | null {
+  const at = (offset: number, bytes: number[]) =>
+    buf.length >= offset + bytes.length &&
+    bytes.every((b, i) => buf[offset + i] === b);
+  const ascii = (offset: number, text: string) =>
+    at(offset, [...text].map((c) => c.charCodeAt(0)));
+
+  if (at(0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return { ext: '.png', mime: 'image/png' };
+  }
+  if (at(0, [0xff, 0xd8, 0xff])) return { ext: '.jpg', mime: 'image/jpeg' };
+  if (ascii(0, 'GIF87a') || ascii(0, 'GIF89a')) {
+    return { ext: '.gif', mime: 'image/gif' };
+  }
+  if (ascii(0, 'RIFF') && ascii(8, 'WEBP')) {
+    return { ext: '.webp', mime: 'image/webp' };
+  }
+  return null;
 }
 
 /**
@@ -84,8 +119,13 @@ export class ProductImageStorage {
    * still serves the old prefix.
    */
   async save(file: UploadedImage): Promise<string> {
-    const ext = extname(file.originalname).toLowerCase();
-    const name = `${randomBytes(16).toString('hex')}${ext}`;
+    const type = sniffImage(file.buffer);
+    if (!type) {
+      throw new BadRequestException(
+        'The file is not a PNG, JPEG, WebP or GIF image',
+      );
+    }
+    const name = `${randomBytes(16).toString('hex')}${type.ext}`;
 
     if (!this.client) {
       this.warnOnceIfProduction();
@@ -95,7 +135,7 @@ export class ProductImageStorage {
     const { error } = await this.client.storage
       .from(this.bucket)
       .upload(name, file.buffer, {
-        contentType: file.mimetype,
+        contentType: type.mime,
         // Names are 16 random bytes, so a collision means something is wrong;
         // overwriting would hide it and could clobber another product's image.
         upsert: false,

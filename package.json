@@ -58,5 +58,13 @@
     "ts-node": "^10.9.2",
     "typescript": "^5.6.2",
     "typescript-eslint": "^8.70.0"
+  },
+  "overrides": {
+    "multer": "^2.4.0",
+    "body-parser": "^1.20.8",
+    "lodash": "^4.18.1",
+    "js-yaml": "^4.3.2",
+    "uuid": "^11.1.1",
+    "qs": "^6.16.0"
   }
 }

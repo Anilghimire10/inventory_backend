@@ -33,10 +33,16 @@ async function bootstrap() {
   // proxies of your own in front of this app.
   app.set("trust proxy", 1);
 
-  // Allow larger JSON bodies for bulk product imports (default is ~100kb).
-  const bodyLimit = config.get<string>("BODY_LIMIT") ?? "8mb";
-  app.use(json({ limit: bodyLimit }));
-  app.use(urlencoded({ extended: true, limit: bodyLimit }));
+  // Body size limits. Only the bulk product import needs a large body, so it
+  // alone gets BODY_LIMIT; everything else is capped at 1mb, which is far
+  // above any real form or sale and keeps a multi-megabyte body from being
+  // parsed on every other route. Registration order matters: the first parser
+  // to read a body marks it parsed, and later ones (including Nest's own
+  // default parser) skip it.
+  const importLimit = config.get<string>("BODY_LIMIT") ?? "8mb";
+  app.use("/api/products/import", json({ limit: importLimit }));
+  app.use(json({ limit: "1mb" }));
+  app.use(urlencoded({ extended: true, limit: "1mb" }));
 
   // Security headers. crossOriginResourcePolicy is relaxed so uploaded images
   // can be loaded by the web app on a different origin. (CSP disabled — JSON API.)

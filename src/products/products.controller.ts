@@ -10,11 +10,12 @@ import {
   Put,
   Query,
   UploadedFile,
+  UseFilters,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiTags } from '@nestjs/swagger';
-import { ArrayNotEmpty, ArrayUnique, IsArray, IsString } from 'class-validator';
+import { ArrayNotEmpty, ArrayUnique, IsArray, IsString, MaxLength } from 'class-validator';
 import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -22,6 +23,7 @@ import { QueryProductDto } from './dto/query-product.dto';
 import { GenerateVariantsDto } from './dto/generate-variants.dto';
 import { productImageMulterOptions, type UploadedImage } from './upload.config';
 import { ProductImageStorage } from './product-image.storage';
+import { MulterErrorFilter } from './multer-error.filter';
 import { UserRole } from '@prisma/client';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -63,6 +65,7 @@ export class ProductsController {
   @Post('upload-image')
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('image', productImageMulterOptions))
+  @UseFilters(MulterErrorFilter)
   async uploadImage(@UploadedFile() file?: UploadedImage) {
     if (!file) throw new BadRequestException('No image uploaded');
     // Whether this is a bucket URL or a local /api/uploads path depends on
