@@ -12,6 +12,9 @@ import { JwtService } from '@nestjs/jwt';
 import { PaymentMethod, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { SalesService } from '../src/sales/sales.service';
+import { CustomersService } from '../src/customers/customers.service';
+import { PaymentsService } from '../src/payments/payments.service';
+import { CategoriesService } from '../src/categories/categories.service';
 import { MailService } from '../src/mail/mail.service';
 import { AuthService } from '../src/auth/auth.service';
 import { AuditService } from '../src/audit/audit.service';
@@ -25,7 +28,14 @@ import { StoresService } from '../src/stores/stores.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
 import { allowsFraction, normalizeUnit } from '../src/common/units';
-import { validateEnv } from '../src/common/env.validation';
+import { platformJwtSecret, validateEnv } from '../src/common/env.validation';
+import { sniffImage } from '../src/products/product-image.storage';
+import { multerErrorToHttp } from '../src/products/multer-error.filter';
+import { BadRequestException, PayloadTooLargeException } from '@nestjs/common';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
+import { CreateCustomerDto } from '../src/customers/customers.controller';
+import { CreateSaleDto } from '../src/sales/dto/create-sale.dto';
 import { PrincipalCache } from '../src/common/principal-cache';
 import { JwtStrategy } from '../src/auth/strategies/jwt.strategy';
 import { ConfigService } from '@nestjs/config';
@@ -82,7 +92,10 @@ async function shiftReportBalancesTheDrawer() {
     },
     sale: { findMany: async () => sales },
   });
-  const service = new ShiftsService(prisma);
+  const service = new ShiftsService(
+    prisma,
+    stub<PaymentsService>({ cashCollectedOnShift: async () => 0 }),
+  );
 
   const x: any = await service.report('b1', 'sh1');
   assert.strictEqual(x.gross, 2500, 'gross is every stamped sale at full value');
@@ -188,7 +201,11 @@ async function reorderSuggestionsGroupBySupplier() {
     // the service asks for newest-first; the stub hands them back that way
     purchaseItem: { findMany: async () => history },
   });
-  const service = new PurchasesService(prisma, new InventoryService(prisma));
+  const service = new PurchasesService(
+    prisma,
+    new InventoryService(prisma),
+    stub<PaymentsService>({ record: async () => undefined }),
+  );
 
   const groups: any[] = await service.reorderSuggestions('b1');
   assert.strictEqual(groups.length, 2, 'Acme + the never-purchased bucket');
@@ -482,7 +499,13 @@ async function partReturnLeavesTheSalePartiallyReturned() {
     applyMovementsBatch: async () => undefined,
     returnSerialsToStock: async () => undefined,
   });
-  const service = new SalesService(prisma, inventory, stub<MailService>({}), stub<ShiftsService>({}));
+  const service = new SalesService(
+    prisma,
+    inventory,
+    stub<MailService>({}),
+    stub<ShiftsService>({}),
+    stub<PaymentsService>({ record: async () => undefined }),
+  );
 
   const first: any = await service.returnItems(user, 'sale1', {
     items: [{ saleItemId: 'si1', quantity: 2 }],
@@ -584,7 +607,13 @@ async function aStaleReadCannotOverReturnALine() {
     applyMovementsBatch: async () => undefined,
     returnSerialsToStock: async () => undefined,
   });
-  const service = new SalesService(prisma, inventory, stub<MailService>({}), stub<ShiftsService>({}));
+  const service = new SalesService(
+    prisma,
+    inventory,
+    stub<MailService>({}),
+    stub<ShiftsService>({}),
+    stub<PaymentsService>({ record: async () => undefined }),
+  );
 
   await assert.rejects(
     service.returnItems(user, 'sale1', {
@@ -1415,6 +1444,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
           findMany: async () => open,
         },
       }),
+      stub<PaymentsService>({ cashCollectedOnShift: async () => 0 }),
     );
 
   const ramesh = { id: 'sh-ramesh', userId: 'u2' };
@@ -1470,11 +1500,338 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
   );
 }
 
+/**
+ * Every balance change writes a ledger row, in the same transaction.
+ *
+ * The invariant the Payment table exists for: if a payment can move a balance
+ * without leaving a record, or leave a record without moving the balance, the
+ * two drift and nothing afterwards can say which is right.
+ */
+async function everyPaymentLeavesATrail() {
+  const recorded: any[] = [];
+  let balance = 500;
+
+  const makeService = () => {
+    const prisma = stub<PrismaService>({
+      customer: {
+        findFirst: async () => ({ id: 'c1', businessId: 'b1' }),
+        findUniqueOrThrow: async () => ({ id: 'c1', creditBalance: balance }),
+        updateMany: async (args: any) => {
+          // Mirrors the guarded decrement: only moves when the balance covers it.
+          const need = Number(args.data.creditBalance.decrement);
+          if (balance < need) return { count: 0 };
+          balance -= need;
+          return { count: 1 };
+        },
+      },
+      // The real service runs both writes inside one interactive transaction;
+      // the stub just runs the callback, and the assertions below check that
+      // a failure part-way leaves nothing behind.
+      $transaction: async (fn: any) => fn(prisma),
+    });
+    const payments = stub<PaymentsService>({
+      record: async (input: any) => {
+        recorded.push(input);
+        return input;
+      },
+    });
+    return new CustomersService(prisma, payments);
+  };
+
+  const service = makeService();
+
+  await service.payCredit('b1', 'c1', 200, {
+    method: 'CARD' as any,
+    userId: 'u1',
+    shiftId: 'sh1',
+  });
+  assert.strictEqual(balance, 300, 'balance moved by the amount paid');
+  assert.strictEqual(recorded.length, 1, 'exactly one ledger row per payment');
+  assert.strictEqual(recorded[0].type, 'CUSTOMER_CREDIT', 'typed as a credit payment');
+  assert.strictEqual(recorded[0].amount, 200, 'amount recorded positive');
+  assert.strictEqual(recorded[0].method, 'CARD', 'method carried through, not defaulted');
+  assert.strictEqual(recorded[0].shiftId, 'sh1', 'attributed to the till that took it');
+
+  // Overpaying must move nothing and record nothing.
+  await assert.rejects(
+    service.payCredit('b1', 'c1', 10_000, {}),
+    /exceeds/,
+    'paying more than is owed is refused',
+  );
+  assert.strictEqual(balance, 300, 'a refused payment leaves the balance alone');
+  assert.strictEqual(recorded.length, 1, 'and writes no ledger row');
+
+  // Cash is the counter's default, since that is what a till takes.
+  await service.payCredit('b1', 'c1', 50, {});
+  assert.strictEqual(recorded[1].method, 'CASH', 'defaults to cash when unstated');
+}
+
+/**
+ * A customer statement reconstructs the stored balance from events.
+ *
+ * The case that broke it: a return against a credit sale cancels credit, which
+ * raises the sale's `amountPaid` *and* its `refundedTotal` by the same amount.
+ * Subtracting both counted the return twice and invented an opening balance on
+ * an account the ledger fully explains.
+ */
+async function aStatementCountsAReturnOnce() {
+  // Rs 1000 on credit, 300 of it returned (cancelling 300 of credit), then
+  // 200 paid down in cash. Owed: 1000 - 300 - 200 = 500.
+  const prisma = stub<PrismaService>({
+    customer: {
+      findFirstOrThrow: async () => ({
+        id: 'c1',
+        name: 'Sita',
+        phone: null,
+        creditBalance: new Prisma.Decimal(500),
+      }),
+    },
+    payment: {
+      findMany: async () => [
+        {
+          id: 'p1',
+          type: 'CUSTOMER_CREDIT',
+          amount: new Prisma.Decimal(200),
+          method: 'CASH',
+          note: null,
+          createdAt: new Date(),
+          saleId: null,
+          purchaseId: null,
+          user: null,
+          store: null,
+        },
+      ],
+    },
+    sale: {
+      findMany: async () => [
+        {
+          id: 's1',
+          receiptNo: 'R-1',
+          createdAt: new Date(),
+          total: new Prisma.Decimal(1000),
+          amountPaid: new Prisma.Decimal(300),
+          refundedTotal: new Prisma.Decimal(300),
+        },
+      ],
+    },
+  });
+  const st: any = await new PaymentsService(prisma).customerStatement('b1', 'c1');
+  assert.strictEqual(st.totals.charged, 700, 'the return is netted out once');
+  assert.strictEqual(st.totals.paid, 200, 'credit payments come off');
+  assert.strictEqual(st.openingBalance, 0, 'nothing unexplained');
+  assert.strictEqual(st.reconciles, true, 'rebuilt purely from events');
+  assert.strictEqual(st.totals.closing, st.totals.stored, 'closing is the stored balance');
+}
+
+/** The last active store cannot be closed through the API. */
+async function theLastActiveStoreStaysOpen() {
+  let others = 0;
+  let closed = false;
+  const prisma = stub<PrismaService>({
+    store: {
+      findFirst: async () => ({ id: 'st1', businessId: 'b1', isActive: true }),
+      count: async () => others,
+      update: async () => {
+        closed = true;
+        return {};
+      },
+    },
+  });
+  const service = new StoresService(prisma);
+
+  await assert.rejects(service.remove('b1', 'st1'), /only active store/, 'refused when it is the last');
+  await assert.rejects(
+    service.update('b1', 'st1', { isActive: false }),
+    /only active store/,
+    'and through update too',
+  );
+  assert.strictEqual(closed, false, 'nothing written');
+
+  others = 1;
+  await service.remove('b1', 'st1');
+  assert.strictEqual(closed, true, 'allowed while another store is open');
+}
+
+/** Moving a category under its own subcategory would save a loop. */
+async function aCategoryCannotBecomeItsOwnAncestor() {
+  let loop = true;
+  const prisma = stub<PrismaService>({
+    category: {
+      findFirst: async (args: any) => ({ id: args.where.id, businessId: 'b1' }),
+      update: async () => ({}),
+    },
+    $queryRaw: async () => (loop ? [{ id: 'a' }] : []),
+  });
+  const service = new CategoriesService(prisma);
+
+  await assert.rejects(
+    service.update('b1', 'a', { parentId: 'b' }),
+    /own subcategories/,
+    'A under B is refused when B is already under A',
+  );
+  loop = false;
+  await service.update('b1', 'a', { parentId: 'b' });
+}
+
+/**
+ * Admin-panel tokens are signed with their own key. With one shared
+ * JWT_SECRET, only the `scope` claim check stood between a shop token and the
+ * platform strategy; a different key means one cannot even verify as the other.
+ */
+function platformTokensUseTheirOwnKey() {
+  const shopSecret = 'x'.repeat(48);
+  const env = (vars: Record<string, string>) => (k: string) => vars[k];
+
+  const derived = platformJwtSecret(env({ JWT_SECRET: shopSecret }));
+  assert.notStrictEqual(derived, shopSecret, 'the derived key is not JWT_SECRET');
+  assert.strictEqual(
+    derived,
+    platformJwtSecret(env({ JWT_SECRET: shopSecret })),
+    'the derived key is stable across restarts, or every restart signs admins out',
+  );
+  assert.strictEqual(
+    platformJwtSecret(env({ JWT_SECRET: shopSecret, PLATFORM_JWT_SECRET: 'p'.repeat(40) })),
+    'p'.repeat(40),
+    'an explicit PLATFORM_JWT_SECRET wins',
+  );
+
+  const shop = new JwtService({ secret: shopSecret });
+  const platform = new JwtService({ secret: derived });
+  assert.throws(
+    () => platform.verify(shop.sign({ sub: 'u1', scope: 'platform' })),
+    'a shop-signed token claiming platform scope does not verify as one',
+  );
+  assert.throws(
+    () => shop.verify(platform.sign({ sub: 'a1', scope: 'platform' })),
+    'a platform token does not verify as a shop token',
+  );
+
+  const ok = {
+    DATABASE_URL: 'postgresql://localhost:5432/db',
+    JWT_SECRET: shopSecret,
+    CORS_ORIGIN: 'https://app.example.com',
+    NODE_ENV: 'production',
+  };
+  assert.doesNotThrow(() => validateEnv({ ...ok }), 'PLATFORM_JWT_SECRET is optional');
+  assert.doesNotThrow(
+    () => validateEnv({ ...ok, PLATFORM_JWT_SECRET: 'p'.repeat(40) }),
+    'a real PLATFORM_JWT_SECRET boots',
+  );
+  for (const [label, value] of [
+    ['a placeholder', 'change-me-to-a-long-random-string'],
+    ['too short', 'short'],
+    ['the same as JWT_SECRET', shopSecret],
+  ] as const) {
+    assert.throws(
+      () => validateEnv({ ...ok, PLATFORM_JWT_SECRET: value }),
+      /PLATFORM_JWT_SECRET/,
+      `a PLATFORM_JWT_SECRET that is ${label} must not boot`,
+    );
+  }
+}
+
+/**
+ * The stored type of a product image comes from its bytes. The extension and
+ * the multipart Content-Type are the client's to choose, so trusting either
+ * let an HTML page named `x.png` be published as a web page.
+ */
+function uploadsAreJudgedByTheirBytes() {
+  const bytes = (...b: number[]) => Buffer.from(b);
+  const ascii = (t: string) => Buffer.from(t, 'latin1');
+  assert.deepStrictEqual(
+    sniffImage(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0)),
+    { ext: '.png', mime: 'image/png' },
+  );
+  assert.deepStrictEqual(sniffImage(bytes(0xff, 0xd8, 0xff, 0xe0)), {
+    ext: '.jpg',
+    mime: 'image/jpeg',
+  });
+  assert.deepStrictEqual(sniffImage(ascii('GIF89a....')), { ext: '.gif', mime: 'image/gif' });
+  assert.deepStrictEqual(sniffImage(ascii('RIFF\0\0\0\0WEBPVP8 ')), {
+    ext: '.webp',
+    mime: 'image/webp',
+  });
+  for (const [label, buf] of [
+    ['an HTML page', ascii('<!doctype html><script>alert(1)</script>')],
+    ['an SVG', ascii('<svg xmlns="http://www.w3.org/2000/svg"/>')],
+    ['a RIFF that is not WebP', ascii('RIFF\0\0\0\0WAVEfmt ')],
+    ['a truncated PNG header', bytes(0x89, 0x50, 0x4e)],
+    ['an empty file', Buffer.alloc(0)],
+  ] as const) {
+    assert.strictEqual(sniffImage(buf), null, `${label} is not accepted as an image`);
+  }
+}
+
+/**
+ * Free text is bounded. The body limit is 1mb (8mb on the import), and names
+ * had a MinLength but no MaxLength, so a multi-megabyte customer name used to
+ * be accepted and stored.
+ */
+async function freeTextIsBounded() {
+  const errorsFor = async <T extends object>(cls: new () => T, body: object) =>
+    validate(plainToInstance(cls, body), { whitelist: true });
+
+  assert.strictEqual(
+    (await errorsFor(CreateCustomerDto, { name: 'Ram Bahadur' })).length,
+    0,
+    'an ordinary name passes',
+  );
+  const long = await errorsFor(CreateCustomerDto, { name: 'x'.repeat(201) });
+  assert.ok(
+    long.some((e) => e.property === 'name' && e.constraints?.maxLength),
+    'a 201-character customer name is refused',
+  );
+
+  const sale = await errorsFor(CreateSaleDto, {
+    note: 'n'.repeat(1001),
+    items: [{ productId: 'p1', quantity: 1, serials: ['s'.repeat(101)] }],
+  });
+  assert.ok(
+    sale.some((e) => e.property === 'note'),
+    'an oversized sale note is refused',
+  );
+  assert.ok(
+    sale.some((e) => e.property === 'items'),
+    'an oversized serial inside a nested line is refused too',
+  );
+}
+
+/**
+ * A bad upload is the client's fault. Nest maps multer errors by message and
+ * multer 2.x renamed some, so an upload under the wrong field name answered
+ * 500. Uses multer's own error class, so a later multer that changes its
+ * shape fails here rather than in production.
+ */
+function uploadErrorsAreClientErrors() {
+  // multer ships no types; this is the one constructor the check needs.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { MulterError } = require('multer') as {
+    MulterError: new (code: string, field?: string) => Error;
+  };
+  const unexpected = multerErrorToHttp(new MulterError('LIMIT_UNEXPECTED_FILE', 'file'));
+  assert.ok(unexpected instanceof BadRequestException, 'wrong field name is a 400');
+  assert.match(String(unexpected.message), /"file"/, 'and names the field that was sent');
+  assert.ok(
+    multerErrorToHttp(new MulterError('LIMIT_FILE_SIZE')) instanceof PayloadTooLargeException,
+    'an oversized image is a 413',
+  );
+  assert.ok(
+    multerErrorToHttp(new MulterError('INVALID_FIELD_NAME')) instanceof BadRequestException,
+    'codes Nest has never heard of are 400s too',
+  );
+  assert.strictEqual(multerErrorToHttp(new Error('boom')), null, 'other errors are left alone');
+  assert.strictEqual(multerErrorToHttp('nope'), null, 'as are non-errors');
+}
+
 async function main() {
   subscriptionRules();
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
   await shiftReportBalancesTheDrawer();
+  await everyPaymentLeavesATrail();
+  await aStatementCountsAReturnOnce();
+  await theLastActiveStoreStaysOpen();
+  await aCategoryCannotBecomeItsOwnAncestor();
   await anOwnerJoinsTheTillAlreadyOpen();
   await stockTakePreviewComputesVariances();
   await reorderSuggestionsGroupBySupplier();
@@ -1485,6 +1842,10 @@ async function main() {
   await aStaleReadCannotOverReturnALine();
   await verifyEmailAlwaysRequiresTheCode();
   envValidationRefusesUnsafeConfig();
+  platformTokensUseTheirOwnKey();
+  uploadsAreJudgedByTheirBytes();
+  uploadErrorsAreClientErrors();
+  await freeTextIsBounded();
   await principalCacheCannotResurrectARetiredToken();
   await permanentDeleteRefusesToDestroyHistory();
   staffCannotReachAnotherStore();
