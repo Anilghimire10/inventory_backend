@@ -300,7 +300,6 @@ export class AuthService {
     void this.audit.record({
       businessId: user.businessId,
       userId: user.userId,
-      userName: user.email,
       action: 'auth.logout',
       entity: 'auth',
       summary: 'Signed out',

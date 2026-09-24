@@ -18,10 +18,14 @@ export class TaxesService {
     });
   }
 
+  // Clearing the old default and writing the new one share a transaction:
+  // done separately, a create that then failed (a duplicate name, say) had
+  // already cleared the default, leaving the business with none.
   async create(businessId: string, dto: CreateTaxDto) {
-    if (dto.isDefault) await this.clearDefault(businessId);
     try {
-      return await this.prisma.tax.create({
+      return await this.prisma.$transaction(async (tx) => {
+        if (dto.isDefault) await this.clearDefault(businessId, tx);
+        return tx.tax.create({
         data: {
           businessId,
           name: dto.name.trim(),
@@ -29,6 +33,7 @@ export class TaxesService {
           isActive: dto.isActive ?? true,
           isDefault: dto.isDefault ?? false,
         },
+        });
       });
     } catch (e) {
       throw this.handleUnique(e);
@@ -37,9 +42,10 @@ export class TaxesService {
 
   async update(businessId: string, id: string, dto: UpdateTaxDto) {
     await this.ensure(businessId, id);
-    if (dto.isDefault) await this.clearDefault(businessId);
     try {
-      return await this.prisma.tax.update({
+      return await this.prisma.$transaction(async (tx) => {
+        if (dto.isDefault) await this.clearDefault(businessId, tx);
+        return tx.tax.update({
         where: { id },
         data: {
           name: dto.name?.trim(),
@@ -47,6 +53,7 @@ export class TaxesService {
           isActive: dto.isActive,
           isDefault: dto.isDefault,
         },
+        });
       });
     } catch (e) {
       throw this.handleUnique(e);
@@ -60,8 +67,8 @@ export class TaxesService {
     return this.prisma.tax.delete({ where: { id } });
   }
 
-  private clearDefault(businessId: string) {
-    return this.prisma.tax.updateMany({
+  private clearDefault(businessId: string, tx: Prisma.TransactionClient) {
+    return tx.tax.updateMany({
       where: { businessId, isDefault: true },
       data: { isDefault: false },
     });

@@ -53,7 +53,16 @@ export class AuditInterceptor implements NestInterceptor {
     const verb = VERB[method] ?? method.toLowerCase();
     // A trailing action segment (e.g. /sales/:id/return -> "return") names the
     // action; otherwise fall back to the HTTP verb (create/update/delete).
-    const actionSegment = segments.length > 2 ? segments[2] : null;
+    // A collection-level action has no :id, so its action is the second
+    // segment: /sales/hold is "sales.hold", not "sales.create" -- parking a
+    // cart logged as a sale made the activity feed claim sales that never
+    // happened.
+    const actionSegment =
+      segments.length > 2
+        ? segments[2]
+        : segments.length === 2 && !req.params?.id
+          ? segments[1]
+          : null;
     const action = `${entity}.${actionSegment ?? verb}`;
 
     return next.handle().pipe(
@@ -61,7 +70,6 @@ export class AuditInterceptor implements NestInterceptor {
         void this.audit.record({
           businessId: user.businessId,
           userId: user.userId,
-          userName: user.email,
           action,
           entity,
           entityId: req.params?.id ?? null,

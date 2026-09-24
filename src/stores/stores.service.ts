@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateStoreDto, UpdateStoreDto } from './dto/store.dto';
 import { TX_OPTS } from '../common/prisma-tx';
@@ -63,15 +67,35 @@ export class StoresService {
   }
 
   async update(businessId: string, id: string, dto: UpdateStoreDto) {
-    await this.findOne(businessId, id);
+    const store = await this.findOne(businessId, id);
+    if (dto.isActive === false && store.isActive) {
+      await this.assertAnotherActive(businessId, id);
+    }
     return this.prisma.store.update({ where: { id }, data: dto });
   }
 
   async remove(businessId: string, id: string) {
-    await this.findOne(businessId, id);
+    const store = await this.findOne(businessId, id);
+    if (store.isActive) await this.assertAnotherActive(businessId, id);
     return this.prisma.store.update({
       where: { id },
       data: { isActive: false },
     });
+  }
+
+  /**
+   * A business with no active store cannot sell, receive stock or open a
+   * till, and nothing in the app can put it right again. Only the web UI
+   * guarded this, so a direct API call could leave a shop dead in the water.
+   */
+  private async assertAnotherActive(businessId: string, id: string) {
+    const others = await this.prisma.store.count({
+      where: { businessId, isActive: true, id: { not: id } },
+    });
+    if (others === 0) {
+      throw new BadRequestException(
+        'This is the only active store — open another before closing it',
+      );
+    }
   }
 }

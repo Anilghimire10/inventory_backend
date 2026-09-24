@@ -53,9 +53,15 @@ export class PurchasesService {
       dto.items.reduce((sum, i) => sum + i.quantity * i.costPrice, 0),
     );
     const total = subtotal;
-    // Paid in full by default; pass a smaller amountPaid to buy on credit.
-    const amountPaid = Math.min(Math.max(dto.amountPaid ?? total, 0), total);
     const receiveNow = dto.receiveNow !== false;
+    // Goods received now are paid in full by default; pass a smaller
+    // amountPaid to buy on credit. A draft is an order not yet delivered, so
+    // it defaults to nothing paid -- defaulting it to the full total booked a
+    // supplier payment for money that had not changed hands.
+    const amountPaid = Math.min(
+      Math.max(dto.amountPaid ?? (receiveNow ? total : 0), 0),
+      total,
+    );
 
     // Serials only make sense for goods actually arriving; a draft order
     // captures them later, on POST /purchases/:id/receive.

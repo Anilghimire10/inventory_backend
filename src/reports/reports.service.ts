@@ -803,17 +803,27 @@ export class ReportsService {
     const unattributedSales = staffSaleRows.find((r) => r.userId === null);
 
     // Inventory performance (across the selected period)
-    const [inventoryValue, movements, needs] = await Promise.all([
+    const [inventoryValue, onHand, movements, needs] = await Promise.all([
       this.inventoryValue(businessId, opts.storeId),
+      this.prisma.stockItem.aggregate({
+        where: { businessId, ...(opts.storeId ? { storeId: opts.storeId } : {}) },
+        _sum: { quantity: true },
+      }),
       this.stockMovementDaily(businessId, opts.storeId, tz, from, to),
       this.needsAttention(businessId, opts.storeId),
     ]);
     const totalUnits = byProduct.reduce((s, p) => s + p.quantitySold, 0);
     const stockTurnover =
       inventoryValue > 0 ? round2(cost / inventoryValue) : 0;
+    // Units sold as a share of units that were available to sell: sold over
+    // (sold + still on hand). This used to divide units by rupees/10 --
+    // inventory *value* standing in for a unit count -- so the figure moved
+    // with prices rather than with sales. Negative stock (oversold) counts as
+    // none on hand.
+    const onHandUnits = Math.max(Number(onHand._sum.quantity ?? 0), 0);
     const sellThrough =
-      totalUnits + inventoryValue > 0
-        ? Math.min(100, round2((totalUnits / (totalUnits + (inventoryValue / 10))) * 100))
+      totalUnits + onHandUnits > 0
+        ? round2((totalUnits / (totalUnits + onHandUnits)) * 100)
         : 0;
 
     return {
@@ -960,15 +970,23 @@ export class ReportsService {
    * catalog calls it today.
    */
   private async topProducts(businessId: string, storeId: string | undefined, take: number) {
-    const grouped = await this.prisma.saleItem.groupBy({
-      by: ['productId'],
-      where: {
-        sale: { businessId, ...(storeId ? { storeId } : {}) },
-      },
-      _sum: { quantity: true },
-      orderBy: { _sum: { quantity: 'desc' } },
-      take,
-    });
+    // Units kept, not units rung up: a held cart is not a sale, and a unit
+    // brought back was not sold. The Prisma groupBy this replaced counted
+    // both -- it had no status filter and summed raw `quantity` -- so a
+    // parked cart or a big return could put a product at the top of the
+    // dashboard. Same filter and same SOLD_QTY as every other rollup here.
+    const grouped = await this.prisma.$queryRaw<
+      { productId: string; sold: Prisma.Decimal }[]
+    >`
+      SELECT si."productId", SUM(${SOLD_QTY}) AS sold
+      FROM "SaleItem" si
+      JOIN "Sale" s ON s.id = si."saleId"
+      WHERE ${this.saleFilterSql(businessId, { storeId })}
+      GROUP BY si."productId"
+      HAVING SUM(${SOLD_QTY}) > 0
+      ORDER BY sold DESC
+      LIMIT ${take}
+    `;
 
     const names = new Map(
       (
@@ -984,7 +1002,7 @@ export class ReportsService {
       // Products are soft-deleted and SaleItem.product is required, so the row
       // is always there; the fallback only guards against a blank name.
       name: names.get(g.productId) || 'Unknown product',
-      quantitySold: Number(g._sum.quantity ?? 0),
+      quantitySold: Number(g.sold),
     }));
   }
 

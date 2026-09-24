@@ -22,10 +22,25 @@ export class AuditService {
 
   constructor(private prisma: PrismaService) {}
 
-  /** Persist an activity record. Never throws into the caller's flow. */
+  /**
+   * Persist an activity record. Never throws into the caller's flow.
+   *
+   * `userName` is a snapshot that outlives the user, so it should be their
+   * name. A request only carries the token's email, so callers that don't
+   * have the name leave it out and it is looked up here -- off the request
+   * path, since callers don't await this.
+   */
   async record(entry: AuditEntry) {
     try {
-      await this.prisma.auditLog.create({ data: entry });
+      let userName = entry.userName;
+      if (!userName && entry.userId) {
+        const user = await this.prisma.user.findUnique({
+          where: { id: entry.userId },
+          select: { name: true },
+        });
+        userName = user?.name ?? null;
+      }
+      await this.prisma.auditLog.create({ data: { ...entry, userName } });
     } catch (e) {
       this.logger.warn(`Failed to write audit log: ${(e as Error).message}`);
     }

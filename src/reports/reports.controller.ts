@@ -6,6 +6,7 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
 import { scopeToStore } from '../common/store-scope';
+import { ReportRangeDto } from './dto/report-range.dto';
 
 @ApiTags('reports')
 @ApiBearerAuth()
@@ -31,9 +32,7 @@ export class ReportsController {
   @Get('sales-summary')
   salesSummary(
     @CurrentUser() u: AuthUser,
-    @Query('from') from?: string,
-    @Query('to') to?: string,
-    @Query('storeId') storeId?: string,
+    @Query() { from, to, storeId }: ReportRangeDto,
   ) {
     return this.reports.salesSummary(u.businessId, { from, to, storeId });
   }
@@ -42,9 +41,7 @@ export class ReportsController {
   @Get('tax')
   taxReport(
     @CurrentUser() u: AuthUser,
-    @Query('from') from?: string,
-    @Query('to') to?: string,
-    @Query('storeId') storeId?: string,
+    @Query() { from, to, storeId }: ReportRangeDto,
   ) {
     return this.reports.taxReport(u.businessId, { from, to, storeId });
   }
@@ -65,9 +62,7 @@ export class ReportsController {
   @Get('analytics')
   analytics(
     @CurrentUser() u: AuthUser,
-    @Query('from') from?: string,
-    @Query('to') to?: string,
-    @Query('storeId') storeId?: string,
+    @Query() { from, to, storeId }: ReportRangeDto,
   ) {
     return this.reports.analytics(u.businessId, { from, to, storeId });
   }

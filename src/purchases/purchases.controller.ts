@@ -74,7 +74,12 @@ export class PurchasesController {
 
   @Post()
   create(@CurrentUser() u: AuthUser, @Body() dto: CreatePurchaseDto) {
-    return this.purchases.create(u.businessId, dto);
+    // Paying a supplier is owner/manager business (see `pay` below). A stock
+    // keeper receives the goods; what was paid for them is left on credit
+    // for management to record, rather than letting the default "paid in
+    // full" book a supplier payment they had no authority to make.
+    if (u.role === UserRole.STOCK_KEEPER) dto.amountPaid = 0;
+    return this.purchases.create(u.businessId, dto, u.userId);
   }
 
   @Patch(':id')
@@ -83,7 +88,10 @@ export class PurchasesController {
     @Param('id') id: string,
     @Body() dto: UpdatePurchaseDto,
   ) {
-    return this.purchases.update(u.businessId, id, dto);
+    // Same rule as create: a stock keeper can correct the lines, not what
+    // was paid. Omitted, the service keeps the existing figure.
+    if (u.role === UserRole.STOCK_KEEPER) dto.amountPaid = undefined;
+    return this.purchases.update(u.businessId, id, dto, u.userId);
   }
 
   /** Receive a draft; serialised lines carry their scanned serials/IMEIs. */
