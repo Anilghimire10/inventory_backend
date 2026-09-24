@@ -7,6 +7,7 @@ import {
 import { PaymentMethod, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser } from '../common/types/auth-user';
+import { PaymentsService } from '../payments/payments.service';
 import { paginate } from '../common/dto/pagination.dto';
 import { CloseShiftDto, OpenShiftDto, QueryShiftDto } from './dto/shift.dto';
 
@@ -21,7 +22,10 @@ const CASH_TENDERS: PaymentMethod[] = [PaymentMethod.CASH, PaymentMethod.MIXED];
 
 @Injectable()
 export class ShiftsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private payments: PaymentsService,
+  ) {}
 
   /** Start a till session. One open shift per user, enforced by the DB. */
   async open(user: AuthUser, dto: OpenShiftDto) {
@@ -345,8 +349,21 @@ export class ShiftsService {
       }
     }
 
-    const expectedCash = round2(openingFloat + cashIn - cashRefunds);
+    // Cash taken at this till against customer credit. Notes in the drawer
+    // that no sale explains: the customer is settling a khata from an earlier
+    // day, so nothing in the query above sees it. Every shift that collected
+    // any counted long by exactly this much, and the variance report blamed
+    // the cashier for it.
+    //
+    // Shifts closed before the Payment ledger existed have no rows, so this is
+    // 0 for them and their reports read exactly as they always did.
+    const creditCollected = await this.payments.cashCollectedOnShift(shiftId);
+
+    const expectedCash = round2(
+      openingFloat + cashIn + creditCollected - cashRefunds,
+    );
     return {
+      creditCollected,
       salesCount: sales.length,
       gross: round2(gross),
       discounts: round2(discounts),

@@ -3,8 +3,9 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { PaymentMethod, PaymentType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentsService } from '../payments/payments.service';
 import { QueryCustomerDto } from './dto/query-customer.dto';
 import {
   CreateCustomerDto,
@@ -14,7 +15,10 @@ import { paginate } from '../common/dto/pagination.dto';
 
 @Injectable()
 export class CustomersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private payments: PaymentsService,
+  ) {}
 
   create(businessId: string, dto: CreateCustomerDto) {
     return this.prisma.customer.create({ data: { businessId, ...dto } });
@@ -74,21 +78,66 @@ export class CustomersService {
     return this.prisma.customer.update({ where: { id }, data: dto });
   }
 
-  async payCredit(businessId: string, id: string, amount: number) {
+  /**
+   * Take a payment against a customer's outstanding credit.
+   *
+   * The balance move and its ledger row are one transaction. Writing the row
+   * afterwards would leave the two disagreeing whenever the second write
+   * failed, which is precisely the state a ledger exists to make impossible.
+   *
+   * `shiftId` is what lets the money reach the drawer: a customer settling
+   * their khata in cash at the counter puts notes in the till, and until this
+   * existed the shift's expected cash knew nothing about them, so the drawer
+   * counted long and the variance report blamed the cashier.
+   */
+  async payCredit(
+    businessId: string,
+    id: string,
+    amount: number,
+    context: {
+      method?: PaymentMethod;
+      userId?: string;
+      storeId?: string | null;
+      shiftId?: string | null;
+      note?: string;
+    } = {},
+  ) {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
     await this.ensure(businessId, id);
-    // Atomic guarded decrement: the balance check and the write happen in
-    // one statement against the row's live value, so two concurrent
-    // payments can't both pass a stale "amount <= balance" check and drive
-    // the balance negative.
-    const result = await this.prisma.customer.updateMany({
-      where: { id, businessId, creditBalance: { gte: amount } },
-      data: { creditBalance: { decrement: amount } },
+
+    return this.prisma.$transaction(async (tx) => {
+      // Atomic guarded decrement: the balance check and the write happen in
+      // one statement against the row's live value, so two concurrent
+      // payments can't both pass a stale "amount <= balance" check and drive
+      // the balance negative.
+      const result = await tx.customer.updateMany({
+        where: { id, businessId, creditBalance: { gte: amount } },
+        data: { creditBalance: { decrement: amount } },
+      });
+      if (result.count === 0) {
+        throw new BadRequestException('Payment exceeds outstanding balance');
+      }
+
+      await this.payments.record(
+        {
+          businessId,
+          type: PaymentType.CUSTOMER_CREDIT,
+          amount,
+          // Cash unless told otherwise: it is what a counter takes by default,
+          // and mislabelling a card payment as cash would put money in the
+          // expected drawer that is not physically there.
+          method: context.method ?? PaymentMethod.CASH,
+          customerId: id,
+          storeId: context.storeId ?? null,
+          shiftId: context.shiftId ?? null,
+          userId: context.userId ?? null,
+          note: context.note ?? null,
+        },
+        tx,
+      );
+
+      return tx.customer.findUniqueOrThrow({ where: { id } });
     });
-    if (result.count === 0) {
-      throw new BadRequestException('Payment exceeds outstanding balance');
-    }
-    return this.prisma.customer.findUniqueOrThrow({ where: { id } });
   }
 
   async remove(businessId: string, id: string) {

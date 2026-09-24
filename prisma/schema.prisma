@@ -83,6 +83,18 @@ enum PaymentMethod {
   MIXED
 }
 
+// What a Payment row records. The direction of the money is a property of the
+// type, not of the amount: SALE, CUSTOMER_CREDIT and SUPPLIER_REFUND are cash
+// in, REFUND and SUPPLIER_PAYMENT are cash out. Amounts are therefore always positive, so a
+// customer statement never has to render a negative number.
+enum PaymentType {
+  SALE // taken at the till when a sale is rung up
+  REFUND // handed back to the customer on a return
+  CUSTOMER_CREDIT // customer paying down their udhaaro
+  SUPPLIER_PAYMENT // paid out to a supplier against a purchase
+  SUPPLIER_REFUND // what a supplier owes back after a return or a paid-down edit
+}
+
 // How a shop paid its subscription. Recorded by hand in the admin panel
 // until online payment (Fonepay) creates these rows itself.
 enum SubscriptionPaymentMethod {
@@ -163,6 +175,7 @@ model Business {
   notifications  Notification[]
   auditLogs      AuditLog[]
   shifts         Shift[]
+  payments       Payment[]
   serials        Serial[]
 }
 
@@ -184,6 +197,7 @@ model Store {
   sales          Sale[]
   batches        Batch[]
   shifts         Shift[]
+  payments       Payment[]
   serials        Serial[]
 
   @@index([businessId])
@@ -215,6 +229,7 @@ model User {
   stockMovements StockMovement[]
   emailTokens    EmailToken[]
   auditLogs      AuditLog[]
+  payments       Payment[]
   shifts         Shift[]
 
   @@index([businessId])
@@ -432,6 +447,7 @@ model Supplier {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  payments  Payment[]
   purchases Purchase[]
 
   @@index([businessId])
@@ -457,6 +473,7 @@ model Purchase {
   updatedAt  DateTime       @updatedAt
 
   items   PurchaseItem[]
+  payments Payment[]
   serials Serial[]
 
   @@index([businessId])
@@ -492,6 +509,7 @@ model Customer {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
+  payments Payment[]
   sales Sale[]
 
   @@index([businessId])
@@ -529,6 +547,7 @@ model Sale {
   updatedAt       DateTime      @updatedAt
 
   items   SaleItem[]
+  payments Payment[]
   serials Serial[]
 
   @@unique([businessId, receiptNo])
@@ -582,7 +601,8 @@ model Shift {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  sales Sale[]
+  sales    Sale[]
+  payments Payment[]
 
   // "One open shift per user PER STORE" is enforced by a partial unique index
   // on (userId, storeId) WHERE "closedAt" IS NULL — Prisma can't express
@@ -595,6 +615,63 @@ model Shift {
   // that an owner joins the cashier's drawer rather than opening a second
   // one, and by the sale path to resolve which drawer a sale lands in.
   @@index([storeId, closedAt])
+}
+
+// ---------- Money ----------
+
+/// Every movement of money, as it happens.
+///
+/// Before this existed, paying down a customer's udhaaro or settling a
+/// supplier invoice only moved a balance: `Customer.creditBalance` went down,
+/// `Purchase.amountPaid` went up, and nothing recorded who paid, when, or by
+/// what means. A customer asking "when did I pay that 5,000?" could not be
+/// answered, and cash collected against credit at the till never reached the
+/// shift's expected cash, so the drawer could not be made to balance.
+///
+/// Balances stay where they are rather than becoming derived: they are read on
+/// hot paths and guarded by atomic statements that this ledger does not
+/// replace. What changes is that every write to one is now accompanied by a
+/// row here, in the same transaction, so the two can always be reconciled.
+model Payment {
+  id         String      @id @default(cuid())
+  businessId String
+  business   Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  /// Where the money changed hands. Null for payments not made at a till.
+  storeId    String?
+  store      Store?      @relation(fields: [storeId], references: [id])
+  type       PaymentType
+  /// Always positive — what physically changed hands. See PaymentType for
+  /// which direction each type moves.
+  amount     Decimal     @db.Decimal(12, 2)
+  method     PaymentMethod
+
+  /// Whichever of these the payment concerns; the rest are null.
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+  supplierId String?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+  saleId     String?
+  sale       Sale?     @relation(fields: [saleId], references: [id])
+  purchaseId String?
+  purchase   Purchase? @relation(fields: [purchaseId], references: [id])
+
+  /// The till session this passed through, when it passed through one. This
+  /// is what lets a Z report account for credit collected at the counter.
+  shiftId String?
+  shift   Shift?  @relation(fields: [shiftId], references: [id])
+  /// Who took or made the payment. Null only for rows with no acting user.
+  userId  String?
+  user    User?   @relation(fields: [userId], references: [id])
+
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([businessId, createdAt])
+  /// Customer and supplier statements: every row for one party, in order.
+  @@index([customerId, createdAt])
+  @@index([supplierId, createdAt])
+  /// Drawer reconciliation reads every payment on one shift.
+  @@index([shiftId])
 }
 
 // ---------- Notifications ----------

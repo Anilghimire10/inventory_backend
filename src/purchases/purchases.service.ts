@@ -4,12 +4,15 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  PaymentMethod,
+  PaymentType,
   Prisma,
   PurchaseStatus,
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { PaymentsService } from '../payments/payments.service';
 import { CreatePurchaseDto, PurchaseItemDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { ReturnPurchaseDto } from './dto/return-purchase.dto';
@@ -26,9 +29,10 @@ export class PurchasesService {
   constructor(
     private prisma: PrismaService,
     private inventory: InventoryService,
+    private payments: PaymentsService,
   ) {}
 
-  async create(businessId: string, dto: CreatePurchaseDto) {
+  async create(businessId: string, dto: CreatePurchaseDto, userId?: string) {
     // Forms send "" for "no supplier selected" -- treat that the same as
     // omitted rather than letting it hit the FK constraint as a bad id.
     if (dto.supplierId === '') dto.supplierId = undefined;
@@ -101,6 +105,26 @@ export class PurchasesService {
       if (receiveNow) {
         await this.receiveItems(tx, businessId, dto.storeId, purchase.id, dto, productMap);
       }
+
+      // Paid in full by default, so most purchases hand money over the moment
+      // they are entered. That is a supplier payment like any other, and
+      // leaving it out of the ledger would make every such invoice look
+      // unpaid when the supplier's history is added up.
+      if (amountPaid > 0) {
+        await this.payments.record(
+          {
+            businessId,
+            type: PaymentType.SUPPLIER_PAYMENT,
+            amount: amountPaid,
+            method: PaymentMethod.CASH,
+            supplierId: dto.supplierId ?? null,
+            purchaseId: purchase.id,
+            storeId: dto.storeId,
+            userId: userId ?? null,
+          },
+          tx,
+        );
+      }
       return purchase;
     }, TX_OPTS);
   }
@@ -111,7 +135,12 @@ export class PurchasesService {
    * transaction. Editing is blocked if some of the original stock has already
    * been sold/moved (the reversal would drive stock negative).
    */
-  async update(businessId: string, id: string, dto: UpdatePurchaseDto) {
+  async update(
+    businessId: string,
+    id: string,
+    dto: UpdatePurchaseDto,
+    userId?: string,
+  ) {
     const existing = await this.prisma.purchase.findFirst({
       where: { id, businessId },
       include: { items: true },
@@ -226,6 +255,30 @@ export class PurchasesService {
           },
         },
       });
+
+      // An edit can change what was paid -- directly, or because a smaller
+      // total clamps it down. Record the difference, so the supplier's
+      // payments still add up to what their invoices say was paid.
+      const paidDelta = round2(amountPaid - Number(existing.amountPaid));
+      if (paidDelta !== 0) {
+        await this.payments.record(
+          {
+            businessId,
+            type:
+              paidDelta > 0
+                ? PaymentType.SUPPLIER_PAYMENT
+                : PaymentType.SUPPLIER_REFUND,
+            amount: Math.abs(paidDelta),
+            method: PaymentMethod.CASH,
+            supplierId: dto.supplierId ?? null,
+            purchaseId: id,
+            storeId: newStoreId,
+            userId: userId ?? null,
+            note: 'Purchase edited',
+          },
+          tx,
+        );
+      }
 
       // 3. Re-apply stock for the new lines (only if already received).
       if (wasReceived) {
@@ -500,6 +553,27 @@ export class PurchasesService {
         }
       }
 
+      // Clamping amountPaid down to the new total is money the supplier now
+      // owes back. It is logged as a supplier refund when the return is made,
+      // since that is when the paid-to-date figure drops; the refund itself
+      // is settled outside the app, which the note says.
+      if (refundDueFromSupplier > 0) {
+        await this.payments.record(
+          {
+            businessId,
+            type: PaymentType.SUPPLIER_REFUND,
+            amount: refundDueFromSupplier,
+            method: PaymentMethod.CASH,
+            supplierId: purchase.supplierId,
+            purchaseId: purchase.id,
+            storeId: purchase.storeId,
+            userId,
+            note: 'Refund due on goods returned',
+          },
+          tx,
+        );
+      }
+
       const updated = await tx.purchase.update({
         where: { id: purchase.id },
         data: {
@@ -523,34 +597,68 @@ export class PurchasesService {
     }, TX_OPTS);
   }
 
-  /** Record a payment to the supplier against a purchase (clamped to the total). */
-  async recordPayment(businessId: string, id: string, amount: number) {
+  /**
+   * Pay a supplier against a purchase invoice.
+   *
+   * The balance move and its ledger row commit together, so "what do we still
+   * owe this supplier" and "what have we actually paid them" can never tell
+   * different stories.
+   */
+  async recordPayment(
+    businessId: string,
+    id: string,
+    amount: number,
+    context: { method?: PaymentMethod; userId?: string; note?: string } = {},
+  ) {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
     const purchase = await this.prisma.purchase.findFirst({
       where: { id, businessId },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
 
-    // Atomic guarded increment: the outstanding check and the write happen
-    // in one statement against the row's live value, so two concurrent
-    // payments can't both pass a stale check and push amountPaid past total.
-    const claimed = await this.prisma.$executeRaw`
-      UPDATE "Purchase"
-      SET "amountPaid" = "amountPaid" + ${amount}
-      WHERE id = ${id} AND "businessId" = ${businessId}
-        AND "amountPaid" + ${amount} <= total + 0.001
-    `;
-    if (claimed === 0) {
-      const outstanding = round2(Number(purchase.total) - Number(purchase.amountPaid));
-      throw new BadRequestException(
-        `Payment exceeds the outstanding ${outstanding}`,
+    return this.prisma.$transaction(async (tx) => {
+      // Atomic guarded increment: the outstanding check and the write happen
+      // in one statement against the row's live value, so two concurrent
+      // payments can't both pass a stale check and push amountPaid past total.
+      const claimed = await tx.$executeRaw`
+        UPDATE "Purchase"
+        SET "amountPaid" = "amountPaid" + ${amount}
+        WHERE id = ${id} AND "businessId" = ${businessId}
+          AND "amountPaid" + ${amount} <= total + 0.001
+      `;
+      if (claimed === 0) {
+        const outstanding = round2(
+          Number(purchase.total) - Number(purchase.amountPaid),
+        );
+        throw new BadRequestException(
+          `Payment exceeds the outstanding ${outstanding}`,
+        );
+      }
+
+      await this.payments.record(
+        {
+          businessId,
+          type: PaymentType.SUPPLIER_PAYMENT,
+          amount,
+          method: context.method ?? PaymentMethod.CASH,
+          supplierId: purchase.supplierId,
+          purchaseId: id,
+          storeId: purchase.storeId,
+          // Deliberately no shiftId: paying a supplier is not a till
+          // transaction, and booking it to a drawer would make that drawer
+          // expect to be short by the payment at close.
+          userId: context.userId ?? null,
+          note: context.note ?? null,
+        },
+        tx,
       );
-    }
-    const updated = await this.prisma.purchase.findUniqueOrThrow({ where: { id } });
-    return {
-      ...updated,
-      outstanding: round2(Number(updated.total) - Number(updated.amountPaid)),
-    };
+
+      const updated = await tx.purchase.findUniqueOrThrow({ where: { id } });
+      return {
+        ...updated,
+        outstanding: round2(Number(updated.total) - Number(updated.amountPaid)),
+      };
+    });
   }
 
   async findAll(businessId: string, q: PaginationDto) {

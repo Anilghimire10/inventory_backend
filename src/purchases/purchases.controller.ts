@@ -13,9 +13,17 @@ import {
   ApiPropertyOptional,
   ApiTags,
 } from '@nestjs/swagger';
-import { IsNumber, IsOptional, IsString, Min } from 'class-validator';
-import { UserRole } from '@prisma/client';
+import {
+  IsIn,
+  IsNumber,
+  IsOptional,
+  IsString,
+  MaxLength,
+  Min,
+} from 'class-validator';
+import { PaymentMethod, UserRole } from '@prisma/client';
 import { PurchasesService } from './purchases.service';
+import { SETTLE_METHODS } from '../payments/payments.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { ReturnPurchaseDto } from './dto/return-purchase.dto';
@@ -30,17 +38,30 @@ export class PayPurchaseDto {
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0.01)
   amount: number;
+
+  @ApiPropertyOptional({ enum: SETTLE_METHODS, default: PaymentMethod.CASH })
+  @IsOptional()
+  @IsIn(SETTLE_METHODS)
+  method?: PaymentMethod;
+
+  @ApiPropertyOptional({ description: 'Free-text reference, e.g. a cheque number' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  note?: string;
 }
 
 export class ReorderDraftDto {
   @ApiPropertyOptional({ description: 'Only this store' })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   storeId?: string;
 
   @ApiPropertyOptional({ description: 'Only this supplier' })
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   supplierId?: string;
 }
 
@@ -93,7 +114,11 @@ export class PurchasesController {
     @Param('id') id: string,
     @Body() dto: PayPurchaseDto,
   ) {
-    return this.purchases.recordPayment(u.businessId, id, dto.amount);
+    return this.purchases.recordPayment(u.businessId, id, dto.amount, {
+      method: dto.method,
+      userId: u.userId,
+      note: dto.note,
+    });
   }
 
   /** Suggested reorder quantities, grouped into one draft order per supplier. */

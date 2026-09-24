@@ -6,12 +6,14 @@ import {
 import { randomUUID } from 'crypto';
 import {
   PaymentMethod,
+  PaymentType,
   Prisma,
   SaleStatus,
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ShiftsService } from '../shifts/shifts.service';
+import { PaymentsService } from '../payments/payments.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
@@ -41,6 +43,7 @@ export class SalesService {
     private inventory: InventoryService,
     private mail: MailService,
     private shifts: ShiftsService,
+    private payments: PaymentsService,
   ) {}
 
   /** Email a sale's receipt to the customer (or an explicit address). */
@@ -175,6 +178,27 @@ export class SalesService {
         },
         include: { items: true },
       });
+
+      // What the customer actually handed over now. A fully-credit sale hands
+      // over nothing, so it gets no row -- the debt is the sale, not a
+      // payment, and inventing a zero payment would put an empty line on
+      // every statement.
+      if (amountPaid > 0) {
+        await this.payments.record(
+          {
+            businessId,
+            type: PaymentType.SALE,
+            amount: amountPaid,
+            method: paymentMethod,
+            saleId: sale.id,
+            customerId: dto.customerId ?? null,
+            storeId,
+            shiftId,
+            userId: user.userId,
+          },
+          tx,
+        );
+      }
 
       // Deduct stock (blocks overselling) and consume batches FEFO -- batched
       // so an N-line sale costs a handful of round trips, not O(N).
@@ -464,6 +488,27 @@ export class SalesService {
             data: { creditBalance: { decrement: creditReduction } },
           });
         }
+      }
+
+      // Money physically handed back is the refund less whatever was settled
+      // by cancelling the customer's outstanding credit on this sale -- that
+      // part never leaves the drawer, it just stops being owed.
+      const cashRefunded = round2(refund - creditReduction);
+      if (cashRefunded > 0) {
+        await this.payments.record(
+          {
+            businessId: sale.businessId,
+            type: PaymentType.REFUND,
+            amount: cashRefunded,
+            method: sale.paymentMethod,
+            saleId: sale.id,
+            customerId: sale.customerId,
+            storeId: sale.storeId,
+            shiftId: sale.shiftId,
+            userId: user.userId,
+          },
+          tx,
+        );
       }
 
       const updated = await tx.sale.update({
