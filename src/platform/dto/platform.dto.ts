@@ -2,10 +2,13 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   BusinessType,
+  PlatformRole,
   SalesModel,
   SubscriptionPaymentMethod,
 } from '@prisma/client';
 import {
+  ArrayMaxSize,
+  IsArray,
   IsBoolean,
   IsDateString,
   IsEmail,
@@ -21,6 +24,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
@@ -36,6 +40,31 @@ export class PlatformLoginDto {
   // set before new ones were capped at 128 must still sign in.
   @MaxLength(1024)
   password: string;
+
+  @ApiPropertyOptional({ description: 'The 6-digit code, for an admin with two-factor on' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(10)
+  code?: string;
+}
+
+export class TwoFactorCodeDto {
+  @ApiProperty({ example: '123456' })
+  @IsString()
+  @MaxLength(10)
+  code: string;
+}
+
+export class DisableTwoFactorDto {
+  @ApiProperty()
+  @IsString()
+  @MaxLength(1024)
+  password: string;
+
+  @ApiProperty({ example: '123456' })
+  @IsString()
+  @MaxLength(10)
+  code: string;
 }
 
 export class ChangePasswordDto {
@@ -68,6 +97,14 @@ export class CreateAdminDto {
   @MaxLength(128)
   @MinLength(8)
   password: string;
+
+  @ApiPropertyOptional({
+    enum: PlatformRole,
+    description: 'ADMIN (default) can change anything; SUPPORT is read-only apart from support tickets',
+  })
+  @IsOptional()
+  @IsEnum(PlatformRole)
+  role?: PlatformRole;
 }
 
 export class UpdateAdminDto {
@@ -89,6 +126,18 @@ export class UpdateAdminDto {
   @MaxLength(128)
   @MinLength(8)
   password?: string;
+
+  @ApiPropertyOptional({
+    description: "Turn off another admin's two-factor, e.g. after a lost phone. They can set it up again.",
+  })
+  @IsOptional()
+  @IsBoolean()
+  resetTwoFactor?: boolean;
+
+  @ApiPropertyOptional({ enum: PlatformRole })
+  @IsOptional()
+  @IsEnum(PlatformRole)
+  role?: PlatformRole;
 }
 
 export class QueryAuditLogDto extends PaginationDto {
@@ -327,4 +376,110 @@ export class UpdateTenantUserDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+}
+
+// ---- Internal notes and deletion ----
+
+export class CreateBusinessNoteDto {
+  @ApiProperty({ description: 'A call, a payment promise, a setup detail' })
+  @IsString()
+  @MaxLength(2000)
+  @MinLength(1)
+  body: string;
+}
+
+export class DeleteBusinessDto {
+  @ApiProperty({ description: "The business's name, typed out to confirm" })
+  @IsString()
+  @MaxLength(200)
+  confirmName: string;
+}
+
+// ---- Email log ----
+
+export const EMAIL_TYPES = [
+  'verification',
+  'password-reset',
+  'receipt',
+  'low-stock',
+  'invite',
+  'subscription-reminder',
+  'announcement',
+] as const;
+
+export class QueryEmailLogDto extends PaginationDto {
+  @ApiPropertyOptional({ enum: ['SENT', 'FAILED', 'LOGGED'] })
+  @IsOptional()
+  @IsIn(['SENT', 'FAILED', 'LOGGED'])
+  status?: 'SENT' | 'FAILED' | 'LOGGED';
+
+  @ApiPropertyOptional({ enum: EMAIL_TYPES })
+  @IsOptional()
+  @IsIn(EMAIL_TYPES)
+  type?: (typeof EMAIL_TYPES)[number];
+}
+
+// ---- Announcements ----
+
+export class SendAnnouncementDto {
+  @ApiProperty({ example: 'Scheduled maintenance on Saturday' })
+  @IsString()
+  @MaxLength(120)
+  @MinLength(3)
+  title: string;
+
+  @ApiProperty()
+  @IsString()
+  @MaxLength(1000)
+  @MinLength(1)
+  body: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: 'Businesses to send to. Omitted or empty: every business that is not suspended.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  businessIds?: string[];
+
+  @ApiPropertyOptional({ description: "Also email each business's owners" })
+  @IsOptional()
+  @IsBoolean()
+  email?: boolean;
+}
+
+/** Admin panel → Settings. A field left out is unchanged; null clears it. */
+export class UpdatePlatformSettingsDto {
+  @ApiPropertyOptional({ nullable: true, description: 'Trial days for new signups; null uses env TRIAL_DAYS' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(365)
+  trialDays?: number | null;
+
+  @ApiPropertyOptional({ description: 'False makes signup invite-only (admins create businesses)' })
+  @IsOptional()
+  @IsBoolean()
+  signupOpen?: boolean;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Banner across the shop app; null or empty removes it' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(500)
+  maintenanceMessage?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Delete shop activity-log entries older than this; null keeps them' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @Type(() => Number)
+  @IsInt()
+  @Min(30)
+  @Max(3650)
+  auditRetentionDays?: number | null;
 }

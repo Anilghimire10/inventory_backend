@@ -9,7 +9,7 @@
 import assert from 'assert';
 import { createHash } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
-import { PaymentMethod, Prisma, SaleStatus, UserRole } from '@prisma/client';
+import { PaymentMethod, PlatformRole, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
@@ -28,6 +28,12 @@ import { StoresService } from '../src/stores/stores.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
 import { allowsFraction, normalizeUnit } from '../src/common/units';
+import { splitTax } from '../src/common/tax';
+import { SettingsService } from '../src/settings/settings.service';
+import { LogRetentionCron } from '../src/settings/log-retention.cron';
+import { SupportService } from '../src/support/support.service';
+import { QueryTicketsDto } from '../src/support/dto/support.dto';
+import { platformRoleAllows } from '../src/platform/platform-auth.guard';
 import { platformJwtSecret, validateEnv } from '../src/common/env.validation';
 import { sniffImage } from '../src/products/product-image.storage';
 import { multerErrorToHttp } from '../src/products/multer-error.filter';
@@ -36,19 +42,38 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { CreateCustomerDto } from '../src/customers/customers.controller';
 import { CreateSaleDto } from '../src/sales/dto/create-sale.dto';
+import { QueryProductDto } from '../src/products/dto/query-product.dto';
 import { PrincipalCache } from '../src/common/principal-cache';
+import { isLocalSlot } from '../src/common/timezone';
 import { JwtStrategy } from '../src/auth/strategies/jwt.strategy';
 import { ConfigService } from '@nestjs/config';
 import {
   DAY_MS,
   addMonths,
   daysUntil,
+  isSubscriptionActive,
   paymentPeriod,
+  SubscriptionInactiveException,
   subscriptionStatus,
+  subscriptionSummary,
   trialEndsAt,
 } from '../src/common/subscription';
 import { PlatformAdminsService } from '../src/platform/platform-admins.service';
+import { ImpersonationReadOnlyGuard } from '../src/common/guards/impersonation-read-only.guard';
+import { ForbiddenException } from '@nestjs/common';
+import {
+  base32Decode,
+  base32Encode,
+  decryptTotpSecret,
+  encryptTotpSecret,
+  otpauthUrl,
+  totpCode,
+  verifyTotp,
+} from '../src/common/totp';
 import { PlatformAuditService } from '../src/platform/platform-audit.service';
+import { PlatformAuthService } from '../src/platform/platform-auth.service';
+import { BusinessController } from '../src/business/business.controller';
+import { BusinessService } from '../src/business/business.service';
 import { SubscriptionRemindersService } from '../src/platform/subscription-reminders.service';
 
 const stub = <T>(impl: unknown) => impl as T;
@@ -773,6 +798,7 @@ async function verifyEmailAlwaysRequiresTheCode() {
       stub<MailService>({}),
       stub<AuditService>({ record: async () => undefined }),
       stub<PrincipalCache>({ evict: () => undefined }),
+      stub<SettingsService>({}),
     );
     return { service, verified: () => markedVerified };
   };
@@ -1316,6 +1342,227 @@ async function aNewStoreOpensCarryingTheCatalog() {
   assert.strictEqual(touched, false, 'no products means no seeding call at all');
 }
 
+/** "View as owner" can read and cannot write -- enforced by the API itself. */
+async function viewAsOwnerIsReadOnly() {
+  const guard = new ImpersonationReadOnlyGuard();
+  const ctx = (method: string, user?: Partial<AuthUser>) =>
+    ({ switchToHttp: () => ({ getRequest: () => ({ method, user }) }) }) as never;
+  const owner: Partial<AuthUser> = { userId: 'u1', businessId: 'b1', role: UserRole.OWNER };
+  const viewing = { ...owner, impersonatedBy: { adminId: 'a1', email: 'a@x.com', expiresAt: '' } };
+
+  for (const m of ['POST', 'PATCH', 'PUT', 'DELETE']) {
+    assert.throws(() => guard.canActivate(ctx(m, viewing)), ForbiddenException, `${m} is refused while viewing`);
+    assert.ok(guard.canActivate(ctx(m, owner)), `${m} still works for the owner themselves`);
+  }
+  for (const m of ['GET', 'HEAD', 'OPTIONS']) {
+    assert.ok(guard.canActivate(ctx(m, viewing)), `${m} is allowed while viewing`);
+  }
+  assert.ok(guard.canActivate(ctx('POST')), 'public routes (no user) are untouched');
+
+  // The full export is a GET, so the guard passes it; the route refuses it
+  // itself. Nothing may be written to the response first.
+  let wrote = false;
+  const res = stub<never>({ setHeader: () => (wrote = true), write: () => (wrote = true), end: () => (wrote = true) });
+  const controller = new BusinessController(
+    stub<BusinessService>({
+      exportNdjson: async function* () {
+        yield '';
+      },
+    }),
+  );
+  await assert.rejects(
+    controller.exportData(viewing as AuthUser, res),
+    ForbiddenException,
+    'the owner export is refused while viewing',
+  );
+  assert.ok(!wrote, 'no headers or rows went out');
+}
+
+/**
+ * Admin two-factor. Checked against RFC 6238's own test vector, because an
+ * off-by-one here passes every round-trip test and fails every real phone.
+ */
+function adminTotpMatchesTheRfc() {
+  // RFC 6238 appendix B, SHA-1: secret "12345678901234567890", T=59s ->
+  // 94287082 (8 digits), so 287082 for 6. T=1111111109 -> 07081804 -> 081804.
+  const secret = base32Encode(Buffer.from('12345678901234567890', 'ascii'));
+  assert.strictEqual(secret, 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ');
+  assert.strictEqual(totpCode(secret, Math.floor(59 / 30)), '287082');
+  assert.strictEqual(totpCode(secret, Math.floor(1111111109 / 30)), '081804', 'leading zeros kept');
+  assert.deepStrictEqual(base32Decode(secret), Buffer.from('12345678901234567890', 'ascii'));
+
+  // One step of drift either way is accepted, and reports which step matched.
+  const now = 1111111109 * 1000;
+  const step = Math.floor(1111111109 / 30);
+  assert.strictEqual(verifyTotp(secret, totpCode(secret, step), now), step);
+  assert.strictEqual(verifyTotp(secret, totpCode(secret, step - 1), now), step - 1);
+  assert.strictEqual(verifyTotp(secret, totpCode(secret, step + 1), now), step + 1);
+  assert.strictEqual(verifyTotp(secret, totpCode(secret, step - 2), now), null, 'a minute old is too old');
+  assert.strictEqual(verifyTotp(secret, ' 081 804 ', now), step, 'spaces people type are ignored');
+  assert.strictEqual(verifyTotp(secret, '12345', now), null);
+  assert.strictEqual(verifyTotp(secret, 'abcdef', now), null);
+
+  // Secrets at rest: round-trip, and tampering is detected rather than
+  // decrypting to garbage.
+  const saved = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = 'j'.repeat(48);
+  try {
+    const stored = encryptTotpSecret(secret);
+    assert.notStrictEqual(stored, secret);
+    assert.ok(!stored.includes(secret), 'the secret is not stored in the clear');
+    assert.strictEqual(decryptTotpSecret(stored), secret);
+    const parts = stored.split(':');
+    const flipped = Buffer.from(parts[3], 'base64');
+    flipped[0] ^= 1;
+    parts[3] = flipped.toString('base64');
+    assert.throws(() => decryptTotpSecret(parts.join(':')), 'a tampered secret does not decrypt');
+    process.env.JWT_SECRET = 'k'.repeat(48);
+    assert.throws(() => decryptTotpSecret(stored), 'a different key does not decrypt it');
+  } finally {
+    if (saved === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = saved;
+  }
+
+  const url = otpauthUrl('admin@platform.com', secret);
+  assert.ok(url.startsWith('otpauth://totp/Inventory%20Admin%3Aadmin%40platform.com?'));
+  assert.ok(url.includes(`secret=${secret}`) && url.includes('issuer=Inventory+Admin'));
+}
+
+/**
+ * Wrong two-factor codes are counted per account. The login route's throttle
+ * is per IP, so without this someone holding the password could spread
+ * guesses across addresses. Also: turning two-factor on ends every other
+ * session, as a password change does.
+ */
+async function adminTotpLocksAfterRepeatedWrongCodes() {
+  const saved = { jwt: process.env.JWT_SECRET, totp: process.env.TOTP_ENCRYPTION_KEY };
+  process.env.JWT_SECRET = 'j'.repeat(48);
+  delete process.env.TOTP_ENCRYPTION_KEY;
+  try {
+    const secret = base32Encode(Buffer.from('12345678901234567890'));
+    const row: any = {
+      id: 'a1',
+      email: 'admin@platform.com',
+      name: 'Admin',
+      role: PlatformRole.ADMIN,
+      isActive: true,
+      passwordHash: '',
+      totpSecret: encryptTotpSecret(secret),
+      totpEnabledAt: new Date(),
+      totpLastStep: null,
+      totpFailedAttempts: 0,
+      totpLockedUntil: null,
+      passwordChangedAt: null,
+    };
+    const apply = (data: any) => {
+      for (const [k, v] of Object.entries(data)) {
+        row[k] = v && typeof v === 'object' && 'increment' in v ? row[k] + (v as any).increment : v;
+      }
+    };
+    const service = new PlatformAuthService(
+      stub<PrismaService>({
+        platformAdmin: {
+          findUnique: async () => ({ ...row }),
+          update: async ({ data }: any) => {
+            apply(data);
+            return { ...row };
+          },
+          updateMany: async ({ data }: any) => {
+            if (row.totpLastStep !== null) return { count: 0 };
+            apply(data);
+            return { count: 1 };
+          },
+        },
+      }),
+      new JwtService({ secret: 'p'.repeat(48) }),
+      stub<PlatformAuditService>({ record: async () => undefined }),
+    );
+    // acceptCode is private; the lock logic is what's under test, not login's
+    // password check (argon2 would need a real hash here).
+    const accept = (code: string) => (service as any).acceptCode(row, code) as Promise<string>;
+    const good = totpCode(secret, Math.floor(Date.now() / 30_000));
+
+    for (let i = 1; i < 5; i++) assert.strictEqual(await accept('000000'), 'wrong', `wrong code ${i}`);
+    assert.strictEqual(await accept('000000'), 'locked', 'the fifth wrong code locks the account');
+    assert.ok(row.totpLockedUntil > new Date(), 'the lock is in the future');
+    assert.strictEqual(await accept(good), 'locked', 'even the right code is refused while locked');
+    assert.strictEqual(row.totpLastStep, null, 'and it is not spent');
+
+    row.totpLockedUntil = new Date(Date.now() - 1000);
+    row.totpFailedAttempts = 3;
+    assert.strictEqual(await accept(good), 'ok', 'the right code works once the lock runs out');
+    assert.strictEqual(row.totpFailedAttempts, 0, 'a right code clears the count');
+    assert.strictEqual(row.totpLockedUntil, null);
+
+    // Enabling: other sessions end, this one gets a fresh token.
+    row.totpEnabledAt = null;
+    row.totpLastStep = null;
+    const next = totpCode(secret, Math.floor(Date.now() / 30_000));
+    const res = await service.enableTwoFactor({ adminId: 'a1', email: row.email, ip: null }, next);
+    assert.ok(res.accessToken, 'enabling returns a token for this session');
+    assert.ok(row.passwordChangedAt instanceof Date, 'and retires the tokens issued before it');
+  } finally {
+    if (saved.jwt === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = saved.jwt;
+    if (saved.totp !== undefined) process.env.TOTP_ENCRYPTION_KEY = saved.totp;
+  }
+}
+
+/**
+ * The grace period and what the shop app is told. A lock-out a day early
+ * stops a paying shop's till; one that never comes gives the app away.
+ */
+function subscriptionGraceAndSummary() {
+  const saved = { grace: process.env.SUBSCRIPTION_GRACE_DAYS, email: process.env.SUPPORT_EMAIL };
+  process.env.SUBSCRIPTION_GRACE_DAYS = '3';
+  process.env.SUPPORT_EMAIL = 'help@example.com';
+  try {
+    const now = new Date('2026-09-24T09:00:00Z');
+    const inDays = (d: number) => new Date(now.getTime() + d * DAY_MS);
+    const biz = (subscribedTo: Date | null, isSubscribed = true) => ({ isSubscribed, subscribedTo });
+
+    // Access: ends at end date + grace, not at the end date.
+    assert.ok(isSubscriptionActive(biz(inDays(-1)), now), 'one day past the end date is inside a 3-day grace');
+    assert.ok(isSubscriptionActive(biz(new Date(inDays(-3).getTime() + 1)), now), 'the last millisecond of grace still works');
+    assert.ok(!isSubscriptionActive(biz(inDays(-3)), now), 'grace over: locked out');
+    assert.ok(!isSubscriptionActive(biz(inDays(30), false), now), 'switched off is locked out whatever the date');
+    assert.ok(isSubscriptionActive(biz(null), now), 'no end date never expires');
+    process.env.SUBSCRIPTION_GRACE_DAYS = '0';
+    assert.ok(!isSubscriptionActive(biz(new Date(now.getTime() - 1)), now), 'grace 0 locks out on the end date');
+    process.env.SUBSCRIPTION_GRACE_DAYS = 'nonsense';
+    assert.ok(isSubscriptionActive(biz(inDays(-2)), now), 'an unparseable grace falls back to the default, not to 0');
+    process.env.SUBSCRIPTION_GRACE_DAYS = '3';
+
+    // The banner the owner sees.
+    assert.strictEqual(subscriptionSummary(biz(inDays(5)), 0, now).status, 'trial');
+    assert.strictEqual(subscriptionSummary(biz(inDays(5)), 0, now).daysLeft, 5);
+    assert.strictEqual(subscriptionSummary(biz(inDays(5)), 2, now).status, 'ending');
+    assert.strictEqual(subscriptionSummary(biz(inDays(40)), 2, now).status, 'active');
+    const grace = subscriptionSummary(biz(inDays(-1)), 2, now);
+    assert.strictEqual(grace.status, 'grace');
+    assert.strictEqual(grace.daysLeft, 2, 'days until the app actually stops, not since it ended');
+    assert.deepStrictEqual((grace as { contact?: object }).contact, { email: 'help@example.com' });
+    assert.strictEqual(subscriptionSummary(biz(null), 0, now).status, 'active', 'no end date: nothing to warn about');
+
+    // The lock-out response carries what the expired screen needs.
+    const body = new SubscriptionInactiveException(biz(inDays(-4))).getResponse() as Record<string, unknown>;
+    assert.strictEqual(body.code, 'SUBSCRIPTION_INACTIVE');
+    assert.strictEqual(body.reason, 'expired');
+    assert.strictEqual(body.endedAt, inDays(-4).toISOString());
+    assert.strictEqual(new SubscriptionInactiveException(biz(null, false)).getStatus(), 401, 'still a 401 for older app builds');
+    assert.strictEqual(
+      (new SubscriptionInactiveException(biz(inDays(9), false)).getResponse() as Record<string, unknown>).reason,
+      'inactive',
+      'switched off reads as inactive, not as expired with a future date',
+    );
+  } finally {
+    if (saved.grace === undefined) delete process.env.SUBSCRIPTION_GRACE_DAYS;
+    else process.env.SUBSCRIPTION_GRACE_DAYS = saved.grace;
+    if (saved.email === undefined) delete process.env.SUPPORT_EMAIL;
+    else process.env.SUPPORT_EMAIL = saved.email;
+  }
+}
+
 /**
  * Manual subscriptions: what the admin panel labels a business, and what a
  * recorded payment does to its paid-until date. Getting this wrong either
@@ -1358,8 +1605,8 @@ function subscriptionRules() {
   );
   assert.deepStrictEqual(seen, [8, 7, 6, 5, 4, 3, 2, 1, 0, -1]);
 
-  const trial = trialEndsAt(now);
-  assert.strictEqual(trial.getTime() - now.getTime(), 14 * DAY_MS, 'default trial is 14 days');
+  const trial = trialEndsAt(14, now);
+  assert.strictEqual(trial.getTime() - now.getTime(), 14 * DAY_MS, 'a 14-day trial ends 14 days on');
 }
 
 /** The admin panel must never be able to lock every admin out. */
@@ -1823,8 +2070,247 @@ function uploadErrorsAreClientErrors() {
   assert.strictEqual(multerErrorToHttp('nope'), null, 'as are non-errors');
 }
 
+/**
+ * The daily emails go out at the shop's own 8am / 9am, from a job that runs
+ * every quarter hour -- so exactly one run a day must match, including in
+ * Nepal, whose +5:45 offset an hourly job at :00 UTC could never hit.
+ */
+function dailyJobsFireAtShopTime() {
+  const ktm = 'Asia/Kathmandu';
+  // 08:00 in Kathmandu is 02:15 UTC.
+  assert.ok(isLocalSlot(ktm, new Date('2026-09-25T02:15:00Z'), 8), '08:00 Nepal matches');
+  assert.ok(!isLocalSlot(ktm, new Date('2026-09-25T02:00:00Z'), 8), '07:45 Nepal does not');
+  assert.ok(!isLocalSlot(ktm, new Date('2026-09-25T02:30:00Z'), 8), '08:15 Nepal is the next slot');
+  assert.ok(!isLocalSlot(ktm, new Date('2026-09-25T08:00:00Z'), 8), 'the server\'s 08:00 is 13:45 there');
+
+  // Walk one whole day of quarter-hour runs: each zone matches exactly once.
+  for (const tz of [ktm, 'UTC', 'Asia/Kolkata', 'America/New_York']) {
+    let hits = 0;
+    for (let q = 0; q < 96; q++) {
+      if (isLocalSlot(tz, new Date(Date.UTC(2026, 8, 25) + q * 15 * 60_000), 8)) hits++;
+    }
+    assert.strictEqual(hits, 1, `${tz}: one digest a day`);
+  }
+
+  // A zone Intl doesn't know falls back to Nepal rather than throwing.
+  assert.ok(isLocalSlot('Not/AZone', new Date('2026-09-25T02:15:00Z'), 8));
+}
+
+/**
+ * `?activeOnly=false` must mean false. The ValidationPipe's implicit
+ * conversion turns the string into `Boolean('false')` -- true -- before a
+ * `@Transform` sees `value`, so the flag was silently inverted and a purchase
+ * line on a deactivated product could not be looked up.
+ */
+function queryFlagsMeanWhatTheySay() {
+  const parse = (q: object) =>
+    plainToInstance(QueryProductDto, q, { enableImplicitConversion: true });
+  const off = parse({ activeOnly: 'false', excludeVariants: 'false', trackSerials: 'false' });
+  assert.strictEqual(off.activeOnly, false, "'false' is false");
+  assert.strictEqual(off.excludeVariants, false);
+  assert.strictEqual(off.trackSerials, false);
+  const on = parse({ activeOnly: 'true', trackSerials: true });
+  assert.strictEqual(on.activeOnly, true);
+  assert.strictEqual(on.trackSerials, true);
+  // Left out, a flag stays unset, so the service's defaults still apply.
+  assert.strictEqual(parse({}).activeOnly, undefined);
+}
+
+/**
+ * `taxInclusive` was stored and editable but pricing always added tax on
+ * top. With it on, the shelf price is what the customer pays: the tax is
+ * backed out of it, and the sale remembers which way it was priced.
+ */
+async function inclusivePricesContainTheirTax() {
+  // The split itself: 113 at 13% is 100 + 13, and net + tax is always the
+  // shelf price even where the tax rounds.
+  assert.deepStrictEqual(splitTax(113, 13, true), { net: 100, tax: 13, total: 113 });
+  assert.deepStrictEqual(splitTax(100, 13, false), { net: 100, tax: 13, total: 113 });
+  const odd = splitTax(100, 13, true);
+  assert.strictEqual(odd.tax, 11.5);
+  assert.strictEqual(Math.round((odd.net + odd.tax) * 100) / 100, 100);
+  assert.deepStrictEqual(splitTax(50, 0, true), { net: 50, tax: 0, total: 50 });
+
+  const products = [
+    { id: 'p1', name: 'Soap', sellingPrice: 113, costPrice: 60, taxRate: 13, isTaxable: true, isActive: true },
+    { id: 'p2', name: 'Rice', sellingPrice: 50, costPrice: 40, taxRate: 13, isTaxable: false, isActive: true },
+  ];
+  const holdWith = async (taxInclusive: boolean) => {
+    let saved: any = null;
+    const prisma = stub<PrismaService>({
+      store: { findFirst: async () => ({ id: 's1' }) },
+      business: { findUnique: async () => ({ taxEnabled: true, taxInclusive }) },
+      product: { findMany: async () => products },
+      sale: {
+        create: async ({ data }: any) => {
+          saved = data;
+          return data;
+        },
+      },
+    });
+    const service = new SalesService(
+      prisma,
+      stub<InventoryService>({}),
+      stub<MailService>({}),
+      stub<ShiftsService>({}),
+      stub<PaymentsService>({}),
+    );
+    await service.hold(user, {
+      items: [
+        { productId: 'p1', quantity: 2 },
+        { productId: 'p2', quantity: 1 },
+      ],
+    } as any);
+    return saved;
+  };
+
+  const incl = await holdWith(true);
+  assert.strictEqual(incl.taxInclusive, true, 'the sale snapshots how it was priced');
+  assert.strictEqual(incl.total, 276, 'the customer pays the shelf prices, 2 x 113 + 50');
+  assert.strictEqual(incl.tax, 26);
+  assert.strictEqual(incl.subtotal, 250);
+  assert.strictEqual(incl.items.create[0].lineTotal, 226);
+  assert.strictEqual(incl.items.create[1].lineTotal, 50, 'untaxed lines are untouched');
+
+  const excl = await holdWith(false);
+  assert.strictEqual(excl.taxInclusive, false);
+  assert.strictEqual(excl.subtotal, 276);
+  assert.strictEqual(excl.tax, 29.38, 'tax on top, as before');
+  assert.strictEqual(excl.total, 305.38);
+}
+
+/**
+ * Admin roles (FEATURES.md section 4): SUPPORT reads, and writes only where
+ * a route says so; the panel always keeps one active full ADMIN.
+ */
+async function supportAdminsAreReadOnly() {
+  const S = PlatformRole.SUPPORT;
+  assert.ok(platformRoleAllows(S, 'GET', {}), 'support can read');
+  assert.ok(!platformRoleAllows(S, 'POST', {}), 'support cannot write by default');
+  assert.ok(!platformRoleAllows(S, 'DELETE', {}));
+  assert.ok(platformRoleAllows(S, 'POST', { supportMayWrite: true }), 'unless the route allows it');
+  assert.ok(!platformRoleAllows(S, 'GET', { adminOnly: true }), 'and never an admin-only read');
+  assert.ok(platformRoleAllows(PlatformRole.ADMIN, 'DELETE', { adminOnly: true }), 'admins can do anything');
+
+  const admins: any[] = [
+    { id: 'a1', email: 'a1@x.com', isActive: true, role: PlatformRole.ADMIN },
+    { id: 's1', email: 's1@x.com', isActive: true, role: PlatformRole.SUPPORT },
+  ];
+  const prisma = stub<PrismaService>({
+    platformAdmin: {
+      findUnique: async ({ where }: any) => admins.find((a) => a.id === where.id) ?? null,
+      count: async ({ where }: any) =>
+        admins.filter(
+          (a) => a.isActive && a.id !== where.id.not && (!where.role || a.role === where.role),
+        ).length,
+      update: async ({ where, data }: any) => Object.assign(admins.find((a) => a.id === where.id)!, data),
+    },
+  });
+  const service = new PlatformAdminsService(prisma, stub<PlatformAuditService>({ record: async () => {} }));
+  const a1 = { adminId: 'a1', email: 'a1@x.com' };
+  const s1 = { adminId: 's1', email: 's1@x.com' };
+
+  await assert.rejects(service.update(a1, 'a1', { role: PlatformRole.SUPPORT }), /your own role/);
+  // An active support account doesn't count: demoting or deactivating the
+  // only full admin would leave nobody able to create another.
+  await assert.rejects(service.update(s1, 'a1', { role: PlatformRole.SUPPORT }), /full admin must remain/);
+  await assert.rejects(service.update(s1, 'a1', { isActive: false }), /full admin must remain/);
+  // Promote s1, and then a1 can step down.
+  await service.update(a1, 's1', { role: PlatformRole.ADMIN });
+  await service.update(s1, 'a1', { role: PlatformRole.SUPPORT });
+  assert.strictEqual(admins[0].role, PlatformRole.SUPPORT);
+}
+
+/** Invite-only signup refuses the public form; the trial length follows the setting. */
+async function signupFollowsThePlatformSettings() {
+  const withSettings = (row: Partial<{ signupOpen: boolean; trialDays: number | null }>) => {
+    const prisma = stub<PrismaService>({
+      platformSettings: {
+        upsert: async () => ({ id: 1, signupOpen: true, trialDays: null, ...row }),
+      },
+    });
+    return new SettingsService(prisma);
+  };
+  const closed = new AuthService(
+    stub<PrismaService>({}),
+    stub<JwtService>({}),
+    stub<MailService>({}),
+    stub<AuditService>({}),
+    stub<PrincipalCache>({}),
+    withSettings({ signupOpen: false }),
+  );
+  await assert.rejects(
+    closed.register({ email: 'x@y.com', password: 'password123', name: 'X', businessName: 'Shop' } as any),
+    (e: any) => e.getResponse?.().code === 'SIGNUP_CLOSED',
+    'a closed signup is refused before anything is written',
+  );
+
+  const saved = process.env.TRIAL_DAYS;
+  process.env.TRIAL_DAYS = '21';
+  try {
+    assert.strictEqual(await withSettings({}).trialDays(), 21, 'unset falls back to env TRIAL_DAYS');
+    assert.strictEqual(await withSettings({ trialDays: 30 }).trialDays(), 30, 'the setting wins');
+    assert.strictEqual(await withSettings({ trialDays: 0 }).trialDays(), 0, 'zero is a real value');
+  } finally {
+    if (saved === undefined) delete process.env.TRIAL_DAYS;
+    else process.env.TRIAL_DAYS = saved;
+  }
+}
+
+/** Retention deletes only entries past the cut-off, and nothing when it's off. */
+async function logRetentionRemovesOnlyOldEntries() {
+  const now = new Date('2026-09-24T00:00:00Z');
+  const DAY = 24 * 60 * 60 * 1000;
+  let rows = Array.from({ length: 12 }, (_, i) => ({ id: `l${i}`, createdAt: new Date(now.getTime() - i * 30 * DAY) }));
+  const prisma = stub<PrismaService>({
+    auditLog: {
+      findMany: async ({ where, take }: any) =>
+        rows.filter((r) => r.createdAt < where.createdAt.lt).slice(0, take).map((r) => ({ id: r.id })),
+      deleteMany: async ({ where }: any) => {
+        const before = rows.length;
+        rows = rows.filter((r) => !where.id.in.includes(r.id));
+        return { count: before - rows.length };
+      },
+    },
+  });
+  const cronWith = (auditRetentionDays: number | null) =>
+    new LogRetentionCron(prisma, stub<SettingsService>({ get: async () => ({ auditRetentionDays }) }));
+
+  assert.strictEqual(await cronWith(null).run(now), 'retention off');
+  assert.strictEqual(rows.length, 12, 'off means nothing is removed');
+  await cronWith(90).run(now);
+  // Ages 0, 30, 60, 90 days are kept (90 is not older than the cut-off).
+  assert.deepStrictEqual(rows.map((r) => r.id), ['l0', 'l1', 'l2', 'l3']);
+}
+
+/** In the shop, owners and managers see every ticket; other staff only their own. */
+async function staffSeeOnlyTheirOwnTickets() {
+  const wheres: any[] = [];
+  const prisma = stub<PrismaService>({
+    supportTicket: {
+      findMany: async ({ where }: any) => {
+        wheres.push(where);
+        return [];
+      },
+      count: async () => 0,
+    },
+  });
+  const service = new SupportService(prisma, stub<MailService>({}), stub<PlatformAuditService>({}));
+  const q = Object.assign(new QueryTicketsDto(), { page: 1, limit: 20 });
+  await service.listForShop({ ...user, role: UserRole.CASHIER }, q);
+  await service.listForShop({ ...user, role: UserRole.OWNER }, q);
+  assert.deepStrictEqual(wheres[0], { businessId: 'b1', userId: 'u1' }, 'a cashier sees their own');
+  assert.deepStrictEqual(wheres[1], { businessId: 'b1' }, 'an owner sees the whole business');
+}
+
 async function main() {
   subscriptionRules();
+  dailyJobsFireAtShopTime();
+  queryFlagsMeanWhatTheySay();
+  subscriptionGraceAndSummary();
+  adminTotpMatchesTheRfc();
+  await adminTotpLocksAfterRepeatedWrongCodes();
+  await viewAsOwnerIsReadOnly();
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
   await shiftReportBalancesTheDrawer();
@@ -1852,6 +2338,11 @@ async function main() {
   await productStoresCannotSilentlyWriteOffStock();
   await anAdminPasswordResetEndsTheirSessions();
   await aNewStoreOpensCarryingTheCatalog();
+  await inclusivePricesContainTheirTax();
+  await supportAdminsAreReadOnly();
+  await signupFollowsThePlatformSettings();
+  await logRetentionRemovesOnlyOldEntries();
+  await staffSeeOnlyTheirOwnTickets();
   console.log('checks passed');
 }
 

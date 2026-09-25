@@ -9,6 +9,7 @@ import { BusinessType, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { SettingsService } from '../settings/settings.service';
 import { MailService } from '../mail/mail.service';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { normalizeEmail } from '../common/email';
@@ -21,10 +22,15 @@ import {
   trialEndsAt,
 } from '../common/subscription';
 import { Actor, PlatformAuditService } from './platform-audit.service';
+import { BusinessService } from '../business/business.service';
+import { AuthService } from '../auth/auth.service';
+import { isSubscriptionActive } from '../common/subscription';
 import { SubscriptionRemindersService } from './subscription-reminders.service';
 import {
   BusinessSort,
   CreateBusinessDto,
+  CreateBusinessNoteDto,
+  DeleteBusinessDto,
   QueryBusinessesDto,
   RecordPaymentDto,
   SubscriptionFilter,
@@ -92,6 +98,9 @@ export class PlatformService {
     private mail: MailService,
     private audit: PlatformAuditService,
     private reminders: SubscriptionRemindersService,
+    private business: BusinessService,
+    private auth: AuthService,
+    private settings: SettingsService,
   ) {}
 
   /** Platform-wide totals for the admin dashboard. */
@@ -200,11 +209,33 @@ export class PlatformService {
       }),
       this.prisma.business.count({ where }),
     ]);
+    const lastActive = await this.lastActive(rows.map((b) => b.id));
     const data = rows.map((b) => ({
       ...b,
       subscriptionStatus: subscriptionStatus(b, b._count.subscriptionPayments, now, q.days),
+      lastActiveAt: lastActive.get(b.id) ?? null,
     }));
     return paginate(data, total, q.page, q.limit);
+  }
+
+  /**
+   * When each business was last used: its latest sign-in or its latest sale,
+   * whichever is later. A shop that stays signed in on one till for weeks
+   * never logs in again, so sign-ins alone would call a busy shop idle.
+   * GREATEST skips NULLs, so either one is enough.
+   */
+  private async lastActive(ids: string[]): Promise<Map<string, Date | null>> {
+    if (ids.length === 0) return new Map();
+    const rows = await this.prisma.$queryRaw<{ id: string; at: Date | null }[]>`
+      SELECT b.id, GREATEST(
+        (SELECT MAX(a."createdAt") FROM "AuditLog" a
+          WHERE a."businessId" = b.id AND a.action = 'auth.login'),
+        (SELECT MAX(s."createdAt") FROM "Sale" s WHERE s."businessId" = b.id)
+      ) AS at
+      FROM "Business" b
+      WHERE b.id IN (${Prisma.join(ids)})
+    `;
+    return new Map(rows.map((r) => [r.id, r.at]));
   }
 
   /** Full detail for one business: profile, users, totals, recent sales. */
@@ -260,8 +291,10 @@ export class PlatformService {
       },
     });
 
+    const lastActive = await this.lastActive([id]);
     return {
       ...business,
+      lastActiveAt: lastActive.get(id) ?? null,
       subscriptionStatus: subscriptionStatus(business, business._count.subscriptionPayments),
       totalSalesValue: round2(Number(salesAgg._sum.total ?? 0)),
       totalTransactions: salesAgg._count,
@@ -283,6 +316,7 @@ export class PlatformService {
     // can only be entered through the reset flow the invite points to.
     const passwordHash = await argon2.hash(dto.password ?? randomBytes(32).toString('hex'));
 
+    const trialDays = await this.settings.trialDays();
     const { business, owner } = await this.prisma.$transaction(async (tx) => {
       const business = await tx.business.create({
         data: {
@@ -290,7 +324,9 @@ export class PlatformService {
           type: dto.type ?? BusinessType.OTHER,
           ...(dto.salesModel ? { salesModel: dto.salesModel } : {}),
           ...(dto.currency ? { currency: dto.currency.toUpperCase() } : {}),
-          subscribedTo: dto.subscribedTo ? new Date(dto.subscribedTo) : trialEndsAt(),
+          subscribedTo: dto.subscribedTo
+            ? new Date(dto.subscribedTo)
+            : trialEndsAt(trialDays),
         },
       });
       const store = await tx.store.create({
@@ -483,6 +519,293 @@ export class PlatformService {
   }
 
   // ---- Per-business drill-downs (super-admin) ----
+
+  // ---- More read-only business tabs ----
+  // Each is written to the admin log like the customers tab: the query and
+  // the size of the answer, never the rows.
+
+  /** Products with their total on hand across every store. */
+  async businessProducts(actor: Actor, businessId: string, q: PaginationDto) {
+    await this.getBusinessOrThrow(businessId);
+    const where: Prisma.ProductWhereInput = {
+      businessId,
+      // Variant parents hold no stock of their own; their variants are listed.
+      variants: { none: {} },
+      ...(q.search
+        ? {
+            OR: [
+              { name: { contains: q.search, mode: 'insensitive' } },
+              { sku: { contains: q.search, mode: 'insensitive' } },
+              { barcode: { contains: q.search, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+    const [rows, total] = await Promise.all([
+      this.prisma.product.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { name: 'asc' },
+        select: {
+          id: true,
+          name: true,
+          variantName: true,
+          sku: true,
+          unit: true,
+          costPrice: true,
+          sellingPrice: true,
+          reorderLevel: true,
+          isActive: true,
+        },
+      }),
+      this.prisma.product.count({ where }),
+    ]);
+    const stock = await this.prisma.stockItem.groupBy({
+      by: ['productId'],
+      where: { productId: { in: rows.map((r) => r.id) } },
+      _sum: { quantity: true },
+    });
+    const onHand = new Map(stock.map((s) => [s.productId, Number(s._sum.quantity ?? 0)]));
+    const data = rows.map((r) => ({ ...r, onHand: onHand.get(r.id) ?? 0 }));
+    await this.audit.record(actor, 'business.products.view', {
+      businessId,
+      details: { search: q.search ?? null, page: q.page, returned: data.length, total },
+    });
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  async businessPurchases(actor: Actor, businessId: string, q: PaginationDto) {
+    await this.getBusinessOrThrow(businessId);
+    const where: Prisma.PurchaseWhereInput = {
+      businessId,
+      ...(q.search
+        ? {
+            OR: [
+              { reference: { contains: q.search, mode: 'insensitive' } },
+              { supplier: { name: { contains: q.search, mode: 'insensitive' } } },
+            ],
+          }
+        : {}),
+    };
+    const [data, total] = await Promise.all([
+      this.prisma.purchase.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          reference: true,
+          status: true,
+          total: true,
+          amountPaid: true,
+          createdAt: true,
+          receivedAt: true,
+          supplier: { select: { name: true } },
+          store: { select: { name: true } },
+          _count: { select: { items: true } },
+        },
+      }),
+      this.prisma.purchase.count({ where }),
+    ]);
+    await this.audit.record(actor, 'business.purchases.view', {
+      businessId,
+      details: { search: q.search ?? null, page: q.page, returned: data.length, total },
+    });
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  async businessShifts(actor: Actor, businessId: string, q: PaginationDto) {
+    await this.getBusinessOrThrow(businessId);
+    const where: Prisma.ShiftWhereInput = { businessId };
+    const [data, total] = await Promise.all([
+      this.prisma.shift.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { openedAt: 'desc' },
+        select: {
+          id: true,
+          openedAt: true,
+          closedAt: true,
+          openingFloat: true,
+          expectedCash: true,
+          countedCash: true,
+          variance: true,
+          store: { select: { name: true } },
+          user: { select: { name: true } },
+          _count: { select: { sales: true } },
+        },
+      }),
+      this.prisma.shift.count({ where }),
+    ]);
+    await this.audit.record(actor, 'business.shifts.view', {
+      businessId,
+      details: { page: q.page, returned: data.length, total },
+    });
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  // ---- Internal notes ----
+
+  async listNotes(businessId: string) {
+    await this.getBusinessOrThrow(businessId);
+    return this.prisma.businessNote.findMany({
+      where: { businessId },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      select: {
+        id: true,
+        body: true,
+        adminEmail: true,
+        createdAt: true,
+        admin: { select: { id: true, name: true } },
+      },
+    });
+  }
+
+  async addNote(actor: Actor, businessId: string, dto: CreateBusinessNoteDto) {
+    await this.getBusinessOrThrow(businessId);
+    const body = dto.body.trim();
+    if (!body) throw new BadRequestException('A note needs some text');
+    const note = await this.prisma.businessNote.create({
+      data: { businessId, adminId: actor.adminId, adminEmail: actor.email, body },
+      select: {
+        id: true,
+        body: true,
+        adminEmail: true,
+        createdAt: true,
+        admin: { select: { id: true, name: true } },
+      },
+    });
+    await this.audit.record(actor, 'business.note.add', {
+      businessId,
+      details: { noteId: note.id },
+    });
+    return note;
+  }
+
+  async deleteNote(actor: Actor, businessId: string, noteId: string) {
+    const { count } = await this.prisma.businessNote.deleteMany({
+      where: { id: noteId, businessId },
+    });
+    if (count === 0) throw new NotFoundException('Note not found');
+    await this.audit.record(actor, 'business.note.delete', {
+      businessId,
+      details: { noteId },
+    });
+    return { deleted: true };
+  }
+
+  // ---- View as owner ----
+
+  /**
+   * Open the shop app as the business's owner: read-only, for 30 minutes, in
+   * a new tab. For support calls where "what do you see?" is quicker to
+   * answer by looking.
+   *
+   * The token goes in the URL's #fragment, which browsers never send to a
+   * server, so it stays out of access logs and Referer headers.
+   */
+  async impersonate(actor: Actor, businessId: string) {
+    const b = await this.prisma.business.findUnique({
+      where: { id: businessId },
+      select: { id: true, name: true, isSuspended: true, isSubscribed: true, subscribedTo: true },
+    });
+    if (!b) throw new NotFoundException('Business not found');
+    // The shop app would refuse the session for these anyway, with an error
+    // aimed at the shop rather than the admin.
+    if (b.isSuspended) throw new BadRequestException('The business is suspended, so its app is locked');
+    if (!isSubscriptionActive(b)) {
+      throw new BadRequestException('The subscription has lapsed, so its app is locked');
+    }
+    const owner = await this.prisma.user.findFirst({
+      where: { businessId, role: UserRole.OWNER, isActive: true, emailVerified: true },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, name: true, email: true, businessId: true, tokenVersion: true },
+    });
+    if (!owner) throw new BadRequestException('The business has no active, verified owner to view as');
+
+    const base =
+      process.env.SHOP_APP_URL?.trim() ||
+      (process.env.NODE_ENV === 'production' ? null : 'http://localhost:5173');
+    if (!base) throw new BadRequestException('SHOP_APP_URL is not set on the API');
+
+    // adminId is null only for a failed login; this route requires a signed-in admin.
+    const { token, expiresAt } = this.auth.issueImpersonationToken(owner, {
+      adminId: actor.adminId!,
+      email: actor.email,
+    });
+    await this.audit.record(actor, 'business.impersonate', {
+      businessId,
+      targetUserId: owner.id,
+      details: { owner: owner.email, expiresAt: expiresAt.toISOString() },
+    });
+    return {
+      url: `${base.replace(/\/+$/, '')}/impersonate#token=${encodeURIComponent(token)}`,
+      expiresAt,
+      owner: { name: owner.name, email: owner.email },
+    };
+  }
+
+  // ---- Export and deletion ----
+
+  /**
+   * Everything the business holds, as NDJSON -- the same export an owner can
+   * download, for a deletion request or a shop leaving. Logged before the
+   * first byte goes out: it is the largest read of tenant data there is.
+   */
+  async exportBusiness(actor: Actor, businessId: string) {
+    const b = await this.getBusinessOrThrow(businessId);
+    await this.audit.record(actor, 'business.export', { businessId });
+    return { name: b.name, chunks: this.business.exportNdjson(businessId) };
+  }
+
+  /**
+   * Delete a business and everything in it, for test and spam signups and
+   * deletion requests. The admin types the business name to confirm.
+   *
+   * Not a single `business.delete`: six foreign keys are RESTRICT (sale and
+   * purchase lines to products; sales, purchases and shifts to stores and
+   * users), and Postgres checks RESTRICT as the cascade reaches each row, so
+   * a business with any sales would fail partway through the cascade. Those
+   * rows go first, explicitly, and the whole thing is one transaction.
+   *
+   * The log entry carries the name and the counts, not a businessId: the row
+   * it would point at is gone, and earlier entries for the business lose
+   * their link the same way (SET NULL).
+   */
+  async deleteBusiness(actor: Actor, businessId: string, dto: DeleteBusinessDto) {
+    const b = await this.prisma.business.findUnique({
+      where: { id: businessId },
+      select: {
+        id: true,
+        name: true,
+        _count: {
+          select: { users: true, stores: true, products: true, customers: true, sales: true },
+        },
+      },
+    });
+    if (!b) throw new NotFoundException('Business not found');
+    if (dto.confirmName.trim() !== b.name.trim()) {
+      throw new BadRequestException('Type the business name exactly as shown to confirm');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.saleItem.deleteMany({ where: { sale: { businessId } } });
+      await tx.purchaseItem.deleteMany({ where: { purchase: { businessId } } });
+      await tx.sale.deleteMany({ where: { businessId } });
+      await tx.purchase.deleteMany({ where: { businessId } });
+      await tx.shift.deleteMany({ where: { businessId } });
+      await tx.business.delete({ where: { id: businessId } });
+    }, { ...TX_OPTS, timeout: 120_000 });
+
+    await this.audit.record(actor, 'business.delete', {
+      details: { businessId, name: b.name, counts: b._count },
+    });
+    return { deleted: true, name: b.name };
+  }
 
   /** Customers of a business, paginated. */
   async businessCustomers(actor: Actor, businessId: string, q: PaginationDto) {

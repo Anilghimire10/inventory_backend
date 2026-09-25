@@ -123,17 +123,31 @@ enum NotificationType {
 // Platform-level operator (super-admin). NOT a tenant user — sees/manages
 // every business. Lives outside the businessId tenancy boundary.
 model PlatformAdmin {
-  id                String    @id @default(cuid())
-  email             String    @unique
-  passwordHash      String
-  name              String
-  isActive          Boolean   @default(true)
-  passwordChangedAt DateTime? // tokens issued before this are rejected
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  id                 String       @id @default(cuid())
+  email              String       @unique
+  passwordHash       String
+  name               String
+  isActive           Boolean      @default(true)
+  /// ADMIN can change anything; SUPPORT reads, views as owner and answers
+  /// support tickets (see PlatformAuthGuard).
+  role               PlatformRole @default(ADMIN)
+  passwordChangedAt  DateTime? // tokens issued before this are rejected
+  /// Two-factor sign-in (TOTP). The secret is AES-GCM encrypted (common/totp.ts).
+  /// Set but not enabled = enrolment started, not yet confirmed with a code.
+  totpSecret         String?
+  totpEnabledAt      DateTime?
+  /// Last 30-second step a code was accepted for, so no code works twice.
+  totpLastStep       Int?
+  /// Wrong codes in a row; reaching the limit sets totpLockedUntil.
+  totpFailedAttempts Int          @default(0)
+  totpLockedUntil    DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
 
   paymentsRecorded SubscriptionPayment[]
   auditLogs        PlatformAuditLog[]
+  businessNotes    BusinessNote[]
+  supportMessages  SupportMessage[]
 }
 
 model Business {
@@ -147,7 +161,7 @@ model Business {
   timezone        String       @default("Asia/Kathmandu")
   taxId           String? // PAN/VAT registration number
   showTaxIdOnBill Boolean      @default(false) // when on, the PAN/VAT number prints on bills
-  taxInclusive    Boolean      @default(false)
+  taxInclusive    Boolean      @default(false) // selling prices include tax (backed out at sale time)
   taxEnabled      Boolean      @default(true) // master switch: when off, no sale charges tax
   isSuspended     Boolean      @default(false) // suspended by a platform admin
   suspendedReason String? // shown to the business's users when sign-in is refused
@@ -159,6 +173,8 @@ model Business {
 
   subscriptionPayments SubscriptionPayment[]
   platformAuditLogs    PlatformAuditLog[]
+  adminNotes           BusinessNote[]
+  emailLogs            EmailLog[]
 
   stores         Store[]
   users          User[]
@@ -174,6 +190,7 @@ model Business {
   batches        Batch[]
   notifications  Notification[]
   auditLogs      AuditLog[]
+  supportTickets SupportTicket[]
   shifts         Shift[]
   payments       Payment[]
   serials        Serial[]
@@ -229,6 +246,7 @@ model User {
   stockMovements StockMovement[]
   emailTokens    EmailToken[]
   auditLogs      AuditLog[]
+  supportTickets SupportTicket[]
   payments       Payment[]
   shifts         Shift[]
 
@@ -472,9 +490,9 @@ model Purchase {
   createdAt  DateTime       @default(now())
   updatedAt  DateTime       @updatedAt
 
-  items   PurchaseItem[]
+  items    PurchaseItem[]
   payments Payment[]
-  serials Serial[]
+  serials  Serial[]
 
   @@index([businessId])
   @@index([storeId])
@@ -510,7 +528,7 @@ model Customer {
   updatedAt     DateTime @updatedAt
 
   payments Payment[]
-  sales Sale[]
+  sales    Sale[]
 
   @@index([businessId])
 }
@@ -535,6 +553,11 @@ model Sale {
   discount        Decimal       @default(0) @db.Decimal(12, 2)
   tax             Decimal       @default(0) @db.Decimal(12, 2)
   total           Decimal       @default(0) @db.Decimal(12, 2)
+  // Snapshot of Business.taxInclusive when the sale was priced. When true,
+  // each line's unitPrice already contains its tax, so net is backed out of
+  // it rather than tax being added on top. Snapshotted so flipping the
+  // setting never re-reads old sales.
+  taxInclusive    Boolean       @default(false)
   // Money handed back on returns against this sale. Revenue is
   // `total - refundedTotal`, which is why a part return no longer has to
   // exclude the whole sale from the books to avoid overstating it.
@@ -546,9 +569,9 @@ model Sale {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
-  items   SaleItem[]
+  items    SaleItem[]
   payments Payment[]
-  serials Serial[]
+  serials  Serial[]
 
   @@unique([businessId, receiptNo])
   @@index([businessId])
@@ -633,16 +656,16 @@ model Shift {
 /// replace. What changes is that every write to one is now accompanied by a
 /// row here, in the same transaction, so the two can always be reconciled.
 model Payment {
-  id         String      @id @default(cuid())
+  id         String        @id @default(cuid())
   businessId String
-  business   Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business   Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
   /// Where the money changed hands. Null for payments not made at a till.
   storeId    String?
-  store      Store?      @relation(fields: [storeId], references: [id])
+  store      Store?        @relation(fields: [storeId], references: [id])
   type       PaymentType
   /// Always positive — what physically changed hands. See PaymentType for
   /// which direction each type moves.
-  amount     Decimal     @db.Decimal(12, 2)
+  amount     Decimal       @db.Decimal(12, 2)
   method     PaymentMethod
 
   /// Whichever of these the payment concerns; the rest are null.
@@ -719,6 +742,8 @@ model AuditLog {
 
   @@index([businessId, createdAt])
   @@index([userId])
+  // Retention deletes by age across every business (PlatformSettings).
+  @@index([createdAt])
 }
 
 // ---------- Platform (super-admin) ----------
@@ -745,6 +770,48 @@ model SubscriptionPayment {
 
 // What platform admins did. Separate from AuditLog, which belongs to one
 // business and records its own users.
+/// What happened to an email once the app tried to send it.
+enum EmailStatus {
+  SENT // accepted by Resend
+  FAILED // refused by Resend, or the request never got there
+  LOGGED // MAIL_TRANSPORT=log: written to the app log, nothing sent
+}
+
+/// One row per email the app tried to send, so "I never got my code" has an
+/// answer: whether it went, when, and what Resend said if it didn't. The
+/// message body isn't kept -- it holds one-time codes.
+model EmailLog {
+  id         String      @id @default(cuid())
+  to         String
+  /// verification, password-reset, receipt, low-stock, invite, subscription-reminder
+  type       String
+  subject    String
+  status     EmailStatus
+  error      String?
+  /// Whose email it was, when known. SET NULL, so the log outlives the business.
+  businessId String?
+  business   Business?   @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  createdAt  DateTime    @default(now())
+
+  @@index([createdAt])
+  @@index([to, createdAt])
+}
+
+/// An admin's note on a business -- calls, payment promises, setup details.
+/// Platform-internal: nothing in the shop app reads it.
+model BusinessNote {
+  id         String         @id @default(cuid())
+  businessId String
+  business   Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  adminId    String?
+  admin      PlatformAdmin? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  adminEmail String // snapshot, so the note outlives the admin account
+  body       String
+  createdAt  DateTime       @default(now())
+
+  @@index([businessId, createdAt])
+}
+
 model PlatformAuditLog {
   id           String         @id @default(cuid())
   adminId      String?
@@ -760,4 +827,72 @@ model PlatformAuditLog {
 
   @@index([createdAt])
   @@index([businessId, createdAt])
+}
+
+/// Who a platform admin is. See PlatformAdmin.role.
+enum PlatformRole {
+  ADMIN
+  SUPPORT
+}
+
+enum SupportTicketStatus {
+  OPEN
+  CLOSED
+}
+
+/// A question or feedback from a shop, answered from the admin panel.
+model SupportTicket {
+  id            String              @id @default(cuid())
+  businessId    String
+  business      Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  /// Who raised it. SET NULL with a snapshot, so the ticket outlives the user.
+  userId        String?
+  user          User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userName      String
+  userEmail     String
+  subject       String
+  status        SupportTicketStatus @default(OPEN)
+  /// Bumped by every message, so both inboxes sort by the latest activity.
+  lastMessageAt DateTime            @default(now())
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  messages SupportMessage[]
+
+  @@index([status, lastMessageAt])
+  @@index([businessId, lastMessageAt])
+}
+
+/// One message in a ticket's thread, from the shop or from an admin.
+model SupportMessage {
+  id         String         @id @default(cuid())
+  ticketId   String
+  ticket     SupportTicket  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  fromAdmin  Boolean
+  /// Set on admin replies. SET NULL with the email kept, like BusinessNote.
+  adminId    String?
+  admin      PlatformAdmin? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  authorName String
+  body       String
+  createdAt  DateTime       @default(now())
+
+  @@index([ticketId, createdAt])
+}
+
+/// Platform-wide settings edited from the admin panel. A single row (id 1),
+/// created on first read.
+model PlatformSettings {
+  id                 Int      @id @default(1)
+  /// Free trial for new signups, in days. Null falls back to env TRIAL_DAYS.
+  trialDays          Int?
+  /// When false, the public register form is closed; admins still create
+  /// businesses from the panel (2C.5).
+  signupOpen         Boolean  @default(true)
+  /// Shown as a banner across the shop app (and its sign-in page) while set.
+  maintenanceMessage String?
+  /// Shop activity-log (AuditLog) entries older than this are deleted daily.
+  /// Null keeps them forever.
+  auditRetentionDays Int?
+  updatedAt          DateTime @updatedAt
+  updatedBy          String? // admin email snapshot
 }

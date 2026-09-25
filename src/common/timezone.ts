@@ -122,6 +122,27 @@ export function hourOfDay(tz: string, at: Date): number {
   return wallClock(tz, at).hour;
 }
 
+/**
+ * Whether `at` falls in the first `slotMinutes` of `hour` on the wall clock in
+ * `tz` -- "is it 8am there yet, and is this the run that should act on it?".
+ *
+ * For jobs that run every `slotMinutes` and must fire once per business at a
+ * local hour. The slot has to be a quarter hour, not a whole one: Nepal is
+ * UTC+5:45, so an hourly job at :00 UTC only ever sees 8:45 in Kathmandu.
+ * Every real offset is a multiple of 15 minutes, so a 15-minute schedule
+ * lands exactly on the hour everywhere, and exactly one run matches per day.
+ * An unknown zone falls back to Nepal, like the reports do.
+ */
+export function isLocalSlot(tz: string, at: Date, hour: number, slotMinutes = 15): boolean {
+  let w: WallClock;
+  try {
+    w = wallClock(tz, at);
+  } catch {
+    w = wallClock(DEFAULT_TIMEZONE, at);
+  }
+  return w.hour === hour && w.minute < slotMinutes;
+}
+
 /** The instant local midnight began for the day `at` falls on in `tz`. */
 export function startOfDay(tz: string, at: Date = new Date()): Date {
   const w = wallClock(tz, at);

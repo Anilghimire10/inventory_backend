@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   UnauthorizedException,
@@ -10,9 +11,15 @@ import { BusinessType, EmailTokenType, UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { createHash, randomInt } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { SettingsService } from '../settings/settings.service';
 import { MailService } from '../mail/mail.service';
 import { AuditService } from '../audit/audit.service';
-import { isSubscriptionActive, trialEndsAt } from '../common/subscription';
+import {
+  isSubscriptionActive,
+  SubscriptionInactiveException,
+  subscriptionSummary,
+  trialEndsAt,
+} from '../common/subscription';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import {
@@ -50,6 +57,7 @@ export class AuthService {
     private mail: MailService,
     private audit: AuditService,
     private principals: PrincipalCache,
+    private settings: SettingsService,
   ) {}
 
   /**
@@ -60,6 +68,17 @@ export class AuthService {
    * Then emails a verification code. Login is blocked until the email is verified.
    */
   async register(dto: RegisterDto) {
+    // Invite-only (admin panel → Settings): shops are created from the panel.
+    const { signupOpen } = await this.settings.get();
+    if (!signupOpen) {
+      throw new ForbiddenException({
+        statusCode: 403,
+        error: 'Forbidden',
+        code: 'SIGNUP_CLOSED',
+        message: 'New sign-ups are by invitation only at the moment. Contact us to get an account.',
+      });
+    }
+    const trialDays = await this.settings.trialDays();
     const email = normalizeEmail(dto.email);
     const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) throw new ConflictException('Email already in use');
@@ -74,7 +93,7 @@ export class AuthService {
           ...(dto.salesModel ? { salesModel: dto.salesModel } : {}),
           ...(dto.currency ? { currency: dto.currency.toUpperCase() } : {}),
           // Every signup starts on a trial; an admin extends it once paid.
-          subscribedTo: trialEndsAt(),
+          subscribedTo: trialEndsAt(trialDays),
         },
       });
       const store = await tx.store.create({
@@ -208,9 +227,7 @@ export class AuthService {
       throw new UnauthorizedException(suspendedMessage(user.business.suspendedReason));
     }
     if (!isSubscriptionActive(user.business)) {
-      throw new UnauthorizedException(
-        'Your subscription is inactive. Please renew to continue.',
-      );
+      throw new SubscriptionInactiveException(user.business);
     }
 
     void this.audit.record({
@@ -326,9 +343,19 @@ export class AuthService {
       const { isSubscribed, subscribedTo, isSuspended, ...restrictedBusiness } =
         safe.business;
       safe.business = restrictedBusiness as typeof safe.business;
+      return safe;
     }
 
-    return safe;
+    // Where the subscription stands, for the shop app's trial / renewal
+    // banner. Owners and managers only, same as the raw fields above: they
+    // are the ones who can act on it.
+    const paymentCount = await this.prisma.subscriptionPayment.count({
+      where: { businessId: user.businessId },
+    });
+    return {
+      ...safe,
+      subscription: subscriptionSummary(user.business, paymentCount),
+    };
   }
 
   // ----- One-time code helpers -----
@@ -412,6 +439,30 @@ export class AuthService {
       data: { attempts: { increment: 1 } },
     });
     return false;
+  }
+
+  /**
+   * A short-lived, read-only session as a shop's owner, for a platform admin
+   * ("view as owner"). The `imp` claim is what makes it read-only and what the
+   * strategy re-checks on every request: the admin must still be active.
+   * Signed with the shop's own key, so it is an ordinary shop token in every
+   * other respect -- including being revoked by the owner's password change.
+   */
+  issueImpersonationToken(
+    owner: { id: string; businessId: string; tokenVersion: number },
+    admin: { adminId: string; email: string },
+    minutes = 30,
+  ) {
+    const token = this.jwt.sign(
+      {
+        sub: owner.id,
+        businessId: owner.businessId,
+        tv: owner.tokenVersion,
+        imp: { adminId: admin.adminId, email: admin.email },
+      },
+      { expiresIn: `${minutes}m` },
+    );
+    return { token, expiresAt: new Date(Date.now() + minutes * 60_000) };
   }
 
   private issueToken(

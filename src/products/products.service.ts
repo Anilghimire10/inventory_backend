@@ -103,6 +103,7 @@ export class ProductsService {
       ...(q.ids?.length ? { id: { in: q.ids } } : {}),
       ...(q.parentId ? { parentId: q.parentId } : {}),
       ...(q.excludeVariants ? { parentId: null } : {}),
+      ...(q.trackSerials ? { trackSerials: true } : {}),
       ...(q.search
         ? {
             OR: [

@@ -7,6 +7,8 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { splitTax } from '../common/tax';
+import { utcBound } from '../common/sql-time';
 import {
   DEFAULT_TIMEZONE,
   addDays,
@@ -52,8 +54,15 @@ const num = (v: Prisma.Decimal | bigint | number | null | undefined) =>
 /** Units on a line that were kept, i.e. not handed back. */
 const SOLD_QTY = Prisma.sql`(si.quantity - si."returnedQty")`;
 
-/** What those units brought in, before tax. */
-const LINE_REVENUE = Prisma.sql`${SOLD_QTY} * si."unitPrice"`;
+/**
+ * What those units brought in, before tax.
+ *
+ * On a tax-inclusive sale the unit price already holds the tax, so it is
+ * scaled back to its pre-tax part; `taxRate` is 0 on untaxed lines, where
+ * the factor is 1.
+ */
+const LINE_REVENUE = Prisma.sql`${SOLD_QTY} * si."unitPrice"
+  * CASE WHEN s."taxInclusive" THEN 100 / (100 + si."taxRate") ELSE 1 END`;
 
 /**
  * What those units cost.
@@ -124,8 +133,8 @@ export class ReportsService {
       ${col('businessId')} = ${businessId}
       AND ${col('status')} <> ${SaleStatus.HELD}::"SaleStatus"
       ${opts.storeId ? Prisma.sql`AND ${col('storeId')} = ${opts.storeId}` : Prisma.empty}
-      ${opts.from ? Prisma.sql`AND ${col('createdAt')} >= ${new Date(opts.from)}` : Prisma.empty}
-      ${opts.to ? Prisma.sql`AND ${col('createdAt')} <= ${new Date(opts.to)}` : Prisma.empty}
+      ${opts.from ? Prisma.sql`AND ${col('createdAt')} >= ${utcBound(new Date(opts.from))}` : Prisma.empty}
+      ${opts.to ? Prisma.sql`AND ${col('createdAt')} <= ${utcBound(new Date(opts.to))}` : Prisma.empty}
     `;
   }
 
@@ -616,8 +625,8 @@ export class ReportsService {
           AND sh."closedAt" IS NOT NULL
           AND sh.variance IS NOT NULL
           ${opts.storeId ? Prisma.sql`AND sh."storeId" = ${opts.storeId}` : Prisma.empty}
-          ${from ? Prisma.sql`AND sh."closedAt" >= ${new Date(from)}` : Prisma.empty}
-          ${to ? Prisma.sql`AND sh."closedAt" <= ${new Date(to)}` : Prisma.empty}
+          ${from ? Prisma.sql`AND sh."closedAt" >= ${utcBound(new Date(from))}` : Prisma.empty}
+          ${to ? Prisma.sql`AND sh."closedAt" <= ${utcBound(new Date(to))}` : Prisma.empty}
         GROUP BY 1, 2
       `,
 
@@ -905,6 +914,7 @@ export class ReportsService {
         discount: true,
         taxRate: true,
         lineTotal: true,
+        sale: { select: { taxInclusive: true } },
       },
     });
 
@@ -917,11 +927,15 @@ export class ReportsService {
       const soldQty = Number(it.quantity) - Number(it.returnedQty);
       if (soldQty <= 0) continue;
       const rate = Number(it.taxRate);
-      // Net of the per-unit discount, scaled to the non-returned quantity.
-      const perUnitNet =
+      // Price less the per-unit discount, scaled to the non-returned
+      // quantity. Before tax, unless the sale was priced tax-inclusive.
+      const perUnit =
         Number(it.unitPrice) - Number(it.discount) / (Number(it.quantity) || 1);
-      const lineNet = perUnitNet * soldQty;
-      const lineTax = round2((lineNet * rate) / 100);
+      const { net: lineNet, tax: lineTax } = splitTax(
+        perUnit * soldQty,
+        rate,
+        it.sale.taxInclusive,
+      );
       taxableAmount += lineNet;
       taxCollected += lineTax;
       grossSales += lineNet + lineTax;
@@ -1038,20 +1052,19 @@ export class ReportsService {
           },
         },
       }),
-      this.prisma.saleItem.groupBy({
-        by: ['productId'],
-        where: {
-          sale: {
-            businessId,
-            ...(storeId ? { storeId } : {}),
-            createdAt: { gte: since },
-          },
-        },
-        _sum: { quantity: true },
-      }),
+      // Units kept, the same rule as topProducts: the Prisma groupBy this
+      // replaced had no status filter and summed raw `quantity`, so a parked
+      // cart or a returned unit made a product look like it was moving.
+      this.prisma.$queryRaw<{ productId: string; sold: Prisma.Decimal }[]>`
+        SELECT si."productId", SUM(${SOLD_QTY}) AS sold
+        FROM "SaleItem" si
+        JOIN "Sale" s ON s.id = si."saleId"
+        WHERE ${this.saleFilterSql(businessId, { storeId, from: since.toISOString() })}
+        GROUP BY si."productId"
+      `,
     ]);
 
-    const soldMap = new Map(sold.map((s) => [s.productId, Number(s._sum.quantity ?? 0)]));
+    const soldMap = new Map(sold.map((s) => [s.productId, Math.max(0, Number(s.sold))]));
     return products
       .map((p) => ({
         productId: p.id,
@@ -1087,7 +1100,7 @@ export class ReportsService {
              COUNT(*)                         AS count
       FROM "Sale" s
       WHERE ${this.saleFilterSql(businessId, { storeId })}
-        AND s."createdAt" >= ${start}
+        AND s."createdAt" >= ${utcBound(start)}
       GROUP BY 1
     `;
 
@@ -1118,7 +1131,7 @@ export class ReportsService {
              COUNT(*)                         AS count
       FROM "Sale" s
       WHERE ${this.saleFilterSql(businessId, { storeId })}
-        AND s."createdAt" >= ${startOfToday}
+        AND s."createdAt" >= ${utcBound(startOfToday)}
       GROUP BY 1
     `;
 
@@ -1164,8 +1177,8 @@ export class ReportsService {
       FROM "StockMovement" m
       WHERE m."businessId" = ${businessId}
         ${storeId ? Prisma.sql`AND m."storeId" = ${storeId}` : Prisma.empty}
-        ${from ? Prisma.sql`AND m."createdAt" >= ${new Date(from)}` : Prisma.empty}
-        ${to ? Prisma.sql`AND m."createdAt" <= ${new Date(to)}` : Prisma.empty}
+        ${from ? Prisma.sql`AND m."createdAt" >= ${utcBound(new Date(from))}` : Prisma.empty}
+        ${to ? Prisma.sql`AND m."createdAt" <= ${utcBound(new Date(to))}` : Prisma.empty}
       GROUP BY 1
       ORDER BY 1 ASC
     `;

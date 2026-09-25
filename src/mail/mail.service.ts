@@ -1,10 +1,28 @@
 import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EmailStatus } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { accessEndsAt, supportContact } from '../common/subscription';
+
+/** What kind of email it is, for the admin panel's email log. */
+export type EmailType =
+  | 'verification'
+  | 'password-reset'
+  | 'receipt'
+  | 'low-stock'
+  | 'invite'
+  | 'subscription-reminder'
+  | 'announcement'
+  | 'support-reply'
+  | 'support-new';
 
 interface SendArgs {
   to: string;
   subject: string;
   html: string;
+  type: EmailType;
+  /** Whose email it is. Omitted, it is looked up from the recipient's account. */
+  businessId?: string;
 }
 
 /** Escape user-supplied text before it goes into an email's HTML. */
@@ -27,7 +45,10 @@ const esc = (s: string) =>
 export class MailService {
   private readonly logger = new Logger(MailService.name);
 
-  constructor(private config: ConfigService) {}
+  constructor(
+    private config: ConfigService,
+    private prisma: PrismaService,
+  ) {}
 
   private cfg() {
     const apiKey = this.config.get<string>('RESEND_API_KEY');
@@ -59,10 +80,51 @@ export class MailService {
     return (this.config.get<string>('MAIL_TRANSPORT') ?? 'resend').toLowerCase();
   }
 
-  async send({ to, subject, html }: SendArgs) {
+  /**
+   * Send, then write the outcome to the email log. The log is best-effort: a
+   * failed log write never fails the email, and a failed email is logged
+   * before its error goes back to the caller.
+   */
+  async send(args: SendArgs) {
+    try {
+      const status = await this.deliver(args);
+      void this.record(args, status);
+    } catch (e) {
+      void this.record(args, EmailStatus.FAILED, (e as { detail?: string }).detail ?? (e as Error).message);
+      throw e;
+    }
+  }
+
+  private async record(args: SendArgs, status: EmailStatus, error?: string) {
+    try {
+      const businessId =
+        args.businessId ??
+        (
+          await this.prisma.user.findUnique({
+            where: { email: args.to.trim().toLowerCase() },
+            select: { businessId: true },
+          })
+        )?.businessId ??
+        null;
+      await this.prisma.emailLog.create({
+        data: {
+          to: args.to,
+          type: args.type,
+          subject: args.subject,
+          status,
+          error: error ? error.slice(0, 1000) : null,
+          businessId,
+        },
+      });
+    } catch (e) {
+      this.logger.warn(`Email log write failed: ${(e as Error).message}`);
+    }
+  }
+
+  private async deliver({ to, subject, html }: SendArgs): Promise<EmailStatus> {
     if (this.transport() === 'log') {
       this.logger.log(`[mail:log] to=${to} subject="${subject}" (not sent)`);
-      return;
+      return EmailStatus.LOGGED;
     }
     const { apiKey, from, fromName, url } = this.cfg();
 
@@ -88,14 +150,20 @@ export class MailService {
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       this.logger.error(`Resend send failed (${res.status}): ${detail}`);
-      throw new InternalServerErrorException('Failed to send email');
+      // What Resend said goes to the email log; the caller gets the generic
+      // message, as before.
+      throw Object.assign(new InternalServerErrorException('Failed to send email'), {
+        detail: `Resend ${res.status}: ${detail}`,
+      });
     }
+    return EmailStatus.SENT;
   }
 
   // ----- Templated messages used by the auth flows -----
 
   sendVerificationCode(to: string, name: string, code: string) {
     return this.send({
+      type: 'verification',
       to,
       subject: 'Verify your email',
       html: this.codeTemplate(
@@ -121,14 +189,18 @@ export class MailService {
       discount: number;
       tax: number;
       total: number;
+      /** Prices already included the tax, so it isn't added on top. */
+      taxInclusive?: boolean;
     },
+    /** The customer isn't a user, so the log can't look their business up. */
+    businessId?: string,
   ) {
-    const money = (n: number) => `${data.currency} ${n.toFixed(2)}`;
+    const money = (n: number) => `${esc(data.currency)} ${n.toFixed(2)}`;
     const rows = data.items
       .map(
         (it) => `
         <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0">${it.name}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0">${esc(it.name)}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:right">${it.quantity}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:right">${money(it.unitPrice)}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:right">${money(it.lineTotal)}</td>
@@ -138,9 +210,9 @@ export class MailService {
 
     const html = `
       <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#0f172a">
-        <h2 style="margin:0 0 4px">${data.businessName}</h2>
-        <p style="margin:0 0 16px;color:#475569">Receipt ${data.receiptNo} · ${data.date.toLocaleString()}</p>
-        <p style="margin:0 0 12px">Hi ${data.customerName}, thanks for your purchase. Here's your receipt:</p>
+        <h2 style="margin:0 0 4px">${esc(data.businessName)}</h2>
+        <p style="margin:0 0 16px;color:#475569">Receipt ${esc(data.receiptNo)} · ${data.date.toLocaleString()}</p>
+        <p style="margin:0 0 12px">Hi ${esc(data.customerName)}, thanks for your purchase. Here's your receipt:</p>
         <table style="width:100%;border-collapse:collapse;font-size:14px">
           <thead>
             <tr style="text-align:left;color:#64748b;font-size:12px;text-transform:uppercase">
@@ -155,12 +227,14 @@ export class MailService {
         <div style="margin-top:12px;font-size:14px">
           <div style="display:flex;justify-content:space-between;color:#475569"><span>Subtotal</span><span>${money(data.subtotal)}</span></div>
           <div style="display:flex;justify-content:space-between;color:#475569"><span>Discount</span><span>${money(data.discount)}</span></div>
-          <div style="display:flex;justify-content:space-between;color:#475569"><span>Tax</span><span>${money(data.tax)}</span></div>
+          <div style="display:flex;justify-content:space-between;color:#475569"><span>${data.taxInclusive ? 'Tax (included)' : 'Tax'}</span><span>${money(data.tax)}</span></div>
           <div style="display:flex;justify-content:space-between;font-weight:700;font-size:16px;margin-top:6px"><span>Total</span><span>${money(data.total)}</span></div>
         </div>
       </div>`;
 
     return this.send({
+      type: 'receipt',
+      businessId,
       to,
       subject: `Receipt ${data.receiptNo} — ${data.businessName}`,
       html,
@@ -184,9 +258,9 @@ export class MailService {
       .map(
         (it) => `
         <tr>
-          <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${it.productName}${
-            it.sku ? ` <span style="color:#94a3b8">(${it.sku})</span>` : ''
-          }${it.storeName ? `<div style="color:#94a3b8;font-size:12px">${it.storeName}</div>` : ''}</td>
+          <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0">${esc(it.productName)}${
+            it.sku ? ` <span style="color:#94a3b8">(${esc(it.sku)})</span>` : ''
+          }${it.storeName ? `<div style="color:#94a3b8;font-size:12px">${esc(it.storeName)}</div>` : ''}</td>
           <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:600;color:#dc2626">${it.quantity}</td>
           <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;color:#475569">${it.reorderLevel}</td>
         </tr>`,
@@ -196,9 +270,9 @@ export class MailService {
     const html = `
       <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#0f172a">
         <h2 style="margin:0 0 4px">Low stock alert</h2>
-        <p style="margin:0 0 16px;color:#475569">Hi ${name}, ${items.length} item${
+        <p style="margin:0 0 16px;color:#475569">Hi ${esc(name)}, ${items.length} item${
           items.length === 1 ? '' : 's'
-        } at <strong>${businessName}</strong> ${
+        } at <strong>${esc(businessName)}</strong> ${
           items.length === 1 ? 'is' : 'are'
         } at or below the reorder level:</p>
         <table style="width:100%;border-collapse:collapse;font-size:14px">
@@ -215,6 +289,7 @@ export class MailService {
       </div>`;
 
     return this.send({
+      type: 'low-stock',
       to,
       subject: `Low stock: ${items.length} item${items.length === 1 ? '' : 's'} need restocking`,
       html,
@@ -228,6 +303,7 @@ export class MailService {
    */
   sendAccountInvite(to: string, name: string, businessName: string) {
     return this.send({
+      type: 'invite',
       to,
       subject: `Your ${businessName} account is ready`,
       html: `
@@ -249,11 +325,15 @@ export class MailService {
     daysLeft: number,
   ) {
     const date = endsOn.toISOString().slice(0, 10);
+    const stopsOn = accessEndsAt(endsOn).toISOString().slice(0, 10);
+    const { email, phone } = supportContact();
+    const contact = [email, phone].filter(Boolean).map((c) => esc(c!)).join(' · ');
     const when =
       daysLeft > 0
         ? `ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}, on ${date}`
         : `ended on ${date}`;
     return this.send({
+      type: 'subscription-reminder',
       to,
       subject:
         daysLeft > 0
@@ -267,14 +347,68 @@ export class MailService {
         <p style="margin:0;color:#475569">${
           daysLeft > 0
             ? 'Renew before then to keep using the app without interruption.'
-            : 'Your team can no longer sign in. Contact us to renew.'
+            : `The app keeps working until ${stopsOn}. Renew before then, or your team won't be able to sign in.`
         }</p>
+        <p style="margin:16px 0 0;color:#475569">${
+          contact ? `To renew, contact us: <strong>${contact}</strong>` : 'Contact us to renew.'
+        }</p>
+      </div>`,
+    });
+  }
+
+  /** An admin answered a support ticket: tell whoever raised it. */
+  sendSupportReply(to: string, name: string, subject: string, reply: string, businessId: string) {
+    return this.send({
+      type: 'support-reply',
+      to,
+      businessId,
+      subject: `Re: ${subject}`,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">We've replied to your question</h2>
+        <p style="margin:0 0 8px">Hi ${esc(name)},</p>
+        <p style="margin:0 0 8px;color:#475569">About <strong>${esc(subject)}</strong>:</p>
+        <p style="margin:0 0 16px;color:#0f172a;white-space:pre-line;border-left:3px solid #e2e8f0;padding-left:12px">${esc(reply)}</p>
+        <p style="margin:0;color:#94a3b8;font-size:12px">To answer, open Help &amp; support in the app.</p>
+      </div>`,
+    });
+  }
+
+  /** A shop raised a ticket: tell the support inbox (SUPPORT_EMAIL). */
+  sendSupportNew(to: string, businessName: string, from: string, subject: string, body: string) {
+    return this.send({
+      type: 'support-new',
+      to,
+      subject: `Support: ${subject}`,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">${esc(subject)}</h2>
+        <p style="margin:0 0 16px;color:#475569">From ${esc(from)} at <strong>${esc(businessName)}</strong></p>
+        <p style="margin:0 0 16px;white-space:pre-line">${esc(body)}</p>
+        <p style="margin:0;color:#94a3b8;font-size:12px">Answer it from the admin panel's Support page.</p>
+      </div>`,
+    });
+  }
+
+  /** A platform announcement, emailed to a shop's owners alongside the bell. */
+  sendAnnouncement(to: string, name: string, businessName: string, title: string, body: string) {
+    return this.send({
+      type: 'announcement',
+      to,
+      subject: title,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">${esc(title)}</h2>
+        <p style="margin:0 0 8px">Hi ${esc(name)},</p>
+        <p style="margin:0 0 16px;color:#475569;white-space:pre-line">${esc(body)}</p>
+        <p style="margin:0;color:#94a3b8;font-size:12px">Sent to the owners of ${esc(businessName)}.</p>
       </div>`,
     });
   }
 
   sendPasswordReset(to: string, name: string, code: string) {
     return this.send({
+      type: 'password-reset',
       to,
       subject: 'Reset your password',
       html: this.codeTemplate(
@@ -295,7 +429,7 @@ export class MailService {
     return `
       <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
         <h2 style="margin:0 0 16px">${heading}</h2>
-        <p style="margin:0 0 8px">Hi ${name},</p>
+        <p style="margin:0 0 8px">Hi ${esc(name)},</p>
         <p style="margin:0 0 16px;color:#475569">${intro}</p>
         <div style="font-size:32px;font-weight:700;letter-spacing:8px;background:#f1f5f9;border-radius:8px;padding:16px;text-align:center">${code}</div>
         <p style="margin:16px 0 0;color:#94a3b8;font-size:13px">This code expires in 15 minutes.</p>

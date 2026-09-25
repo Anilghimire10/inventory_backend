@@ -4,7 +4,10 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
-import { isSubscriptionActive } from '../../common/subscription';
+import {
+  isSubscriptionActive,
+  SubscriptionInactiveException,
+} from '../../common/subscription';
 import { PrincipalCache } from '../../common/principal-cache';
 import { suspendedMessage } from '../auth.service';
 
@@ -13,6 +16,9 @@ export interface JwtPayload {
   businessId: string;
   /** User.tokenVersion at mint time. Stale values are rejected below. */
   tv?: number;
+  /** A platform admin viewing as this user (read-only). See issueImpersonationToken. */
+  imp?: { adminId: string; email: string };
+  exp?: number;
 }
 
 @Injectable()
@@ -32,6 +38,30 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
   /** Whatever this returns becomes req.user (typed as AuthUser). */
   async validate(payload: JwtPayload): Promise<AuthUser> {
+    const principal = await this.principal(payload);
+    if (!payload.imp) return principal;
+
+    // "View as owner": still only while the admin who opened it is active. The
+    // flag goes on the returned principal, never into the cache, which is
+    // keyed by the owner's id and shared with the owner's own sessions.
+    const admin = await this.prisma.platformAdmin.findUnique({
+      where: { id: payload.imp.adminId },
+      select: { isActive: true },
+    });
+    if (!admin?.isActive) {
+      throw new UnauthorizedException('The admin session that opened this view has ended.');
+    }
+    return {
+      ...principal,
+      impersonatedBy: {
+        adminId: payload.imp.adminId,
+        email: payload.imp.email,
+        expiresAt: new Date((payload.exp ?? 0) * 1000).toISOString(),
+      },
+    };
+  }
+
+  private async principal(payload: JwtPayload): Promise<AuthUser> {
     // A cache hit is only usable when the token was minted at the version the
     // entry holds. A mismatch is NOT grounds to reject -- the entry may simply
     // be stale, which is exactly what a freshly-minted token looks like right
@@ -69,9 +99,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException(suspendedMessage(user.business.suspendedReason));
     }
     if (!isSubscriptionActive(user.business)) {
-      throw new UnauthorizedException(
-        'Your subscription is inactive. Please renew to continue.',
-      );
+      throw new SubscriptionInactiveException(user.business);
     }
     const principal: AuthUser = {
       userId: user.id,

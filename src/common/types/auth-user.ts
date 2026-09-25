@@ -10,4 +10,10 @@ export interface AuthUser {
   storeId: string | null;
   role: UserRole;
   email: string;
+  /**
+   * Set when a platform admin is viewing the shop as its owner ("view as
+   * owner", admin panel). Such a session is read-only: see
+   * ImpersonationReadOnlyGuard.
+   */
+  impersonatedBy?: { adminId: string; email: string; expiresAt: string };
 }

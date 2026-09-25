@@ -2,6 +2,7 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
+import { PlatformRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { platformJwtSecret } from '../../common/env.validation';
 
@@ -14,6 +15,7 @@ export interface PlatformPrincipal {
   adminId: string;
   email: string;
   name: string;
+  role: PlatformRole;
 }
 
 /**
@@ -48,15 +50,16 @@ export class PlatformJwtStrategy extends PassportStrategy(
     if (!admin || !admin.isActive) {
       throw new UnauthorizedException('Admin no longer active');
     }
-    // A password change or reset signs out every session opened before it.
+    // A password change or reset, or turning on two-factor, signs out every
+    // session opened before it.
     // Compared in whole seconds (iat's resolution), so the token issued in
     // the same request as the change still works.
     if (
       admin.passwordChangedAt &&
       (payload.iat ?? 0) < Math.floor(admin.passwordChangedAt.getTime() / 1000)
     ) {
-      throw new UnauthorizedException('Password changed, please sign in again');
+      throw new UnauthorizedException('Your sign-in details changed, please sign in again');
     }
-    return { adminId: admin.id, email: admin.email, name: admin.name };
+    return { adminId: admin.id, email: admin.email, name: admin.name, role: admin.role };
   }
 }

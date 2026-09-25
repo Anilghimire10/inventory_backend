@@ -3,6 +3,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthModule } from '../auth/auth.module';
+import { BusinessModule } from '../business/business.module';
 import { platformJwtSecret } from '../common/env.validation';
 import { PlatformAuthController } from './platform-auth.controller';
 import { PlatformAuthService } from './platform-auth.service';
@@ -13,7 +14,12 @@ import { PlatformUsersService } from './platform-users.service';
 import { PlatformAdminsController } from './platform-admins.controller';
 import { PlatformAdminsService } from './platform-admins.service';
 import { PlatformAuditService } from './platform-audit.service';
+import { PlatformInsightsController } from './platform-insights.controller';
+import { PlatformAnnouncementsController } from './platform-announcements.controller';
+import { PlatformAnnouncementsService } from './platform-announcements.service';
+import { PlatformInsightsService } from './platform-insights.service';
 import { SubscriptionRemindersService } from './subscription-reminders.service';
+import { PlatformSettingsController } from './platform-settings.controller';
 import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
 
 @Module({
@@ -21,6 +27,8 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     PassportModule,
     // AuthService issues the verification / reset codes the support tools send.
     AuthModule,
+    // BusinessService.exportNdjson, for exporting a business from the panel.
+    BusinessModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -37,6 +45,9 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     PlatformController,
     PlatformUsersController,
     PlatformAdminsController,
+    PlatformInsightsController,
+    PlatformAnnouncementsController,
+    PlatformSettingsController,
   ],
   providers: [
     PlatformAuthService,
@@ -44,6 +55,8 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     PlatformUsersService,
     PlatformAdminsService,
     PlatformAuditService,
+    PlatformInsightsService,
+    PlatformAnnouncementsService,
     SubscriptionRemindersService,
     PlatformJwtStrategy,
   ],

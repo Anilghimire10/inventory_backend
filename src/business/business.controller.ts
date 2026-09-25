@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Patch, Res } from "@nestjs/common";
+import { Body, Controller, ForbiddenException, Get, Patch, Res } from "@nestjs/common";
 import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from "@nestjs/swagger";
 import { SalesModel } from "@prisma/client";
 import type { Response } from "express";
@@ -126,10 +126,24 @@ export class BusinessController {
    * the export filling the process's socket buffer with rows nobody has
    * read yet -- which for a large tenant is the same out-of-memory failure
    * from the other end.
+   *
+   * Refused in a "view as owner" session. It is a GET, so the read-only
+   * guard lets it through, but it is the whole tenant in one file and the
+   * admin log would only show the session starting. The panel's own export
+   * is logged per download.
    */
   @Roles(UserRole.OWNER)
   @Get("export")
   async exportData(@CurrentUser() u: AuthUser, @Res() res: Response) {
+    if (u.impersonatedBy) {
+      throw new ForbiddenException({
+        statusCode: 403,
+        error: "Forbidden",
+        code: "READ_ONLY",
+        message:
+          "The full export isn't available while viewing as the owner. Use Export on the business page in the admin panel.",
+      });
+    }
     const stamp = new Date().toISOString().slice(0, 10);
     res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
     res.setHeader(

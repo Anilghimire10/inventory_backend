@@ -1,9 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import { NotificationType, Prisma, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
-import { DAY_MS, daysUntil } from '../common/subscription';
+import { accessEndsAt, DAY_MS, daysUntil } from '../common/subscription';
+import { trackCron } from '../common/cron-status';
+import { isLocalSlot } from '../common/timezone';
+
+/** Every 15 minutes, on the quarter hour. See `isLocalSlot` for why not hourly. */
+export const REMINDER_SCHEDULE = '0 */15 * * * *';
+/** Local hour reminders go out. */
+export const REMINDER_HOUR = 9;
 
 /** Days before the end date (0 = the day it ends) that owners hear about it. */
 export const REMIND_AT_DAYS = [7, 3, 1, 0];
@@ -28,9 +35,19 @@ export class SubscriptionRemindersService {
     private mail: MailService,
   ) {}
 
-  @Cron(CronExpression.EVERY_DAY_AT_9AM)
-  async runDaily(now = new Date()) {
-    const due = await this.prisma.business.findMany({
+  /**
+   * 09:00 in each shop's own time zone. Was EVERY_DAY_AT_9AM on the server's
+   * clock, 14:45 in Kathmandu on a UTC host. Runs every quarter hour and acts
+   * only on businesses whose clock has just reached 9 (see `isLocalSlot`);
+   * the dedupeKey in `remind` still guards against a double send.
+   */
+  @Cron(REMINDER_SCHEDULE)
+  runDaily(now = new Date()) {
+    return trackCron('subscription-reminders', () => this.remindAllDue(now));
+  }
+
+  private async remindAllDue(now: Date) {
+    const candidates = await this.prisma.business.findMany({
       where: {
         isSubscribed: true,
         isSuspended: false,
@@ -39,8 +56,9 @@ export class SubscriptionRemindersService {
           lte: new Date(now.getTime() + (Math.max(...REMIND_AT_DAYS) + 1) * DAY_MS),
         },
       },
-      select: { id: true, name: true, subscribedTo: true },
+      select: { id: true, name: true, subscribedTo: true, timezone: true },
     });
+    const due = candidates.filter((b) => isLocalSlot(b.timezone, now, REMINDER_HOUR));
     let reminded = 0;
     for (const b of due) {
       const daysLeft = daysUntil(b.subscribedTo!, now);
@@ -52,7 +70,9 @@ export class SubscriptionRemindersService {
         this.logger.warn(`Subscription reminder failed for ${b.id}: ${(e as Error).message}`);
       }
     }
-    this.logger.log(`Subscription reminders sent to ${reminded} business(es).`);
+    // Most quarter hours reach nobody's 9am; only log the runs that did.
+    if (due.length) this.logger.log(`Subscription reminders sent to ${reminded} business(es).`);
+    return `Reminded ${reminded} of ${due.length} business(es) at 09:00 local`;
   }
 
   /**
@@ -72,7 +92,12 @@ export class SubscriptionRemindersService {
             daysLeft > 0
               ? `Subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`
               : 'Subscription has ended',
-          body: `Paid until ${date}. Contact us to renew.`,
+          body:
+            daysLeft > 0
+              ? `Paid until ${date}. Contact us to renew.`
+              : `Ended on ${date}. The app keeps working until ${accessEndsAt(b.subscribedTo)
+                  .toISOString()
+                  .slice(0, 10)}; renew before then.`,
           dedupeKey: force ? null : `subscription:${date}:${daysLeft}`,
         },
       });

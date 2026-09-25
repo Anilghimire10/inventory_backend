@@ -1,20 +1,26 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
+import { once } from 'events';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { PlatformService } from './platform.service';
-import { PlatformAuthGuard } from './platform-auth.guard';
+import { AdminOnly, PlatformAuthGuard, SupportMayWrite } from './platform-auth.guard';
 import { CurrentActor } from './current-admin.decorator';
 import { Actor } from './platform-audit.service';
 import {
   CreateBusinessDto,
+  CreateBusinessNoteDto,
+  DeleteBusinessDto,
   QueryBusinessesDto,
   RecordPaymentDto,
   SetSubscriptionDto,
@@ -141,6 +147,102 @@ export class PlatformController {
   @Post('businesses/:id/send-reminder')
   sendReminder(@CurrentActor() actor: Actor, @Param('id') id: string) {
     return this.platform.sendReminder(actor, id);
+  }
+
+  // ---- More read-only tabs (each view is logged) ----
+
+  @Get('businesses/:id/products')
+  businessProducts(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Query() q: PaginationDto,
+  ) {
+    return this.platform.businessProducts(actor, id, q);
+  }
+
+  @Get('businesses/:id/purchases')
+  businessPurchases(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Query() q: PaginationDto,
+  ) {
+    return this.platform.businessPurchases(actor, id, q);
+  }
+
+  @Get('businesses/:id/shifts')
+  businessShifts(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Query() q: PaginationDto,
+  ) {
+    return this.platform.businessShifts(actor, id, q);
+  }
+
+  // ---- Internal notes ----
+
+  @Get('businesses/:id/notes')
+  listNotes(@Param('id') id: string) {
+    return this.platform.listNotes(id);
+  }
+
+  @SupportMayWrite()
+  @Post('businesses/:id/notes')
+  addNote(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Body() dto: CreateBusinessNoteDto,
+  ) {
+    return this.platform.addNote(actor, id, dto);
+  }
+
+  @Delete('businesses/:id/notes/:noteId')
+  deleteNote(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Param('noteId') noteId: string,
+  ) {
+    return this.platform.deleteNote(actor, id, noteId);
+  }
+
+  /** A 30-minute, read-only session in the shop app as the owner. Logged. */
+  @SupportMayWrite()
+  @Post('businesses/:id/impersonate')
+  impersonate(@CurrentActor() actor: Actor, @Param('id') id: string) {
+    return this.platform.impersonate(actor, id);
+  }
+
+  // ---- Export and deletion ----
+
+  /**
+   * The business's data as NDJSON, streamed page by page like the owner's own
+   * export (BusinessController.exportData), honouring backpressure.
+   */
+  @AdminOnly()
+  @Get('businesses/:id/export')
+  async exportBusiness(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Res() res: Response,
+  ) {
+    const { name, chunks } = await this.platform.exportBusiness(actor, id);
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'business';
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${slug}-export-${stamp}.ndjson"`);
+    for await (const chunk of chunks) {
+      if (!res.write(chunk)) await once(res, 'drain');
+    }
+    res.end();
+  }
+
+  /** Permanently delete a business. `confirmName` must match its name. */
+  @Delete('businesses/:id')
+  deleteBusiness(
+    @CurrentActor() actor: Actor,
+    @Param('id') id: string,
+    @Body() dto: DeleteBusinessDto,
+  ) {
+    return this.platform.deleteBusiness(actor, id, dto);
   }
 
   /** Global activity feed across all businesses. */

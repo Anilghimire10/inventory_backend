@@ -31,6 +31,9 @@ import { SalesModule } from './sales/sales.module';
 import { ReportsModule } from './reports/reports.module';
 import { CreditModule } from './credit/credit.module';
 import { ShiftsModule } from './shifts/shifts.module';
+import { SettingsModule } from './settings/settings.module';
+import { SupportModule } from './support/support.module';
+import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-only.guard';
 
 @Module({
   imports: [
@@ -76,6 +79,8 @@ import { ShiftsModule } from './shifts/shifts.module';
     ReportsModule,
     CreditModule,
     ShiftsModule,
+    SettingsModule,
+    SupportModule,
   ],
   controllers: [HealthController],
   providers: [
@@ -83,6 +88,8 @@ import { ShiftsModule } from './shifts/shifts.module';
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     // Global auth: every route requires a valid JWT unless marked @Public()
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // "View as owner" sessions from the admin panel are read-only.
+    { provide: APP_GUARD, useClass: ImpersonationReadOnlyGuard },
     // Global role enforcement for routes that declare @Roles(...)
     { provide: APP_GUARD, useClass: RolesGuard },
     // Pins cashiers/stock keepers to the store they are assigned to. Runs

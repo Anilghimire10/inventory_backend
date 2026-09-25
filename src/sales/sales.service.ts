@@ -23,6 +23,7 @@ import { ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+import { splitTax } from '../common/tax';
 
 /** Fields `create()` and `hold()` share to price out a cart. */
 interface SaleLinesInput {
@@ -71,7 +72,8 @@ export class SalesService {
       discount: Number(sale.discount),
       tax: Number(sale.tax),
       total: Number(sale.total),
-    });
+      taxInclusive: sale.taxInclusive,
+    }, businessId);
     return { message: `Receipt emailed to ${to}` };
   }
 
@@ -95,7 +97,7 @@ export class SalesService {
     // two branches could ring up a sale at one and have it stamped onto the
     // other branch's drawer. Both Z reports were then wrong, and neither had
     // anything in it to show why.
-    const [{ lines, subtotal, tax, billDiscount, total }, shiftId] =
+    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive }, shiftId] =
       await Promise.all([
         this.buildLines(businessId, storeId, dto),
         this.shifts.resolveShiftId(user, storeId, dto.shiftId),
@@ -159,6 +161,7 @@ export class SalesService {
           discount: billDiscount,
           tax,
           total,
+          taxInclusive,
           paymentMethod,
           amountPaid,
           prescriptionRef: dto.prescriptionRef,
@@ -279,7 +282,7 @@ export class SalesService {
     if (!storeId) {
       throw new BadRequestException('No store specified for this sale');
     }
-    const { lines, subtotal, tax, billDiscount, total } = await this.buildLines(
+    const { lines, subtotal, tax, billDiscount, total, taxInclusive } = await this.buildLines(
       businessId,
       storeId,
       dto,
@@ -297,6 +300,7 @@ export class SalesService {
         discount: billDiscount,
         tax,
         total,
+        taxInclusive,
         paymentMethod: PaymentMethod.CASH,
         amountPaid: 0,
         prescriptionRef: dto.prescriptionRef,
@@ -787,7 +791,7 @@ export class SalesService {
         : Promise.resolve(),
       this.prisma.business.findUnique({
         where: { id: businessId },
-        select: { taxEnabled: true },
+        select: { taxEnabled: true, taxInclusive: true },
       }),
       this.prisma.product.findMany({
         where: { id: { in: productIds }, businessId, isActive: true },
@@ -795,6 +799,8 @@ export class SalesService {
     ]);
     // Master tax switch: when off, no line charges tax regardless of product.
     const taxEnabled = business?.taxEnabled ?? true;
+    // Whether shelf prices already contain their tax.
+    const taxInclusive = business?.taxInclusive ?? false;
     const productMap = new Map(products.map((p) => [p.id, p]));
     if (productMap.size !== new Set(productIds).size) {
       throw new BadRequestException('One or more products are invalid');
@@ -812,11 +818,15 @@ export class SalesService {
       const product = productMap.get(i.productId)!;
       const unitPrice = i.unitPrice ?? Number(product.sellingPrice);
       const itemDiscount = i.discount ?? 0;
-      const lineNet = round2(unitPrice * i.quantity - itemDiscount);
-      if (lineNet < 0) throw new BadRequestException('Discount exceeds line total');
+      const lineAmount = round2(unitPrice * i.quantity - itemDiscount);
+      if (lineAmount < 0) throw new BadRequestException('Discount exceeds line total');
       // Tax applies only when the master switch is on AND the product is taxable.
       const taxRate = taxEnabled && product.isTaxable ? Number(product.taxRate) : 0;
-      const lineTax = round2((lineNet * taxRate) / 100);
+      const { net: lineNet, tax: lineTax, total: lineTotal } = splitTax(
+        lineAmount,
+        taxRate,
+        taxInclusive,
+      );
       return {
         productId: i.productId,
         name: product.name,
@@ -827,7 +837,7 @@ export class SalesService {
         taxRate,
         lineNet,
         lineTax,
-        lineTotal: round2(lineNet + lineTax),
+        lineTotal,
         trackBatches: product.trackBatches,
         trackSerials: product.trackSerials,
         serials: i.serials,
@@ -840,6 +850,6 @@ export class SalesService {
     const total = round2(subtotal + tax - billDiscount);
     if (total < 0) throw new BadRequestException('Discount exceeds sale total');
 
-    return { lines, subtotal, tax, billDiscount, total };
+    return { lines, subtotal, tax, billDiscount, total, taxInclusive };
   }
 }

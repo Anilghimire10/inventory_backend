@@ -3,6 +3,21 @@ import { Transform } from 'class-transformer';
 import { IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
+/**
+ * A `?flag=true|false` query parameter as a boolean.
+ *
+ * Reads the raw value from `obj`, not `value`: the global ValidationPipe runs
+ * with `enableImplicitConversion`, which has already turned the string into a
+ * boolean by the time `value` arrives -- and `Boolean('false')` is `true`. So
+ * `?activeOnly=false` meant active only, and a purchase line on a product
+ * since deactivated could not be looked up.
+ */
+const QueryBoolean = () =>
+  Transform(({ obj, key }: { obj: Record<string, unknown>; key: string }) => {
+    const raw = obj[key];
+    return raw === true || raw === 'true';
+  });
+
 export class QueryProductDto extends PaginationDto {
   @ApiPropertyOptional({
     description:
@@ -21,7 +36,7 @@ export class QueryProductDto extends PaginationDto {
 
   @ApiPropertyOptional({ description: 'Only active products', default: true })
   @IsOptional()
-  @Transform(({ value }) => value === 'true' || value === true)
+  @QueryBoolean()
   @IsBoolean()
   activeOnly?: boolean;
 
@@ -50,7 +65,15 @@ export class QueryProductDto extends PaginationDto {
     description: 'Hide variant rows, listing only standalone products and parents',
   })
   @IsOptional()
-  @Transform(({ value }) => value === 'true' || value === true)
+  @QueryBoolean()
   @IsBoolean()
   excludeVariants?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'Only products tracked by serial number (the serial register filter)',
+  })
+  @IsOptional()
+  @QueryBoolean()
+  @IsBoolean()
+  trackSerials?: boolean;
 }

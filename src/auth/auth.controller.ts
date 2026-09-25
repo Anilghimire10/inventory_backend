@@ -81,7 +81,8 @@ export class AuthController {
 
   @ApiBearerAuth()
   @Get('me')
-  me(@CurrentUser() user: AuthUser) {
-    return this.auth.me(user.userId);
+  async me(@CurrentUser() user: AuthUser) {
+    // `impersonation` tells the shop app to show its read-only banner.
+    return { ...(await this.auth.me(user.userId)), impersonation: user.impersonatedBy ?? null };
   }
 }

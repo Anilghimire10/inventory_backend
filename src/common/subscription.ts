@@ -1,28 +1,102 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, UnauthorizedException } from '@nestjs/common';
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Whether a business's subscription is currently active.
- * Active when it's marked subscribed AND not past its end date
- * (a null end date means no expiry). Payment wiring (Fonepay) comes later;
- * for now a platform super-admin toggles these fields.
+ * Days a shop keeps working after its end date (env
+ * `SUBSCRIPTION_GRACE_DAYS`, default 3). A renewal that is a day late --
+ * a bank transfer still clearing, an owner who was travelling -- shouldn't
+ * lock the till mid-shift. The end date itself doesn't move: the admin panel
+ * still shows the business as expired, and a payment still renews from it.
  */
-export function isSubscriptionActive(business: {
-  isSubscribed: boolean;
-  subscribedTo: Date | null;
-}): boolean {
+export function graceDays(): number {
+  const days = Number(process.env.SUBSCRIPTION_GRACE_DAYS ?? 3);
+  return Number.isFinite(days) && days >= 0 ? days : 3;
+}
+
+/** When the app actually stops working: the end date plus the grace period. */
+export function accessEndsAt(subscribedTo: Date): Date {
+  return new Date(subscribedTo.getTime() + graceDays() * DAY_MS);
+}
+
+/**
+ * Whether a business may use the app right now: switched on, and not past
+ * its end date plus the grace period (a null end date means no expiry).
+ */
+export function isSubscriptionActive(
+  business: { isSubscribed: boolean; subscribedTo: Date | null },
+  now = new Date(),
+): boolean {
   if (!business.isSubscribed) return false;
-  if (business.subscribedTo && business.subscribedTo.getTime() < Date.now()) {
+  if (business.subscribedTo && accessEndsAt(business.subscribedTo) <= now) {
     return false;
   }
   return true;
 }
 
-/** End of a new signup's free trial: `TRIAL_DAYS` from now (env, default 14). */
-export function trialEndsAt(from = new Date()): Date {
-  const days = Number(process.env.TRIAL_DAYS ?? 14);
-  return new Date(from.getTime() + (Number.isFinite(days) ? days : 14) * DAY_MS);
+/** Who a locked-out shop should contact to renew (env; either may be unset). */
+export function supportContact(): { email?: string; phone?: string } {
+  const email = process.env.SUPPORT_EMAIL?.trim();
+  const phone = process.env.SUPPORT_PHONE?.trim();
+  return { ...(email ? { email } : {}), ...(phone ? { phone } : {}) };
+}
+
+/**
+ * The 401 a shop gets once its subscription stops it. Still a 401, so an
+ * older app build keeps treating it as "signed out" and shows the message;
+ * `code` is what lets a current build show the expired screen instead of
+ * bouncing to login, with the date and who to call.
+ */
+export class SubscriptionInactiveException extends UnauthorizedException {
+  constructor(business: { isSubscribed: boolean; subscribedTo: Date | null }) {
+    const expired = business.isSubscribed && !!business.subscribedTo;
+    super({
+      statusCode: 401,
+      error: 'Unauthorized',
+      code: 'SUBSCRIPTION_INACTIVE',
+      message: 'Your subscription is inactive. Please renew to continue.',
+      reason: expired ? 'expired' : 'inactive',
+      endedAt: expired ? business.subscribedTo!.toISOString() : null,
+      contact: supportContact(),
+    });
+  }
+}
+
+/**
+ * What the shop app shows its owner about the subscription. Only states that
+ * call for a banner are distinguished; everything else is `active`.
+ *
+ * - `trial`: has an end date and has never paid.
+ * - `ending`: paid, and the end date is within 7 days.
+ * - `grace`: past the end date but inside the grace period, still working.
+ */
+export function subscriptionSummary(
+  business: { isSubscribed: boolean; subscribedTo: Date | null },
+  paymentCount: number,
+  now = new Date(),
+) {
+  const end = business.subscribedTo;
+  if (!business.isSubscribed || !end) {
+    return { status: 'active' as const, endsAt: null, accessEndsAt: null, daysLeft: null };
+  }
+  const accessEnd = accessEndsAt(end);
+  const base = { endsAt: end.toISOString(), accessEndsAt: accessEnd.toISOString() };
+  if (end <= now) {
+    return { status: 'grace' as const, ...base, daysLeft: daysUntil(accessEnd, now), contact: supportContact() };
+  }
+  const daysLeft = daysUntil(end, now);
+  if (paymentCount === 0) return { status: 'trial' as const, ...base, daysLeft, contact: supportContact() };
+  if (daysLeft <= 7) return { status: 'ending' as const, ...base, daysLeft, contact: supportContact() };
+  return { status: 'active' as const, ...base, daysLeft };
+}
+
+/**
+ * End of a new signup's free trial, `days` from now. The length comes from
+ * `SettingsService.trialDays()` (the admin panel's setting, else env
+ * `TRIAL_DAYS`, else 14).
+ */
+export function trialEndsAt(days: number, from = new Date()): Date {
+  return new Date(from.getTime() + days * DAY_MS);
 }
 
 export type SubscriptionStatus =

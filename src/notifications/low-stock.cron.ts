@@ -1,9 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import { UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
+import { trackCron } from '../common/cron-status';
+import { isLocalSlot } from '../common/timezone';
+
+/** Every 15 minutes, on the quarter hour. See `isLocalSlot` for why not hourly. */
+export const DIGEST_SCHEDULE = '0 */15 * * * *';
+/** Local hour the digest goes out. */
+export const DIGEST_HOUR = 8;
 
 /**
  * Emails each business owner a once-a-day digest of items that have fallen to
@@ -20,23 +27,35 @@ export class LowStockCron {
     private mail: MailService,
   ) {}
 
-  @Cron(CronExpression.EVERY_DAY_AT_8AM)
-  async runDailyDigest() {
-    const businesses = await this.prisma.business.findMany({
-      where: { isSuspended: false },
-      select: { id: true },
-    });
-    let sent = 0;
-    for (const b of businesses) {
-      try {
-        if (await this.sendForBusiness(b.id)) sent++;
-      } catch (e) {
-        this.logger.warn(
-          `Low-stock digest failed for business ${b.id}: ${(e as Error).message}`,
-        );
+  /**
+   * 08:00 in each shop's own time zone, not the server's. This was
+   * EVERY_DAY_AT_8AM, which on a UTC host is 13:45 in Kathmandu -- a
+   * "morning" restock digest arriving after lunch. Runs every quarter hour
+   * and picks out the businesses whose clock has just reached 8.
+   */
+  @Cron(DIGEST_SCHEDULE)
+  runDailyDigest(now = new Date()) {
+    return trackCron('low-stock-digest', async () => {
+      const all = await this.prisma.business.findMany({
+        where: { isSuspended: false },
+        select: { id: true, timezone: true },
+      });
+      const businesses = all.filter((b) => isLocalSlot(b.timezone, now, DIGEST_HOUR));
+      let sent = 0;
+      for (const b of businesses) {
+        try {
+          if (await this.sendForBusiness(b.id)) sent++;
+        } catch (e) {
+          this.logger.warn(
+            `Low-stock digest failed for business ${b.id}: ${(e as Error).message}`,
+          );
+        }
       }
-    }
-    this.logger.log(`Low-stock digest run complete — emailed ${sent} business(es).`);
+      const summary = `Emailed ${sent} of ${businesses.length} business(es) at 08:00 local`;
+      // Most quarter hours reach nobody's 8am; only log the runs that did.
+      if (businesses.length) this.logger.log(`Low-stock digest run complete — ${summary}.`);
+      return summary;
+    });
   }
 
   /**
