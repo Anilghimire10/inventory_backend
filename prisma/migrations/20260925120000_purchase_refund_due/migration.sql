@@ -1,0 +1,13 @@
+-- Purchase.refundDue: what a supplier owes back.
+--
+-- Returning goods on a purchase that was already paid for leaves the supplier
+-- holding money for goods they took back. That used to be written straight
+-- into the Payment ledger as a SUPPLIER_REFUND, as though the money had
+-- arrived -- the supplier's history showed a refund nobody had received, and
+-- the amount still owed appeared nowhere. It is now a balance on the
+-- purchase, cleared when the refund is recorded as received.
+--
+-- Not backfilled: whether the refunds recorded before this change were ever
+-- actually received can't be told from the data, so those rows are left as
+-- they were written.
+ALTER TABLE "Purchase" ADD COLUMN "refundDue" DECIMAL(12,2) NOT NULL DEFAULT 0;

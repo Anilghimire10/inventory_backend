@@ -59,6 +59,7 @@ enum SerialStatus {
   IN_STOCK
   SOLD
   RETURNED_TO_SUPPLIER
+  DAMAGED // came back from a customer unfit to sell; written off, never sold again
 }
 
 enum PurchaseStatus {
@@ -485,6 +486,10 @@ model Purchase {
   tax        Decimal        @default(0) @db.Decimal(12, 2)
   total      Decimal        @default(0) @db.Decimal(12, 2)
   amountPaid Decimal        @default(0) @db.Decimal(12, 2) // paid to supplier; outstanding = total - amountPaid
+  /// What the supplier owes back: money already paid that a return (or an
+  /// edit that shrank the invoice) no longer covers. Cleared by recording the
+  /// refund when it actually arrives, which is when the ledger gets its row.
+  refundDue  Decimal        @default(0) @db.Decimal(12, 2)
   note       String?
   receivedAt DateTime?
   createdAt  DateTime       @default(now())

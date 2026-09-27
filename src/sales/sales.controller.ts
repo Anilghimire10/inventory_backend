@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -14,7 +15,7 @@ import { UserRole } from '@prisma/client';
 import { SalesService } from './sales.service';
 import { CreateSaleDto } from './dto/create-sale.dto';
 import { HoldSaleDto } from './dto/hold-sale.dto';
-import { ReturnSaleDto } from './dto/return-sale.dto';
+import { ReturnQuoteQueryDto, ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -72,6 +73,19 @@ export class SalesController {
   @Delete(':id')
   discard(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.sales.discardHeld(u.businessId, id);
+  }
+
+  /** What a return would hand back, before it is made. Writes nothing. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Get(':id/return-quote')
+  returnQuote(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Query() q: ReturnQuoteQueryDto,
+  ) {
+    const lines = q.parsed();
+    if (!lines.length) throw new BadRequestException('Choose something to return');
+    return this.sales.returnQuote(u, id, lines);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)

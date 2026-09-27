@@ -24,6 +24,11 @@ export class CreditController {
     return this.credit.receivables(u.businessId, scopeToStore(u, storeId));
   }
 
+  @Get('supplier-refunds')
+  supplierRefunds(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
+    return this.credit.supplierRefunds(u.businessId, scopeToStore(u, storeId));
+  }
+
   @Get('payables')
   payables(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
     return this.credit.payables(u.businessId, scopeToStore(u, storeId));

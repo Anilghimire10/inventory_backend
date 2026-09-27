@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import {
+  AdjustmentReason,
   PaymentMethod,
   PaymentType,
   Prisma,
@@ -13,7 +14,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ShiftsService } from '../shifts/shifts.service';
-import { PaymentsService } from '../payments/payments.service';
+import { PaymentsService, SETTLE_METHODS } from '../payments/payments.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
@@ -24,6 +25,8 @@ import { QuerySaleDto } from './dto/query-sale.dto';
 import { paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 import { splitTax } from '../common/tax';
+import { lineRefund, returnRefund } from '../common/refund';
+import { assertOwnStore } from '../common/store-scope';
 
 /** Fields `create()` and `hold()` share to price out a cart. */
 interface SaleLinesInput {
@@ -31,6 +34,15 @@ interface SaleLinesInput {
   items: SaleItemDto[];
   discount?: number;
   prescriptionRef?: string;
+}
+
+/** A Prisma client or an active transaction client. */
+type Db = PrismaService | Prisma.TransactionClient;
+
+/** One line of a return: which sale line, and how much of it comes back. */
+export interface ReturnLine {
+  saleItemId: string;
+  quantity: number;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -144,6 +156,15 @@ export class SalesService {
           ? PaymentMethod.MIXED
           : PaymentMethod.CREDIT
         : requestedMethod;
+    // How the part paid now was actually handed over. The sale says MIXED
+    // for "part paid, part owed", but MIXED is not a tender: booked that way,
+    // a card part-payment was counted into the drawer as cash and the
+    // cashier came up short at close by exactly that much. So the payment row
+    // carries the tender the cashier picked; one that names no tender (CREDIT
+    // with something paid, or a legacy MIXED) is cash, the counter default.
+    const tender = SETTLE_METHODS.includes(requestedMethod)
+      ? requestedMethod
+      : PaymentMethod.CASH;
 
     return this.createWithReceiptRetry(async () => this.prisma.$transaction(async (tx) => {
       const receiptNo = await this.nextReceiptNo(tx, businessId);
@@ -192,7 +213,7 @@ export class SalesService {
             businessId,
             type: PaymentType.SALE,
             amount: amountPaid,
-            method: paymentMethod,
+            method: tender,
             saleId: sale.id,
             customerId: dto.customerId ?? null,
             storeId,
@@ -254,9 +275,15 @@ export class SalesService {
    * unique constraint. Rather than lock/serialize every checkout for that,
    * just retry: recomputing the max and re-running the transaction on the
    * rare collision is cheap and keeps the common case fully concurrent.
+   *
+   * Retries wait a short random time first. Retried at once, the checkouts
+   * that collided recompute the same next number together and collide again:
+   * ten fired at the same instant at one business failed a quarter of their
+   * attempts outright with a 500 once the five tries ran out. Spread apart,
+   * each finds the number the previous one took.
    */
   private async createWithReceiptRetry<T>(run: () => Promise<T>): Promise<T> {
-    const MAX_ATTEMPTS = 5;
+    const MAX_ATTEMPTS = 8;
     for (let attempt = 1; ; attempt++) {
       try {
         return await run();
@@ -266,6 +293,8 @@ export class SalesService {
           err.code === 'P2002' &&
           JSON.stringify(err.meta?.target ?? '').includes('receiptNo');
         if (!isReceiptCollision || attempt >= MAX_ATTEMPTS) throw err;
+        const backoffMs = Math.random() * 40 * attempt;
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
       }
     }
   }
@@ -369,75 +398,232 @@ export class SalesService {
     return { message: 'Held sale discarded' };
   }
 
-  async returnItems(user: AuthUser, saleId: string, dto: ReturnSaleDto) {
-    const businessId = user.businessId;
+  /**
+   * Check the lines of a return against the sale and value them: what the
+   * goods are worth, and whether this brings the last unit back. Writes
+   * nothing; the preview and the return both come through here and through
+   * `splitRefund`, so what the cashier is shown before confirming is exactly
+   * what happens.
+   */
+  private valueReturn(
+    sale: Prisma.SaleGetPayload<{ include: { items: true } }>,
+    lines: ReturnLine[],
+  ) {
+    const itemMap = new Map(sale.items.map((it) => [it.id, it]));
+    // Per line, so the same line named twice in one request is checked
+    // against its quantity as a whole rather than once per mention.
+    const asked = new Map<string, number>();
+    let itemsValue = 0;
+    for (const r of lines) {
+      const item = itemMap.get(r.saleItemId);
+      if (!item) throw new BadRequestException('Invalid sale item');
+      const total = round3((asked.get(item.id) ?? 0) + r.quantity);
+      const returnable = round3(Number(item.quantity) - Number(item.returnedQty));
+      if (total > returnable) {
+        throw new BadRequestException(
+          `Cannot return ${total} of "${item.name}" (only ${returnable} left)`,
+        );
+      }
+      asked.set(item.id, total);
+      itemsValue += lineRefund(sale, item, r.quantity);
+    }
+    // Numbers, not Decimals: Decimal comparison with >= compares strings,
+    // and "2" >= "10" once flagged a part return as a full one.
+    const closesSale = sale.items.every(
+      (it) =>
+        round3(Number(it.returnedQty) + (asked.get(it.id) ?? 0)) >=
+        Number(it.quantity),
+    );
+    return { itemMap, closesSale, refund: returnRefund(sale, itemsValue, closesSale) };
+  }
+
+  /**
+   * How a refund is paid: first by cancelling what the customer still owes on
+   * this sale, the rest handed back.
+   *
+   * The credit cancelled is capped by the customer's balance as well as by
+   * the sale. Paying a khata down lowers the balance without touching any one
+   * sale's amountPaid, so a sale can look unpaid long after the customer
+   * settled it; cancelling "its" credit then drove the balance negative and
+   * handed back nothing for goods the customer had paid for in full.
+   */
+  private splitRefund(
+    sale: { customerId: string | null; total: Prisma.Decimal; amountPaid: Prisma.Decimal },
+    refund: number,
+    customerBalance: number,
+  ) {
+    let creditCancelled = 0;
+    if (sale.customerId) {
+      const outstanding = round2(Number(sale.total) - Number(sale.amountPaid));
+      creditCancelled = round2(
+        Math.min(refund, Math.max(outstanding, 0), Math.max(customerBalance, 0)),
+      );
+    }
+    return { creditCancelled, cashBack: round2(refund - creditCancelled) };
+  }
+
+  /** Refused before anything is read or written: nothing to take back. */
+  private assertReturnable(status: SaleStatus) {
+    // A held cart is not a sale: it never took stock off the shelf or money
+    // into a drawer. "Returning" one put back stock that had never left and
+    // recorded a refund of money never taken -- stock out of thin air.
+    if (status === SaleStatus.HELD) {
+      throw new BadRequestException(
+        'A held cart is not a sale — resume or discard it instead',
+      );
+    }
+    if (status === SaleStatus.RETURNED) {
+      throw new BadRequestException('Sale already fully returned');
+    }
+  }
+
+  /**
+   * The tender a refund goes back on unless the cashier says otherwise: the
+   * one the sale was paid with -- a card sale refunds to the card and leaves
+   * the drawer alone -- and cash when the sale named no tender.
+   */
+  private async defaultRefundMethod(db: Db, saleId: string) {
+    const paid = await db.payment.findFirst({
+      where: { saleId, type: PaymentType.SALE },
+      select: { method: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    return paid && SETTLE_METHODS.includes(paid.method)
+      ? paid.method
+      : PaymentMethod.CASH;
+  }
+
+  /** What a return would hand back, for the cashier to see before confirming. */
+  async returnQuote(user: AuthUser, saleId: string, lines: ReturnLine[]) {
     const sale = await this.prisma.sale.findFirst({
-      where: { id: saleId, businessId },
+      where: { id: saleId, businessId: user.businessId },
       include: { items: true },
     });
     if (!sale) throw new NotFoundException('Sale not found');
-    if (sale.status === SaleStatus.RETURNED) {
-      throw new BadRequestException('Sale already fully returned');
-    }
+    assertOwnStore(user, sale.storeId);
+    this.assertReturnable(sale.status);
+    const [balance, defaultMethod] = await Promise.all([
+      sale.customerId
+        ? this.prisma.customer
+            .findUnique({
+              where: { id: sale.customerId },
+              select: { creditBalance: true },
+            })
+            .then((c) => Number(c?.creditBalance ?? 0))
+        : Promise.resolve(0),
+      this.defaultRefundMethod(this.prisma, sale.id),
+    ]);
+    const { refund, closesSale } = this.valueReturn(sale, lines);
+    return { refund, ...this.splitRefund(sale, refund, balance), closesSale, defaultMethod };
+  }
 
-    const itemMap = new Map(sale.items.map((it) => [it.id, it]));
-    const serialised = new Set(
-      (
-        await this.prisma.product.findMany({
-          where: {
-            id: { in: sale.items.map((i) => i.productId) },
-            businessId,
-            trackSerials: true,
-          },
-          select: { id: true },
-        })
-      ).map((p) => p.id),
-    );
-    let refund = 0;
-    for (const r of dto.items) {
-      const item = itemMap.get(r.saleItemId);
-      if (!item) throw new BadRequestException('Invalid sale item');
-      const quantity = Number(item.quantity);
-      const returnable = round3(quantity - Number(item.returnedQty));
-      if (r.quantity > returnable) {
-        throw new BadRequestException(
-          `Cannot return ${r.quantity} of "${item.name}" (only ${returnable} left)`,
-        );
-      }
-      const perUnit = Number(item.lineTotal) / quantity;
-      refund += perUnit * r.quantity;
-    }
-    refund = round2(refund);
+  /**
+   * Take goods back against a sale and hand back what they were worth.
+   *
+   * Everything that decides the money is read inside the transaction, with
+   * the sale and customer rows locked: the refund cap reads `refundedTotal`,
+   * the credit cancelled reads the sale's unpaid part and the customer's
+   * balance. Read before the transaction, two returns against the same sale
+   * could both refund "what is left" of it, or both cancel the same credit.
+   */
+  async returnItems(user: AuthUser, saleId: string, dto: ReturnSaleDto) {
+    const businessId = user.businessId;
+    const found = await this.prisma.sale.findFirst({
+      where: { id: saleId, businessId },
+      select: {
+        id: true,
+        storeId: true,
+        status: true,
+        items: { select: { productId: true } },
+      },
+    });
+    if (!found) throw new NotFoundException('Sale not found');
+    assertOwnStore(user, found.storeId);
+    this.assertReturnable(found.status);
+
+    const [trackedProducts, shiftId] = await Promise.all([
+      this.prisma.product.findMany({
+        where: {
+          id: { in: found.items.map((i) => i.productId) },
+          businessId,
+          OR: [{ trackSerials: true }, { trackBatches: true }],
+        },
+        select: { id: true, trackSerials: true, trackBatches: true },
+      }),
+      // The refund comes out of the drawer at the counter now, not the one the
+      // sale was rung up on: a return a week later is paid from today's till,
+      // and that till's count is the one it has to explain.
+      this.shifts.resolveShiftId(user, found.storeId, dto.shiftId),
+    ]);
+    const serialised = new Set(trackedProducts.filter((p) => p.trackSerials).map((p) => p.id));
+    const batched = new Set(trackedProducts.filter((p) => p.trackBatches).map((p) => p.id));
 
     return this.prisma.$transaction(async (tx) => {
-      // Stock-back-in is batched (one read + one bulk write for all lines);
-      // the returnedQty bumps stay per-row so duplicate saleItemIds in one
-      // request still accumulate correctly via the DB-level increment.
+      // One return per sale at a time. Everything below reads the sale after
+      // this, so a return that was waiting sees the one before it in full.
+      await tx.$queryRaw`SELECT id FROM "Sale" WHERE id = ${found.id} FOR UPDATE`;
+      const sale = await tx.sale.findUniqueOrThrow({
+        where: { id: found.id },
+        include: { items: true },
+      });
+      this.assertReturnable(sale.status);
+      const { itemMap, refund, closesSale } = this.valueReturn(sale, dto.items);
+
+      // Lock the customer before any stock row, the same order checkout
+      // takes them in. Checkout's first write is the Sale row, whose foreign
+      // key takes a share lock on the customer straight away; its stock rows
+      // come after. Locking stock first here -- as this briefly did -- let a
+      // return and a credit sale for the same customer and product each hold
+      // one row the other needed, and Postgres broke the deadlock by failing
+      // one with a 500 (found by firing both at once against a real database).
+      let balance = 0;
+      if (sale.customerId) {
+        const [customer] = await tx.$queryRaw<{ creditBalance: Prisma.Decimal }[]>`
+          SELECT "creditBalance" FROM "Customer" WHERE id = ${sale.customerId} FOR UPDATE
+        `;
+        balance = Number(customer?.creditBalance ?? 0);
+      }
+      const { creditCancelled, cashBack } = this.splitRefund(sale, refund, balance);
+
+      // Stock-back-in is batched (one read + one bulk write for all lines).
+      // Goods that came back damaged are booked in and written off in the
+      // same batch: they never reach the shelf, and the history shows both
+      // what came back and why it isn't there. Batched together, their net
+      // change is zero, so the write-off can't fail for want of stock.
+      const reason = dto.reason?.trim() || null;
       await this.inventory.applyMovementsBatch(
         tx,
-        dto.items.map((r) => {
+        dto.items.flatMap((r) => {
           const item = itemMap.get(r.saleItemId)!;
-          return {
+          const back = {
             businessId,
             storeId: sale.storeId,
             productId: item.productId,
-            type: StockMovementType.RETURN_IN,
-            quantity: r.quantity, // stock back in
             userId: user.userId,
             reference: sale.id,
           };
+          return [
+            { ...back, type: StockMovementType.RETURN_IN, quantity: r.quantity, note: reason },
+            ...(r.restock === false
+              ? [
+                  {
+                    ...back,
+                    type: StockMovementType.ADJUSTMENT,
+                    quantity: -r.quantity,
+                    reason: AdjustmentReason.DAMAGE,
+                    note: reason ? `Returned damaged: ${reason}` : 'Returned damaged',
+                  },
+                ]
+              : []),
+          ];
         }),
         { allowNegative: true },
       );
       for (const r of dto.items) {
         const item = itemMap.get(r.saleItemId)!;
-        // Guarded increment, same shape as the stock path: the
-        // `returnedQty + delta <= quantity` test is evaluated against the
-        // row's live, locked value at UPDATE time. The check above ran on a
-        // snapshot read before the transaction, so two cashiers returning the
-        // last unit of the same line at once would both pass it and the line
-        // would end up over-returned -- stock back in twice, refunded twice.
-        // Matching zero rows here means the other one got there first.
+        // Guarded increment, evaluated against the row's live value at UPDATE
+        // time. The sale lock above already serialises returns; this stays as
+        // the last line of defence against a line being returned twice.
         const delta = String(round3(r.quantity));
         const bumped = await tx.$queryRaw<{ id: string }[]>`
           UPDATE "SaleItem"
@@ -459,57 +645,47 @@ export class SalesService {
             saleId: sale.id,
             quantity: r.quantity,
             serials: r.serials,
+            damaged: r.restock === false,
+          });
+        }
+        // Written-off goods never reach the shelf, so they rejoin no batch.
+        if (batched.has(item.productId) && r.restock !== false) {
+          await this.inventory.restoreBatchOnReturn(tx, {
+            storeId: sale.storeId,
+            productId: item.productId,
+            quantity: r.quantity,
+            soldAt: sale.createdAt,
           });
         }
       }
 
-      // Fully vs partially returned?
-      // Both columns are numeric(12,3), so Prisma hands them back as Decimal.
-      // Comparing those with >= compares their valueOf(), which is a *string*
-      // -- "2" >= "10" is true -- so a part return silently flagged the whole
-      // sale RETURNED, dropping it out of every revenue report and blocking
-      // any further return on it. Compare as numbers.
-      const updatedItems = await tx.saleItem.findMany({
-        where: { saleId: sale.id },
-      });
-      const fullyReturned = updatedItems.every(
-        (it) => Number(it.returnedQty) >= Number(it.quantity),
-      );
-
-      // A refund first cancels whatever the customer still owes on this sale
-      // (the unpaid/credit portion); only the rest is money handed back.
-      // Settling it via the return raises amountPaid too, so a later return
-      // on the same sale can't decrement the same credit twice.
-      let creditReduction = 0;
-      if (sale.customerId) {
-        const outstanding = round2(
-          Number(sale.total) - Number(sale.amountPaid),
-        );
-        creditReduction = Math.min(refund, Math.max(outstanding, 0));
-        if (creditReduction > 0) {
-          await tx.customer.update({
-            where: { id: sale.customerId },
-            data: { creditBalance: { decrement: creditReduction } },
-          });
-        }
+      // Credit first: that part never leaves the drawer, it just stops being
+      // owed. Settling it via the return raises amountPaid too, so a later
+      // return can't cancel the same credit twice.
+      if (creditCancelled > 0) {
+        await tx.customer.update({
+          where: { id: sale.customerId! },
+          data: { creditBalance: { decrement: creditCancelled } },
+        });
       }
 
-      // Money physically handed back is the refund less whatever was settled
-      // by cancelling the customer's outstanding credit on this sale -- that
-      // part never leaves the drawer, it just stops being owed.
-      const cashRefunded = round2(refund - creditReduction);
-      if (cashRefunded > 0) {
+      // The rest is handed back, on the tender the cashier chose -- by default
+      // the one the sale was paid with.
+      let method: PaymentMethod | null = null;
+      if (cashBack > 0) {
+        method = dto.refundMethod ?? (await this.defaultRefundMethod(tx, sale.id));
         await this.payments.record(
           {
             businessId: sale.businessId,
             type: PaymentType.REFUND,
-            amount: cashRefunded,
-            method: sale.paymentMethod,
+            amount: cashBack,
+            method,
             saleId: sale.id,
             customerId: sale.customerId,
             storeId: sale.storeId,
-            shiftId: sale.shiftId,
+            shiftId,
             userId: user.userId,
+            note: reason,
           },
           tx,
         );
@@ -518,19 +694,25 @@ export class SalesService {
       const updated = await tx.sale.update({
         where: { id: sale.id },
         data: {
-          ...(creditReduction > 0
-            ? { amountPaid: { increment: creditReduction } }
+          ...(creditCancelled > 0
+            ? { amountPaid: { increment: creditCancelled } }
             : {}),
           // Revenue is total - refundedTotal, so this is what keeps a part
           // return out of the books without discarding the part that sold.
           refundedTotal: { increment: refund },
-          status: fullyReturned
+          status: closesSale
             ? SaleStatus.RETURNED
             : SaleStatus.PARTIALLY_RETURNED,
         },
         include: { items: true },
       });
-      return { sale: updated, refund };
+      return {
+        sale: updated,
+        refund,
+        creditCancelled,
+        cashBack,
+        method,
+      };
     }, TX_OPTS);
   }
 

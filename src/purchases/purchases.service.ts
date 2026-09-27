@@ -19,6 +19,8 @@ import { ReturnPurchaseDto } from './dto/return-purchase.dto';
 import { ReceivePurchaseDto } from './dto/receive-purchase.dto';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+import { AuthUser } from '../common/types/auth-user';
+import { assertOwnStore } from '../common/store-scope';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 /** Quantities are numeric(12,3) — keep float arithmetic on that grid. */
@@ -162,6 +164,13 @@ export class PurchasesService {
         'A purchase with a supplier return cannot be edited',
       );
     }
+    // An edit recomputes what was paid against the new total, and a refund
+    // already owed was worked out against the old one. Settle it first.
+    if (Number(existing.refundDue) > 0) {
+      throw new BadRequestException(
+        'The supplier still owes a refund on this purchase — record it as received before editing',
+      );
+    }
     // ponytail: editing rebuilds the lines, which would orphan the units this
     // purchase booked in (some may already be sold). Blocked rather than
     // reconciled — return to the supplier or adjust instead. Revisit if shops
@@ -203,10 +212,13 @@ export class PurchasesService {
       items.reduce((sum, i) => sum + i.quantity * i.costPrice, 0),
     );
     const total = subtotal;
-    const amountPaid = Math.min(
-      Math.max(dto.amountPaid ?? Number(existing.amountPaid), 0),
-      total,
-    );
+    const paidBefore = Number(existing.amountPaid);
+    const requested = Math.max(dto.amountPaid ?? paidBefore, 0);
+    const amountPaid = Math.min(requested, total);
+    // Money already handed over that the new, smaller total no longer covers:
+    // the supplier owes it back. Only what was really paid counts -- an
+    // amountPaid typed above the total is a typo to clamp, not a debt.
+    const owedBack = round2(Math.max(Math.min(requested, paidBefore) - total, 0));
     const wasReceived = existing.status === PurchaseStatus.RECEIVED;
 
     return this.prisma.$transaction(async (tx) => {
@@ -250,6 +262,7 @@ export class PurchasesService {
           tax: 0,
           total,
           amountPaid,
+          ...(owedBack > 0 ? { refundDue: owedBack } : {}),
           items: {
             create: items.map((i) => ({
               productId: i.productId,
@@ -262,10 +275,11 @@ export class PurchasesService {
         },
       });
 
-      // An edit can change what was paid -- directly, or because a smaller
-      // total clamps it down. Record the difference, so the supplier's
-      // payments still add up to what their invoices say was paid.
-      const paidDelta = round2(amountPaid - Number(existing.amountPaid));
+      // An edit can change what was paid directly: a correction, recorded as
+      // the money it says moved, so the supplier's payments still add up to
+      // what their invoices say was paid. What a smaller total merely clamps
+      // off is owed back instead (refundDue above), not money that moved.
+      const paidDelta = round2(amountPaid - paidBefore + owedBack);
       if (paidDelta !== 0) {
         await this.payments.record(
           {
@@ -450,12 +464,15 @@ export class PurchasesService {
     userId: string,
     id: string,
     dto: ReturnPurchaseDto,
+    actor?: AuthUser,
   ) {
     const purchase = await this.prisma.purchase.findFirst({
       where: { id, businessId },
       include: { items: true },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
+    // A stock keeper sends back goods from the shelf they stand at.
+    if (actor) assertOwnStore(actor, purchase.storeId);
     if (purchase.status !== PurchaseStatus.RECEIVED) {
       throw new BadRequestException(
         'Only a received purchase can be returned to the supplier',
@@ -560,32 +577,19 @@ export class PurchasesService {
       }
 
       // Clamping amountPaid down to the new total is money the supplier now
-      // owes back. It is logged as a supplier refund when the return is made,
-      // since that is when the paid-to-date figure drops; the refund itself
-      // is settled outside the app, which the note says.
-      if (refundDueFromSupplier > 0) {
-        await this.payments.record(
-          {
-            businessId,
-            type: PaymentType.SUPPLIER_REFUND,
-            amount: refundDueFromSupplier,
-            method: PaymentMethod.CASH,
-            supplierId: purchase.supplierId,
-            purchaseId: purchase.id,
-            storeId: purchase.storeId,
-            userId,
-            note: 'Refund due on goods returned',
-          },
-          tx,
-        );
-      }
-
+      // owes back. Owed, not received: it goes on the purchase as refundDue,
+      // and reaches the ledger only when the refund actually arrives
+      // (recordRefundReceived). Writing the ledger row here claimed money had
+      // come in that hadn't, and left what was still owed recorded nowhere.
       const updated = await tx.purchase.update({
         where: { id: purchase.id },
         data: {
           subtotal: newSubtotal,
           total: newTotal,
           amountPaid: newAmountPaid,
+          ...(refundDueFromSupplier > 0
+            ? { refundDue: { increment: refundDueFromSupplier } }
+            : {}),
           note: dto.note ?? purchase.note,
         },
         include: { items: true },
@@ -601,6 +605,57 @@ export class PurchasesService {
         refundDueFromSupplier,
       };
     }, TX_OPTS);
+  }
+
+  /**
+   * The supplier has paid back what they owed on this purchase (or part of
+   * it). This is when the money actually moves, so it is when the ledger gets
+   * its SUPPLIER_REFUND row -- in the same transaction as the balance, the
+   * guarded decrement keeping two recordings from both clearing it.
+   */
+  async recordRefundReceived(
+    businessId: string,
+    id: string,
+    amount: number,
+    context: { method?: PaymentMethod; userId?: string; note?: string } = {},
+  ) {
+    if (amount <= 0) throw new BadRequestException('Amount must be positive');
+    const purchase = await this.prisma.purchase.findFirst({
+      where: { id, businessId },
+    });
+    if (!purchase) throw new NotFoundException('Purchase not found');
+
+    return this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.purchase.updateMany({
+        where: { id, businessId, refundDue: { gte: amount } },
+        data: { refundDue: { decrement: amount } },
+      });
+      if (claimed.count === 0) {
+        throw new BadRequestException(
+          `That is more than the ${round2(Number(purchase.refundDue))} the supplier owes back`,
+        );
+      }
+      await this.payments.record(
+        {
+          businessId,
+          type: PaymentType.SUPPLIER_REFUND,
+          amount,
+          method: context.method ?? PaymentMethod.CASH,
+          supplierId: purchase.supplierId,
+          purchaseId: id,
+          storeId: purchase.storeId,
+          // No shiftId, like a supplier payment: not a till transaction.
+          userId: context.userId ?? null,
+          note: context.note ?? null,
+        },
+        tx,
+      );
+      const updated = await tx.purchase.findUniqueOrThrow({ where: { id } });
+      return {
+        ...updated,
+        outstanding: round2(Number(updated.total) - Number(updated.amountPaid)),
+      };
+    });
   }
 
   /**

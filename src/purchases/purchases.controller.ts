@@ -111,7 +111,7 @@ export class PurchasesController {
     @Param('id') id: string,
     @Body() dto: ReturnPurchaseDto,
   ) {
-    return this.purchases.returnItems(u.businessId, u.userId, id, dto);
+    return this.purchases.returnItems(u.businessId, u.userId, id, dto, u);
   }
 
   /** Record a payment to the supplier against this purchase (credit settlement). */
@@ -123,6 +123,21 @@ export class PurchasesController {
     @Body() dto: PayPurchaseDto,
   ) {
     return this.purchases.recordPayment(u.businessId, id, dto.amount, {
+      method: dto.method,
+      userId: u.userId,
+      note: dto.note,
+    });
+  }
+
+  /** The supplier paid back what they owed on this purchase (see refundDue). */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Post(':id/refund-received')
+  refundReceived(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: PayPurchaseDto,
+  ) {
+    return this.purchases.recordRefundReceived(u.businessId, id, dto.amount, {
       method: dto.method,
       userId: u.userId,
       note: dto.note,

@@ -273,7 +273,6 @@ export class ReportsService {
             receiptNo: true,
             createdAt: true,
             total: true,
-            refundedTotal: true,
             amountPaid: true,
           },
         },
@@ -297,8 +296,13 @@ export class ReportsService {
       // Newest first: the tail of the debt is what survives FIFO payments.
       for (const sale of c.sales) {
         if (remaining <= 0) break;
-        const outstanding =
-          paisa(sale.total) - paisa(sale.refundedTotal) - paisa(sale.amountPaid);
+        // What this sale still has on the khata. A return that cancels credit
+        // raises amountPaid by the amount cancelled, so `total - amountPaid`
+        // already nets it. refundedTotal carries that same amount too, and
+        // subtracting it as well counted every such return twice -- the sale
+        // looked short by the return and the difference was reported as
+        // `unattributed`. Same rule as PaymentsService.customerStatement.
+        const outstanding = paisa(sale.total) - paisa(sale.amountPaid);
         if (outstanding <= 0) continue;
 
         const allocated = Math.min(remaining, outstanding);

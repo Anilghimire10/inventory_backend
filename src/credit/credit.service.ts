@@ -19,9 +19,10 @@ export class CreditService {
    * by store it means "owed by customers who buy here", still in full.
    */
   async summary(businessId: string, storeId?: string) {
-    const [receivables, payables] = await Promise.all([
+    const [receivables, payables, refunds] = await Promise.all([
       this.receivables(businessId, storeId),
       this.payables(businessId, storeId),
+      this.supplierRefunds(businessId, storeId),
     ]);
     const receivablesTotal = round2(
       receivables.reduce((s, c) => s + c.balance, 0),
@@ -29,12 +30,19 @@ export class CreditService {
     const payablesTotal = round2(
       payables.reduce((s, sup) => s + sup.outstanding, 0),
     );
+    const supplierRefundsDue = round2(
+      refunds.reduce((s, sup) => s + sup.due, 0),
+    );
     return {
       receivablesTotal,
       payablesTotal,
-      netPosition: round2(receivablesTotal - payablesTotal),
+      /** Money suppliers owe back on goods returned to them. */
+      supplierRefundsDue,
+      // What is owed to us, customers and suppliers both, less what we owe.
+      netPosition: round2(receivablesTotal + supplierRefundsDue - payablesTotal),
       customersOwing: receivables.length,
       suppliersOwed: payables.length,
+      suppliersOwingRefunds: refunds.length,
       /** True when receivablesTotal is a business-wide figure shown under a
        *  store filter, so the UI can label it rather than imply a branch total. */
       receivablesAreBusinessWide: !!storeId,
@@ -92,6 +100,52 @@ export class CreditService {
         createdAt: s.createdAt,
       })),
     }));
+  }
+
+  /**
+   * Money suppliers owe us: paid-for goods sent back to them, not yet
+   * refunded. One entry per supplier with the purchases it is owed on.
+   */
+  async supplierRefunds(businessId: string, storeId?: string) {
+    const purchases = await this.prisma.purchase.findMany({
+      where: {
+        businessId,
+        refundDue: { gt: 0 },
+        ...(storeId ? { storeId } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        reference: true,
+        refundDue: true,
+        createdAt: true,
+        supplierId: true,
+        supplier: { select: { id: true, name: true } },
+      },
+    });
+    const groups = new Map<
+      string,
+      {
+        id: string | null;
+        name: string;
+        due: number;
+        purchases: { id: string; reference: string | null; refundDue: number; createdAt: Date }[];
+      }
+    >();
+    for (const p of purchases) {
+      const key = p.supplierId ?? '__none__';
+      const g = groups.get(key) ?? {
+        id: p.supplier?.id ?? null,
+        name: p.supplier?.name ?? 'No supplier',
+        due: 0,
+        purchases: [],
+      };
+      const due = round2(Number(p.refundDue));
+      g.due = round2(g.due + due);
+      g.purchases.push({ id: p.id, reference: p.reference, refundDue: due, createdAt: p.createdAt });
+      groups.set(key, g);
+    }
+    return [...groups.values()].sort((a, b) => b.due - a.due);
   }
 
   /**

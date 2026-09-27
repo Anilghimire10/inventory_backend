@@ -11,7 +11,11 @@ const CASH_IN: PaymentType[] = [
   PaymentType.SUPPLIER_REFUND,
 ];
 
-/** Tenders that move physical notes, and so touch a drawer. */
+/**
+ * Tenders that move physical notes, and so touch a drawer. MIXED is here for
+ * rows written before a part-paid sale recorded its real tender; new rows
+ * never carry it.
+ */
 const CASH_TENDERS: PaymentMethod[] = [PaymentMethod.CASH, PaymentMethod.MIXED];
 
 /**
@@ -102,11 +106,38 @@ export class PaymentsService {
    * Only cash tenders. Paying a khata by card or QR moves the balance without
    * touching the drawer.
    */
-  async cashCollectedOnShift(shiftId: string): Promise<number> {
-    const agg = await this.prisma.payment.aggregate({
+  async cashCollectedOnShift(
+    shiftId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<number> {
+    const agg = await (tx ?? this.prisma).payment.aggregate({
       where: {
         shiftId,
         type: PaymentType.CUSTOMER_CREDIT,
+        method: { in: CASH_TENDERS },
+      },
+      _sum: { amount: true },
+    });
+    return round2(Number(agg._sum.amount ?? 0));
+  }
+
+  /**
+   * Cash handed back over the counter on returns, for one shift.
+   *
+   * Read from the refunds themselves rather than rebuilt from the returned
+   * lines. The lines can't say how much of a return cancelled credit instead
+   * of leaving the drawer, which tender it went back on, or which till paid
+   * it -- and each of those is the difference between a drawer that balances
+   * and a cashier blamed for a shortfall that isn't there.
+   */
+  async cashRefundedOnShift(
+    shiftId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<number> {
+    const agg = await (tx ?? this.prisma).payment.aggregate({
+      where: {
+        shiftId,
+        type: PaymentType.REFUND,
         method: { in: CASH_TENDERS },
       },
       _sum: { amount: true },

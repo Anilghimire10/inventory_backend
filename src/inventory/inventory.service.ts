@@ -358,6 +358,13 @@ export class InventoryService {
       JOIN "Store"   s ON s.id = si."storeId"
       WHERE si."businessId" = ${businessId}
         ${storeId ? Prisma.sql`AND si."storeId" = ${storeId}` : Prisma.empty}
+        -- Nothing to reorder for a deleted product, a closed branch, or a
+        -- style whose stock lives on its variants. Without these, each one
+        -- alerted forever (bell, dashboard, daily email) and "create reorder
+        -- drafts" raised purchase orders for goods the shop had retired.
+        AND p."isActive"
+        AND s."isActive"
+        AND NOT EXISTS (SELECT 1 FROM "Product" v WHERE v."parentId" = p.id)
         AND COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel") > 0
         AND si.quantity <= COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel")
       ORDER BY p.name ASC
@@ -525,6 +532,9 @@ export class InventoryService {
    * Customer return: put units back on the shelf. Named serials must belong
    * to this sale; when none are named the oldest sold units on the sale are
    * taken, so a return can be processed without re-scanning.
+   *
+   * A unit that came back damaged is marked DAMAGED instead: it is back in
+   * the shop, but written off, so it can never be scanned into a sale again.
    */
   async returnSerialsToStock(
     db: Db,
@@ -535,6 +545,7 @@ export class InventoryService {
       saleId: string;
       quantity: number;
       serials?: string[];
+      damaged?: boolean;
     },
   ) {
     const ids = await this.pickSerials(db, {
@@ -549,10 +560,45 @@ export class InventoryService {
     await db.serial.updateMany({
       where: { id: { in: ids } },
       data: {
-        status: SerialStatus.IN_STOCK,
+        status: input.damaged ? SerialStatus.DAMAGED : SerialStatus.IN_STOCK,
         storeId: input.storeId,
         soldAt: null,
       },
+    });
+  }
+
+  /**
+   * Customer return of a batch-tracked product: put the quantity back into a
+   * batch, so expiry tracking counts it again. Without this every return
+   * left the batches short of the shelf, and expiry alerts under-counted.
+   *
+   * ponytail: a sale consumes batches first-expiry-first without recording
+   * which batch each unit came from, so the batch it goes back to is
+   * inferred -- the earliest-expiring one the store already held when the
+   * sale was made, which is the one FEFO would have taken it from. Erring
+   * that way also warns about expiry sooner rather than later. Record the
+   * batch on the sale line if exact traceability is ever needed.
+   */
+  async restoreBatchOnReturn(
+    db: Db,
+    input: { storeId: string; productId: string; quantity: number; soldAt: Date },
+  ) {
+    const batch = await db.batch.findFirst({
+      where: {
+        storeId: input.storeId,
+        productId: input.productId,
+        createdAt: { lte: input.soldAt },
+      },
+      // The same order a sale consumes them in (NULL expiries sort last).
+      orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
+      select: { id: true },
+    });
+    // No batch to put it in: StockItem stays the source of truth, exactly as
+    // when a sale finds its batches short.
+    if (!batch) return;
+    await db.batch.update({
+      where: { id: batch.id },
+      data: { quantity: { increment: String(round3(input.quantity)) } },
     });
   }
 
