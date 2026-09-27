@@ -195,10 +195,12 @@ export class PurchasesService {
       throw new BadRequestException('A purchase needs at least one item');
     }
 
-    if (dto.supplierId === '') dto.supplierId = undefined;
+    // '' is the form's "no supplier" -- an explicit clear, which a missing
+    // field is not. Absent keeps the purchase's supplier.
+    const supplierId = dto.supplierId === '' ? null : dto.supplierId;
     const newStoreId = dto.storeId ?? existing.storeId;
     await this.assertStore(businessId, newStoreId);
-    if (dto.supplierId) await this.assertSupplier(businessId, dto.supplierId);
+    if (supplierId) await this.assertSupplier(businessId, supplierId);
 
     const productIds = items.map((i) => i.productId);
     const products = await this.prisma.product.findMany({
@@ -255,9 +257,13 @@ export class PurchasesService {
         where: { id },
         data: {
           storeId: newStoreId,
-          supplierId: dto.supplierId ?? null,
-          reference: dto.reference ?? null,
-          note: dto.note ?? null,
+          // `?? null` cleared each of these whenever the client left it out,
+          // which is fine while the web form posts every field and becomes
+          // silent data loss the moment anything sends a partial patch. Absent
+          // must mean "leave it alone"; only an explicit null clears.
+          ...(supplierId !== undefined ? { supplierId } : {}),
+          ...(dto.reference !== undefined ? { reference: dto.reference } : {}),
+          ...(dto.note !== undefined ? { note: dto.note } : {}),
           subtotal,
           tax: 0,
           total,
@@ -290,7 +296,9 @@ export class PurchasesService {
                 : PaymentType.SUPPLIER_REFUND,
             amount: Math.abs(paidDelta),
             method: PaymentMethod.CASH,
-            supplierId: dto.supplierId ?? null,
+            // Whoever the purchase is with after this edit, including the
+            // supplier it kept when the edit didn't mention one.
+            supplierId: supplierId === undefined ? existing.supplierId : supplierId,
             purchaseId: id,
             storeId: newStoreId,
             userId: userId ?? null,
