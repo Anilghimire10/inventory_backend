@@ -99,6 +99,17 @@ export class BusinessService {
       this.prisma.stockMovement.findMany({ ...a, where }),
     );
     yield* this.pageTable('batch', (a) => this.prisma.batch.findMany({ ...a, where }));
+    // The records a shop's books and warranties rest on. The export stopped
+    // at stock, so a "full" download -- the backup an owner keeps, and what a
+    // shop leaving the platform is handed -- had no payment history, no till
+    // reports and no serial numbers.
+    yield* this.pageTable('serial', (a) => this.prisma.serial.findMany({ ...a, where }));
+    yield* this.pageTable('shift', (a) => this.prisma.shift.findMany({ ...a, where }));
+    yield* this.pageTable('payment', (a) => this.prisma.payment.findMany({ ...a, where }));
+    yield* this.pageTable('auditLog', (a) => this.prisma.auditLog.findMany({ ...a, where }));
+    yield* this.pageTable('supportTicket', (a) =>
+      this.prisma.supportTicket.findMany({ ...a, where, include: { messages: true } }),
+    );
   }
 
   /**

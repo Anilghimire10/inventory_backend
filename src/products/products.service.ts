@@ -355,11 +355,13 @@ export class ProductsService {
         where: { id },
         data: {
           ...rest,
-          // Setting a tax snapshots its rate; clearing it (null) leaves the rate.
+          // Choosing a tax takes its current rate; choosing no tax (null)
+          // clears both, so the product charges exactly what its form shows.
+          // Clearing the id alone used to leave the old rate being charged.
           ...(taxId !== undefined
             ? taxId
               ? { taxId, taxRate: await this.resolveTaxRate(businessId, taxId) }
-              : { taxId: null }
+              : { taxId: null, taxRate: 0 }
             : {}),
           ...(expiryDate !== undefined
             ? { expiryDate: expiryDate ? new Date(expiryDate) : null }
@@ -762,7 +764,7 @@ export class ProductsService {
   }
 
   /** Resolve a tax id to its current rate (validating tenant ownership). */
-  private async resolveTaxRate(businessId: string, taxId?: string) {
+  private async resolveTaxRate(businessId: string, taxId?: string | null) {
     if (!taxId) return undefined;
     const tax = await this.prisma.tax.findFirst({
       where: { id: taxId, businessId },

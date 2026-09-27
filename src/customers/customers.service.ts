@@ -140,21 +140,31 @@ export class CustomersService {
     });
   }
 
+  /**
+   * Delete a customer who has never been used -- a typo or a duplicate.
+   *
+   * Checked here rather than left to the database: Sale.customerId and
+   * Payment.customerId are ON DELETE SET NULL, so the database never refuses.
+   * The delete used to go through for anyone, silently wiping what they owed
+   * off the books and turning their sales into walk-in sales.
+   */
   async remove(businessId: string, id: string) {
-    await this.ensure(businessId, id);
-    try {
-      return await this.prisma.customer.delete({ where: { id } });
-    } catch (err) {
-      if (
-        err instanceof Prisma.PrismaClientKnownRequestError &&
-        err.code === 'P2003'
-      ) {
-        throw new BadRequestException(
-          'This customer has sale history and cannot be deleted.',
-        );
-      }
-      throw err;
+    const customer = await this.ensure(businessId, id);
+    if (Number(customer.creditBalance) > 0) {
+      throw new BadRequestException(
+        'This customer still owes money. Settle their balance before deleting them.',
+      );
     }
+    const [sales, payments] = await Promise.all([
+      this.prisma.sale.count({ where: { customerId: id } }),
+      this.prisma.payment.count({ where: { customerId: id } }),
+    ]);
+    if (sales || payments) {
+      throw new BadRequestException(
+        'This customer has sale or payment history and cannot be deleted.',
+      );
+    }
+    return this.prisma.customer.delete({ where: { id } });
   }
 
   private async ensure(businessId: string, id: string) {

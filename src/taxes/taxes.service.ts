@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -45,6 +46,18 @@ export class TaxesService {
     try {
       return await this.prisma.$transaction(async (tx) => {
         if (dto.isDefault) await this.clearDefault(businessId, tx);
+        // Staff choose a tax for each product, and the product form shows it
+        // with the tax's rate -- so that rate is what the product must charge.
+        // Products carry a copy of it (Product.taxRate, what a sale reads), and
+        // a rate change used to stop here: the form said "VAT (15%)" while the
+        // till went on charging 13%. Sales already made keep the rate on their
+        // own lines, so history doesn't move.
+        if (dto.rate !== undefined) {
+          await tx.product.updateMany({
+            where: { businessId, taxId: id },
+            data: { taxRate: dto.rate },
+          });
+        }
         return tx.tax.update({
         where: { id },
         data: {
@@ -60,11 +73,34 @@ export class TaxesService {
     }
   }
 
+  /**
+   * Delete a tax nothing is being sold under.
+   *
+   * The foreign key only clears Product.taxId, so products used to keep
+   * charging the deleted rate while their form showed "No tax" -- the opposite
+   * of what staff had chosen, and invisible. Clearing the rate instead would
+   * silently change what those products cost. So a tax still on an active
+   * product is refused: whoever deletes it moves those products to another
+   * tax (or to no tax) first, knowingly. Retired products can't be sold, so
+   * they simply let go of it.
+   */
   async remove(businessId: string, id: string) {
     await this.ensure(businessId, id);
-    // Products referencing this tax keep their snapshotted taxRate; the FK is
-    // set null on delete.
-    return this.prisma.tax.delete({ where: { id } });
+    const inUse = await this.prisma.product.count({
+      where: { businessId, taxId: id, isActive: true },
+    });
+    if (inUse > 0) {
+      throw new BadRequestException(
+        `${inUse} product${inUse === 1 ? ' uses' : 's use'} this tax. Choose another tax (or No tax) for ${inUse === 1 ? 'it' : 'them'} first, or deactivate the tax instead.`,
+      );
+    }
+    return this.prisma.$transaction(async (tx) => {
+      await tx.product.updateMany({
+        where: { businessId, taxId: id },
+        data: { taxId: null, taxRate: 0 },
+      });
+      return tx.tax.delete({ where: { id } });
+    });
   }
 
   private clearDefault(businessId: string, tx: Prisma.TransactionClient) {

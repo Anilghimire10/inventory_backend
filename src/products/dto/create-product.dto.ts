@@ -111,11 +111,14 @@ export class CreateProductDto {
   @Min(0)
   sellingPrice?: number;
 
-  @ApiPropertyOptional({ description: 'Id of an admin-defined tax (sets the rate)' })
+  @ApiPropertyOptional({
+    description: 'Id of an admin-defined tax (sets the rate); null for no tax',
+    nullable: true,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(64)
-  taxId?: string;
+  taxId?: string | null;
 
   @ApiPropertyOptional({
     default: 0,
