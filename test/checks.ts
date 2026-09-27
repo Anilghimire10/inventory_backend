@@ -23,13 +23,15 @@ import { PurchasesService } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
 import { UsersService } from '../src/users/users.service';
 import { StoreScopeGuard } from '../src/common/guards/store-scope.guard';
-import { scopeToStore } from '../src/common/store-scope';
+import { assertOwnStore, scopeToStore } from '../src/common/store-scope';
 import { StoresService } from '../src/stores/stores.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { AuthUser } from '../src/common/types/auth-user';
 import { allowsFraction, normalizeUnit } from '../src/common/units';
 import { splitTax } from '../src/common/tax';
 import { SettingsService } from '../src/settings/settings.service';
+import { ReportsService } from '../src/reports/reports.service';
+import { TaxesService } from '../src/taxes/taxes.service';
 import { LogRetentionCron } from '../src/settings/log-retention.cron';
 import { SupportService } from '../src/support/support.service';
 import { QueryTicketsDto } from '../src/support/dto/support.dto';
@@ -86,15 +88,20 @@ const user: AuthUser = {
 };
 
 async function shiftReportBalancesTheDrawer() {
+  const pay = (method: PaymentMethod, amount: number) => [{ method, amount }];
   const sales = [
     // paid in full, cash -> 1000 in the drawer
-    { subtotal: 1000, discount: 0, tax: 0, total: 1000, amountPaid: 1000, paymentMethod: PaymentMethod.CASH, items: [{ quantity: 2, returnedQty: 0, lineTotal: 1000 }] },
+    { discount: 0, tax: 0, total: 1000, refundedTotal: 0, amountPaid: 1000, paymentMethod: PaymentMethod.CASH, payments: pay(PaymentMethod.CASH, 1000) },
     // card sale -> revenue, but no cash in the drawer
-    { subtotal: 500, discount: 0, tax: 0, total: 500, amountPaid: 500, paymentMethod: PaymentMethod.CARD, items: [{ quantity: 1, returnedQty: 0, lineTotal: 500 }] },
-    // half paid in cash, half on credit
-    { subtotal: 400, discount: 0, tax: 0, total: 400, amountPaid: 150, paymentMethod: PaymentMethod.MIXED, items: [{ quantity: 1, returnedQty: 0, lineTotal: 400 }] },
-    // cash sale with one of two units returned -> 300 back out of the drawer
-    { subtotal: 600, discount: 0, tax: 0, total: 600, amountPaid: 600, paymentMethod: PaymentMethod.CASH, items: [{ quantity: 2, returnedQty: 1, lineTotal: 600 }] },
+    { discount: 0, tax: 0, total: 500, refundedTotal: 0, amountPaid: 500, paymentMethod: PaymentMethod.CARD, payments: pay(PaymentMethod.CARD, 500) },
+    // 150 paid now BY CARD, 250 on credit. The sale says MIXED, which used to
+    // be counted as cash -- the drawer then expected 150 that went to the card.
+    { discount: 0, tax: 0, total: 400, refundedTotal: 0, amountPaid: 150, paymentMethod: PaymentMethod.MIXED, payments: pay(PaymentMethod.CARD, 150) },
+    // the same split from before the ledger: no payment row, so the old rule
+    // (MIXED's paid part is cash) still applies
+    { discount: 0, tax: 0, total: 400, refundedTotal: 0, amountPaid: 150, paymentMethod: PaymentMethod.MIXED, payments: [] },
+    // cash sale with one of two units returned
+    { discount: 0, tax: 0, total: 600, refundedTotal: 300, amountPaid: 600, paymentMethod: PaymentMethod.CASH, payments: pay(PaymentMethod.CASH, 600) },
   ];
   const shift = {
     id: 'sh1',
@@ -106,28 +113,39 @@ async function shiftReportBalancesTheDrawer() {
     expectedCash: null,
     countedCash: null,
     variance: null,
+    refundsAtClose: null,
+    carriedFloat: null,
+    cashLeft: null,
+    business: { shiftBlindClose: false, shiftVarianceNoteOver: null },
+    cashMovements: [],
   };
-  const prisma = stub<PrismaService>({
+  const db: any = {
     shift: {
       findFirst: async () => shift,
-      updateMany: async (args: any) => {
-        Object.assign(shift, args.data);
-        return { count: 1 };
-      },
+      updateMany: async () => ({ count: shift.closedAt ? 0 : 1 }),
+      update: async (args: any) => Object.assign(shift, args.data),
     },
     sale: { findMany: async () => sales },
-  });
+    cashMovement: { findMany: async () => [] },
+  };
+  db.$transaction = (fn: (tx: unknown) => unknown) => fn(db);
+  const prisma = stub<PrismaService>(db);
   const service = new ShiftsService(
     prisma,
-    stub<PaymentsService>({ cashCollectedOnShift: async () => 0 }),
+    stub<PaymentsService>({
+      cashCollectedOnShift: async () => 0,
+      // What the refund rows say left this drawer: the 300 above.
+      cashRefundedOnShift: async () => 300,
+    }),
   );
 
   const x: any = await service.report('b1', 'sh1');
-  assert.strictEqual(x.gross, 2500, 'gross is every stamped sale at full value');
-  assert.strictEqual(x.refunds, 300, 'one of two units on a 600 line');
-  assert.strictEqual(x.net, 2200, 'net = gross - refunds');
-  // 5000 float + 1000 cash + 150 cash part of the mixed sale + 600 cash - 300 refund
+  assert.strictEqual(x.gross, 2900, 'gross is every stamped sale at full value');
+  assert.strictEqual(x.refunds, 300, 'refunds are what was handed back on these sales');
+  assert.strictEqual(x.net, 2600, 'net = gross - refunds');
+  // 5000 float + 1000 cash + 150 legacy cash part + 600 cash - 300 cash refund
   assert.strictEqual(x.expectedCash, 6450, 'card and credit money never touches the drawer');
+  assert.strictEqual(x.cashIn, 1750, 'a card part-payment is not cash');
   assert.strictEqual(
     x.byTender.find((t: any) => t.method === PaymentMethod.CARD).amount,
     500,
@@ -137,6 +155,310 @@ async function shiftReportBalancesTheDrawer() {
   const closed: any = await service.close(user, 'sh1', { countedCash: 6400 });
   assert.strictEqual(closed.variance, -50, 'counted short of expected is a negative variance');
   assert.strictEqual(closed.expectedCash, 6450, 'close snapshots what it computed');
+
+  // Days later the rest of the 600 sale comes back. The Z report was counted
+  // and signed off at close; it must still read what it read then.
+  sales[4].refundedTotal = 600;
+  const later: any = await service.report('b1', 'sh1');
+  assert.strictEqual(later.refunds, 300, 'refunds are frozen at close');
+  assert.strictEqual(later.net, 2600, 'and so is net');
+}
+
+/**
+ * Cash control on a shift: pay ins and pay outs move the expected cash, blind
+ * close hides it from cashiers only, a big variance needs a note (except when
+ * the cashier couldn't have known), a count by denomination must add up, and
+ * the next shift opens against what this one left behind.
+ */
+async function cashControlOnAShift() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+
+  const build = (settings: { shiftBlindClose: boolean; shiftVarianceNoteOver: number | null }) => {
+    const shift: any = {
+      id: 'sh1',
+      businessId: 'b1',
+      storeId: 's1',
+      userId: 'u1',
+      openedAt: new Date(),
+      closedAt: null,
+      openingFloat: 1000,
+      expectedCash: null,
+      countedCash: null,
+      variance: null,
+      refundsAtClose: null,
+      carriedFloat: null,
+      cashLeft: null,
+      business: {
+        shiftBlindClose: settings.shiftBlindClose,
+        shiftVarianceNoteOver:
+          settings.shiftVarianceNoteOver === null
+            ? null
+            : new Prisma.Decimal(settings.shiftVarianceNoteOver),
+      },
+      cashMovements: [],
+    };
+    const movements = [
+      { type: 'PAY_OUT', amount: 300 }, // tea and milk
+      { type: 'PAY_IN', amount: 500 }, // more change
+    ];
+    const created: any[] = [];
+    const db: any = {
+      shift: {
+        findFirst: async () => shift,
+        updateMany: async () => ({ count: shift.closedAt ? 0 : 1 }),
+        update: async (args: any) => Object.assign(shift, args.data),
+      },
+      sale: {
+        findMany: async () => [
+          { discount: 0, tax: 0, total: 2000, refundedTotal: 0, amountPaid: 2000, paymentMethod: PaymentMethod.CASH, payments: [{ method: PaymentMethod.CASH, amount: 2000 }] },
+        ],
+      },
+      cashMovement: {
+        findMany: async () => movements,
+        create: async (args: any) => {
+          created.push(args.data);
+          return { id: 'cm1', ...args.data, user: { id: args.data.userId, name: 'x' } };
+        },
+      },
+    };
+    db.$transaction = (fn: (tx: unknown) => unknown) => fn(db);
+    const service = new ShiftsService(
+      stub<PrismaService>(db),
+      stub<PaymentsService>({
+        cashCollectedOnShift: async () => 0,
+        cashRefundedOnShift: async () => 0,
+      }),
+    );
+    return { service, shift, created };
+  };
+
+  // 1000 float + 2000 cash sale - 300 paid out + 500 paid in
+  {
+    const { service } = build({ shiftBlindClose: false, shiftVarianceNoteOver: null });
+    const x: any = await service.report('b1', 'sh1', user);
+    assert.strictEqual(x.expectedCash, 3200, 'pay ins add to the drawer, pay outs take from it');
+    assert.strictEqual(x.payIns, 500);
+    assert.strictEqual(x.payOuts, 300);
+    assert.strictEqual(x.blindClose, false);
+  }
+
+  // Blind close: the cashier sees none of it, the owner sees all of it.
+  {
+    const { service } = build({ shiftBlindClose: true, shiftVarianceNoteOver: null });
+    const cashierView: any = await service.report('b1', 'sh1', user);
+    assert.strictEqual(cashierView.blindClose, true);
+    assert.strictEqual(cashierView.expectedCash, null, 'a blind cashier is not told what to count');
+    assert.strictEqual(cashierView.cashIn, null);
+    assert.deepStrictEqual(cashierView.byTender, [], 'cash by tender would give the expected figure away');
+    const ownerView: any = await service.report('b1', 'sh1', owner);
+    assert.strictEqual(ownerView.expectedCash, 3200, 'management always sees the figures');
+  }
+
+  // Short by 200 with notes required over 100: refused without a note.
+  {
+    const { service, shift } = build({ shiftBlindClose: false, shiftVarianceNoteOver: 100 });
+    await assert.rejects(
+      service.close(user, 'sh1', { countedCash: 3000 }),
+      /short by 200\.00/,
+      'a big variance needs a reason',
+    );
+    assert.strictEqual(shift.closedAt, null, 'and the refused close changed nothing');
+    await assert.rejects(
+      service.close(user, 'sh1', { countedCash: 3000, note: '   ' }),
+      /Add a note/,
+      'whitespace is not a reason',
+    );
+    const closed: any = await service.close(user, 'sh1', { countedCash: 3000, note: 'gave wrong change' });
+    assert.strictEqual(closed.variance, -200);
+    // Within the limit needs nothing.
+    const small = build({ shiftBlindClose: false, shiftVarianceNoteOver: 100 });
+    await small.service.close(user, 'sh1', { countedCash: 3150 });
+    assert.ok(small.shift.closedAt, 'short by 50 closes without a note');
+  }
+
+  // Blind: refusing would tell the cashier they are off, so it goes through.
+  {
+    const { service, shift } = build({ shiftBlindClose: true, shiftVarianceNoteOver: 100 });
+    const closed: any = await service.close(user, 'sh1', { countedCash: 3000 });
+    assert.ok(shift.closedAt, 'a blind cashier is never refused on variance');
+    assert.strictEqual(shift.variance, -200, 'the variance is still recorded');
+    assert.strictEqual(closed.variance, null, 'but not shown to them');
+  }
+
+  // Cash left for the next shift, and counting by denomination.
+  {
+    const { service, shift } = build({ shiftBlindClose: false, shiftVarianceNoteOver: null });
+    await assert.rejects(
+      service.close(user, 'sh1', { countedCash: 3200, cashLeft: 5000 }),
+      /can’t be more than the cash counted/,
+    );
+    await assert.rejects(
+      service.close(user, 'sh1', { countedCash: 3200, cashCount: { '1000': 3 } }),
+      /add up to 3000\.00, not the 3200\.00/,
+      'a breakdown that disagrees with the total is refused',
+    );
+    await assert.rejects(
+      service.close(user, 'sh1', { countedCash: 3200, cashCount: { '100': 2.5 } }),
+      /whole number/,
+    );
+    await service.close(user, 'sh1', {
+      countedCash: 3200,
+      cashLeft: 1000,
+      cashCount: { '1000': 3, '100': 2, '5': 0 },
+    });
+    assert.deepStrictEqual(shift.cashCount, { '1000': 3, '100': 2 }, 'zero lines are dropped');
+    assert.strictEqual(shift.cashLeft, 1000);
+  }
+
+  // Pay in / pay out rules.
+  {
+    const { service, shift, created } = build({ shiftBlindClose: false, shiftVarianceNoteOver: null });
+    await assert.rejects(
+      service.addMovement(user, 'sh1', { type: 'PAY_IN' as any, reason: 'EXPENSE' as any, amount: 50 }),
+      /isn’t a reason for a pay in/,
+      'an expense is never cash coming in',
+    );
+    await assert.rejects(
+      service.addMovement(user, 'sh1', { type: 'PAY_OUT' as any, reason: 'OTHER' as any, amount: 50 }),
+      /Add a note/,
+      'OTHER has to say what it was',
+    );
+    const m: any = await service.addMovement(user, 'sh1', {
+      type: 'PAY_OUT' as any,
+      reason: 'SUPPLIER' as any,
+      amount: 1200,
+      note: ' milk supplier ',
+    });
+    assert.strictEqual(m.amount, 1200);
+    assert.strictEqual(created[0].userId, 'u1', 'recorded against who did it');
+    assert.strictEqual(created[0].note, 'milk supplier');
+
+    shift.closedAt = new Date();
+    await assert.rejects(
+      service.addMovement(user, 'sh1', { type: 'PAY_IN' as any, reason: 'FLOAT_TOPUP' as any, amount: 50 }),
+      /closed/,
+      'a counted drawer is final',
+    );
+  }
+
+  // The next shift opens against what the last one left in the drawer.
+  {
+    let createdShift: any = null;
+    const service = new ShiftsService(
+      stub<PrismaService>({
+        store: { findFirst: async () => ({ id: 's1' }) },
+        shift: {
+          // Nothing open at the store; the last close left 1500.
+          findFirst: async (args: any) =>
+            args.where.closedAt === null
+              ? null
+              : { cashLeft: new Prisma.Decimal(1500), closedAt: new Date(), user: { name: 'Ramesh' } },
+          create: async (args: any) => (createdShift = args.data),
+        },
+      }),
+      stub<PaymentsService>({}),
+    );
+    const suggested = await service.suggestedFloat(user, 's1');
+    assert.strictEqual(suggested?.amount, 1500);
+    assert.strictEqual(suggested?.closedBy, 'Ramesh');
+    await service.open(user, { storeId: 's1', openingFloat: 1400 });
+    assert.strictEqual(createdShift.carriedFloat, 1500, 'the 100 missing overnight is on record');
+    assert.strictEqual(createdShift.openingFloat, 1400);
+  }
+}
+
+/**
+ * One drawer, one shift. An owner at a store where a till is running joins it
+ * rather than opening a second one by habit -- unless they say the counter
+ * has its own cash. The Z report then says whose sales are in the drawer.
+ */
+async function oneDrawerOneShift() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  const cashier: AuthUser = { ...user, userId: 'u2', role: 'CASHIER' as AuthUser['role'] };
+
+  // `open` is every shift open at store s1.
+  const build = (open: { id: string; userId: string; name: string }[]) => {
+    const created: any[] = [];
+    const service = new ShiftsService(
+      stub<PrismaService>({
+        store: { findFirst: async () => ({ id: 's1' }) },
+        shift: {
+          findFirst: async (args: any) => {
+            if (args.where.closedAt !== null) return null; // no previous close
+            const hit = open.find((sh) => !args.where.userId || sh.userId === args.where.userId);
+            return hit ? { ...hit, user: { name: hit.name } } : null;
+          },
+          create: async (args: any) => {
+            created.push(args.data);
+            return { id: 'new', ...args.data };
+          },
+        },
+      }),
+      stub<PaymentsService>({}),
+    );
+    return { service, created };
+  };
+  const sangu = { id: 'sh-sangu', userId: 'u2', name: 'Sangu' };
+
+  {
+    const { service, created } = build([sangu]);
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1200 }),
+      (e: any) => e.getStatus() === 409 && /Sangu’s till is already open/.test(e.message),
+      'an owner is sent to the open till, not given a second drawer',
+    );
+    assert.strictEqual(created.length, 0);
+    await service.open(owner, { storeId: 's1', openingFloat: 500, separateDrawer: true });
+    assert.strictEqual(created[0].userId, 'owner1', 'unless the counter really has its own cash');
+  }
+
+  {
+    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner' };
+    const { service, created } = build([sangu, mine]);
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1 });
+    assert.strictEqual(got.id, 'sh-mine', 'an owner with their own till open here resumes it');
+    assert.strictEqual(created.length, 0);
+  }
+
+  {
+    const ownerTill = { id: 'sh-owner', userId: 'owner1', name: 'Owner' };
+    const { service, created } = build([ownerTill]);
+    await service.open(cashier, { storeId: 's1', openingFloat: 1000 });
+    assert.strictEqual(created[0].userId, 'u2', 'a cashier, who cannot join, is never blocked');
+  }
+
+  // Whose sales are in the drawer.
+  const sale = (userId: string, name: string, total: number) => ({
+    discount: 0, tax: 0, total, refundedTotal: 0, amountPaid: total,
+    paymentMethod: PaymentMethod.CASH, userId, user: { name },
+    payments: [{ method: PaymentMethod.CASH, amount: total }],
+  });
+  const db: any = {
+    shift: {
+      findFirst: async () => ({
+        id: 'sh-sangu', businessId: 'b1', userId: 'u2', openedAt: new Date(), closedAt: null,
+        openingFloat: 1000, expectedCash: null, countedCash: null, variance: null,
+        refundsAtClose: null, carriedFloat: null, cashLeft: null,
+        business: { shiftBlindClose: false, shiftVarianceNoteOver: null }, cashMovements: [],
+      }),
+    },
+    sale: {
+      findMany: async () => [
+        sale('u2', 'Sangu', 300), sale('owner1', 'Owner', 900), sale('u2', 'Sangu', 200),
+      ],
+    },
+    cashMovement: { findMany: async () => [] },
+  };
+  const report: any = await new ShiftsService(
+    stub<PrismaService>(db),
+    stub<PaymentsService>({ cashCollectedOnShift: async () => 0, cashRefundedOnShift: async () => 0 }),
+  ).report('b1', 'sh-sangu', owner);
+  assert.deepStrictEqual(
+    report.byUser.map((u: any) => [u.name, u.count, u.amount]),
+    [['Owner', 1, 900], ['Sangu', 2, 500]],
+    'sales split by who rang them, biggest first',
+  );
+  assert.strictEqual(report.expectedCash, 2400, 'and all of it is in the one drawer');
 }
 
 async function stockTakePreviewComputesVariances() {
@@ -457,6 +779,143 @@ async function unitsGovernFractionalQuantities() {
 }
 
 /**
+ * A sale, its lines and everything a return touches, for driving
+ * SalesService.returnItems the way the database would: the sale lock, the
+ * guarded returnedQty bump, the customer's balance and the refund rows.
+ * Amounts are plain numbers in, Decimals inside -- Prisma's own types, which
+ * is what caught the string-comparison bug below.
+ */
+function returnHarness(opts: {
+  sale: {
+    subtotal: number;
+    tax?: number;
+    discount?: number;
+    total: number;
+    amountPaid: number;
+    paymentMethod?: PaymentMethod;
+    customerId?: string | null;
+    status?: SaleStatus;
+  };
+  items: { id: string; quantity: number; lineTotal: number }[];
+  /** The customer's stored credit balance, when the sale has a customer. */
+  customerBalance?: number;
+  /** Tender on the sale's SALE payment row; null for a sale with none. */
+  salePaymentMethod?: PaymentMethod | null;
+  /** The till the returner is on, as ShiftsService resolves it. */
+  shiftId?: string | null;
+  /** Lines whose product is batch-tracked. */
+  batchTracked?: string[];
+}) {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  const items = opts.items.map((i) => ({
+    id: i.id,
+    productId: `p-${i.id}`,
+    name: i.id,
+    quantity: dec(i.quantity),
+    returnedQty: dec(0),
+    lineTotal: dec(i.lineTotal),
+  }));
+  const sale: any = {
+    id: 'sale1',
+    businessId: 'b1',
+    storeId: 's1',
+    shiftId: 'sh-sold',
+    customerId: opts.sale.customerId ?? null,
+    status: opts.sale.status ?? SaleStatus.COMPLETED,
+    paymentMethod: opts.sale.paymentMethod ?? PaymentMethod.CASH,
+    subtotal: dec(opts.sale.subtotal),
+    tax: dec(opts.sale.tax ?? 0),
+    discount: dec(opts.sale.discount ?? 0),
+    total: dec(opts.sale.total),
+    amountPaid: dec(opts.sale.amountPaid),
+    refundedTotal: dec(0),
+    items,
+  };
+  const state = {
+    balance: opts.customerBalance ?? 0,
+    payments: [] as any[],
+    moves: [] as any[],
+    batchesBack: [] as any[],
+    stockBack: 0,
+    transactions: 0,
+  };
+  const tx = {
+    $queryRaw: async (strings: TemplateStringsArray, ...params: any[]) => {
+      const sql = strings.join('?');
+      if (sql.includes('FROM "Sale"')) return [{ id: sale.id }];
+      if (sql.includes('FROM "Customer"')) return [{ creditBalance: dec(state.balance) }];
+      // The guarded bump: applied only while it stays within the line.
+      const [delta, id] = params;
+      const it = items.find((i) => i.id === id)!;
+      if (it.returnedQty.plus(delta).greaterThan(it.quantity)) return [];
+      it.returnedQty = it.returnedQty.plus(delta);
+      return [{ id }];
+    },
+    sale: {
+      findUniqueOrThrow: async () => sale,
+      update: async ({ data }: any) => {
+        if (data.amountPaid) sale.amountPaid = sale.amountPaid.plus(data.amountPaid.increment);
+        sale.refundedTotal = sale.refundedTotal.plus(data.refundedTotal.increment);
+        sale.status = data.status;
+        return sale;
+      },
+    },
+    saleItem: { findMany: async () => items },
+    customer: {
+      update: async ({ data }: any) => {
+        state.balance = Math.round((state.balance - Number(data.creditBalance.decrement)) * 100) / 100;
+      },
+    },
+    payment: {
+      findFirst: async () =>
+        opts.salePaymentMethod ? { method: opts.salePaymentMethod } : null,
+    },
+  };
+  const prisma = stub<PrismaService>({
+    sale: { findFirst: async () => sale },
+    product: {
+      findMany: async () =>
+        (opts.batchTracked ?? []).map((id) => ({ id: `p-${id}`, trackSerials: false, trackBatches: true })),
+    },
+    // The preview reads the same things the return does, outside a transaction.
+    customer: { findUnique: async () => ({ creditBalance: dec(state.balance) }) },
+    payment: tx.payment,
+    $transaction: async (fn: any) => {
+      state.transactions++;
+      return fn(tx);
+    },
+  });
+  const service = new SalesService(
+    prisma,
+    stub<InventoryService>({
+      applyMovementsBatch: async (_tx: any, moves: any[]) => {
+        state.moves.push(...moves);
+        state.stockBack += moves.reduce((n, m) => n + m.quantity, 0);
+      },
+      returnSerialsToStock: async () => undefined,
+      restoreBatchOnReturn: async (_tx: any, input: any) => {
+        state.batchesBack.push([input.productId, input.quantity]);
+      },
+    }),
+    stub<MailService>({}),
+    stub<ShiftsService>({ resolveShiftId: async () => opts.shiftId ?? null }),
+    stub<PaymentsService>({
+      record: async (input: any) => {
+        state.payments.push(input);
+        return input;
+      },
+    }),
+  );
+  const toItems = (lines: [string, number][]) =>
+    lines.map(([saleItemId, quantity]) => ({ saleItemId, quantity }));
+  const ret = (lines: [string, number][], extra: object = {}) =>
+    service.returnItems(user, 'sale1', { items: toItems(lines), ...extra } as any) as Promise<any>;
+  const quote = (lines: [string, number][]) =>
+    service.returnQuote(user, 'sale1', toItems(lines)) as Promise<any>;
+  return { sale, state, ret, quote };
+}
+
+/**
  * A part return must leave the sale PARTIALLY_RETURNED, not RETURNED.
  *
  * Quantities are numeric(12,3), so Prisma hands them back as Decimal, and
@@ -467,103 +926,512 @@ async function unitsGovernFractionalQuantities() {
  * point of the check: with plain numbers it passes either way.
  */
 async function partReturnLeavesTheSalePartiallyReturned() {
-  const dec = (v: string) => new Prisma.Decimal(v);
-  const item = {
-    id: 'si1',
-    productId: 'p1',
-    name: 'Rice',
-    quantity: dec('10.000'),
-    returnedQty: dec('0.000'),
-    lineTotal: dec('1000.00'),
-  };
-  const sale = {
-    id: 'sale1',
-    businessId: 'b1',
-    storeId: 's1',
-    customerId: null,
-    status: SaleStatus.COMPLETED,
-    total: dec('1000.00'),
-    amountPaid: dec('1000.00'),
-    items: [item],
-  };
-  let saved: any = null;
-  const prisma = stub<PrismaService>({
-    sale: { findFirst: async () => sale },
-    // nothing on this sale is serialised
-    product: { findMany: async () => [] },
-    $transaction: async (fn: any) =>
-      fn({
-        saleItem: {
-          findMany: async () => [item],
-          // Unguarded, like a plain Prisma increment — see the race check below.
-          update: async ({ data }: any) => {
-            item.returnedQty = item.returnedQty.plus(data.returnedQty.increment);
-            return item;
-          },
-        },
-        // The service bumps returnedQty through a guarded raw UPDATE so a
-        // racing return can't over-return a line. Model the guard here:
-        // apply it only while it stays within the line quantity, and report
-        // the row count the way RETURNING does.
-        $queryRaw: async (_sql: any, ...params: any[]) => {
-          const delta = new Prisma.Decimal(params[0]);
-          if (item.returnedQty.plus(delta).greaterThan(item.quantity)) return [];
-          item.returnedQty = item.returnedQty.plus(delta);
-          return [{ id: item.id }];
-        },
-        sale: {
-          update: async ({ data }: any) => {
-            saved = data;
-            return { ...sale, ...data };
-          },
-        },
-        customer: { update: async () => ({}) },
-      }),
+  const { sale, ret } = returnHarness({
+    sale: { subtotal: 1000, total: 1000, amountPaid: 1000 },
+    items: [{ id: 'si1', quantity: 10, lineTotal: 1000 }],
   });
-  const inventory = stub<InventoryService>({
-    applyMovementsBatch: async () => undefined,
-    returnSerialsToStock: async () => undefined,
-  });
-  const service = new SalesService(
-    prisma,
-    inventory,
-    stub<MailService>({}),
-    stub<ShiftsService>({}),
-    stub<PaymentsService>({ record: async () => undefined }),
-  );
 
-  const first: any = await service.returnItems(user, 'sale1', {
-    items: [{ saleItemId: 'si1', quantity: 2 }],
-  } as any);
+  const first = await ret([['si1', 2]]);
   assert.strictEqual(first.refund, 200, '2 of 10 units on a 1000 line');
   assert.strictEqual(
-    saved.status,
+    sale.status,
     SaleStatus.PARTIALLY_RETURNED,
     '2 of 10 returned is a part return, not a full one',
   );
 
   // The remaining 8 must still be returnable, and close the sale out.
-  const second: any = await service.returnItems(user, 'sale1', {
-    items: [{ saleItemId: 'si1', quantity: 8 }],
-  } as any);
+  const second = await ret([['si1', 8]]);
   assert.strictEqual(second.refund, 800, 'the rest of the line');
   assert.strictEqual(
-    saved.status,
+    sale.status,
     SaleStatus.RETURNED,
     'every unit back on the shelf closes the sale out',
   );
 
-  // Nothing is left to return. Refused twice over: the snapshot check sees
-  // nothing returnable, and behind it the guarded increment would match zero
-  // rows anyway -- which is the half that also holds when the competing
-  // return lands after this one read the sale.
   await assert.rejects(
-    service.returnItems(user, 'sale1', {
-      items: [{ saleItemId: 'si1', quantity: 1 }],
-    } as any),
-    /only 0 left|returned by someone else/,
+    ret([['si1', 1]]),
+    /already fully returned/,
     'a line cannot be returned past the quantity sold',
   );
+}
+
+/** A held cart never left the shelf, so nothing can come back against it. */
+async function aHeldCartCannotBeReturned() {
+  const { state, ret } = returnHarness({
+    sale: { subtotal: 500, total: 500, amountPaid: 0, status: SaleStatus.HELD },
+    items: [{ id: 'si1', quantity: 5, lineTotal: 500 }],
+  });
+  await assert.rejects(ret([['si1', 5]]), /held cart is not a sale/);
+  assert.strictEqual(state.transactions, 0, 'refused before anything is written');
+  assert.strictEqual(state.stockBack, 0, 'no stock appears');
+  assert.strictEqual(state.payments.length, 0, 'no refund is recorded');
+}
+
+/**
+ * The bill discount comes back off a return. A 100 bill with 10 off was paid
+ * 90; returning all of it used to refund 100.
+ */
+async function aReturnGivesBackWhatWasPaidNotTheShelfPrice() {
+  const { sale, state, ret } = returnHarness({
+    // Two lines worth 60 (2 units) and 40, 10 off the bill: 90 paid by card.
+    sale: { subtotal: 100, discount: 10, total: 90, amountPaid: 90, paymentMethod: PaymentMethod.CARD },
+    items: [
+      { id: 'a', quantity: 2, lineTotal: 60 },
+      { id: 'b', quantity: 1, lineTotal: 40 },
+    ],
+    salePaymentMethod: PaymentMethod.CARD,
+    shiftId: 'sh-now',
+  });
+
+  const first = await ret([['a', 1]]);
+  assert.strictEqual(first.refund, 27, 'a 30 unit carries 10% of the discount: 27');
+
+  const rest = await ret([['a', 1], ['b', 1]]);
+  assert.strictEqual(rest.refund, 63, 'the last return refunds exactly what is left');
+  assert.strictEqual(Number(sale.refundedTotal), 90, 'never more than the 90 paid');
+  assert.strictEqual(sale.status, SaleStatus.RETURNED);
+
+  assert.deepStrictEqual(
+    state.payments.map((p) => [p.type, p.amount, p.method, p.shiftId]),
+    [
+      ['REFUND', 27, 'CARD', 'sh-now'],
+      ['REFUND', 63, 'CARD', 'sh-now'],
+    ],
+    'refunded to the card it was paid on, from the till doing the return',
+  );
+}
+
+/**
+ * A return on a part-credit sale cancels what is still owed first, and only
+ * what the customer still owes -- a khata paid off since then is not owed.
+ */
+async function aReturnCancelsOnlyCreditStillOwed() {
+  // 400 sale, 150 paid in cash, 250 on the khata, still owed.
+  const owing = returnHarness({
+    sale: { subtotal: 400, total: 400, amountPaid: 150, paymentMethod: PaymentMethod.MIXED, customerId: 'c1' },
+    items: [{ id: 'si1', quantity: 1, lineTotal: 400 }],
+    customerBalance: 250,
+    salePaymentMethod: PaymentMethod.CASH,
+    shiftId: 'sh-now',
+  });
+  const r1 = await owing.ret([['si1', 1]]);
+  assert.strictEqual(r1.refund, 400);
+  assert.strictEqual(owing.state.balance, 0, 'the 250 owed is cancelled');
+  assert.deepStrictEqual(
+    owing.state.payments.map((p) => [p.amount, p.method]),
+    [[150, 'CASH']],
+    'only the 150 actually paid leaves the drawer',
+  );
+
+  // Same sale, but the customer has since paid the 250 off: nothing is owed,
+  // so all 400 comes back to them. This used to cancel 250 of credit that no
+  // longer existed -- balance -250, and 150 back for 400 of goods.
+  const settled = returnHarness({
+    sale: { subtotal: 400, total: 400, amountPaid: 150, paymentMethod: PaymentMethod.MIXED, customerId: 'c1' },
+    items: [{ id: 'si1', quantity: 1, lineTotal: 400 }],
+    customerBalance: 0,
+    salePaymentMethod: PaymentMethod.CASH,
+  });
+  await settled.ret([['si1', 1]]);
+  assert.strictEqual(settled.state.balance, 0, 'the balance never goes negative');
+  assert.deepStrictEqual(
+    settled.state.payments.map((p) => [p.amount, p.method]),
+    [[400, 'CASH']],
+    'the full value is handed back',
+  );
+}
+
+/**
+ * The preview a cashier sees before confirming is what the return then does,
+ * and the cashier can choose the tender the money goes back on.
+ */
+async function aReturnPreviewMatchesTheReturn() {
+  // 400 sale by card, 150 paid, 250 still on the khata.
+  const h = returnHarness({
+    sale: { subtotal: 400, total: 400, amountPaid: 150, paymentMethod: PaymentMethod.MIXED, customerId: 'c1' },
+    items: [{ id: 'si1', quantity: 4, lineTotal: 400 }],
+    customerBalance: 250,
+    salePaymentMethod: PaymentMethod.CARD,
+    shiftId: 'sh-now',
+  });
+
+  const preview = await h.quote([['si1', 4]]);
+  assert.deepStrictEqual(
+    preview,
+    { refund: 400, creditCancelled: 250, cashBack: 150, closesSale: true, defaultMethod: 'CARD' },
+    'the preview splits the refund into credit cancelled and money back',
+  );
+  assert.strictEqual(h.state.transactions, 0, 'a preview writes nothing');
+  assert.strictEqual(h.state.balance, 250);
+
+  // The customer wants the 150 in cash, not back on the card.
+  const done = await h.ret([['si1', 4]], { refundMethod: 'CASH' });
+  assert.deepStrictEqual(
+    [done.refund, done.creditCancelled, done.cashBack, done.method],
+    [preview.refund, preview.creditCancelled, preview.cashBack, 'CASH'],
+    'the return does exactly what the preview said, on the chosen tender',
+  );
+  assert.deepStrictEqual(
+    h.state.payments.map((p) => [p.type, p.amount, p.method, p.shiftId]),
+    [['REFUND', 150, 'CASH', 'sh-now']],
+    'recorded as cash, so the drawer knows it left',
+  );
+
+  await assert.rejects(h.quote([['si1', 1]]), /already fully returned/, 'nothing left to preview');
+}
+
+/**
+ * Goods sent back on a paid purchase leave the supplier owing a refund. That
+ * is recorded as owed (Purchase.refundDue) and reaches the ledger only when
+ * the money arrives -- it used to be written as received on the spot.
+ */
+async function aSupplierRefundIsOwedUntilReceived() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  const item = {
+    id: 'pi1',
+    productId: 'p1',
+    quantity: dec(10),
+    returnedQty: dec(0),
+    costPrice: dec(50),
+    batchNumber: null,
+    expiryDate: null,
+  };
+  // 500 of goods, paid in full.
+  const purchase: any = {
+    id: 'pu1',
+    businessId: 'b1',
+    storeId: 's1',
+    supplierId: 'sup1',
+    status: 'RECEIVED',
+    subtotal: dec(500),
+    total: dec(500),
+    amountPaid: dec(500),
+    refundDue: dec(0),
+    note: null,
+    items: [item],
+  };
+  const ledger: any[] = [];
+  const tx: any = {
+    $queryRaw: async (_sql: any, delta: string) => {
+      item.returnedQty = item.returnedQty.plus(delta);
+      return [{ id: item.id }];
+    },
+    purchase: {
+      update: async ({ data }: any) => {
+        Object.assign(purchase, {
+          subtotal: dec(data.subtotal),
+          total: dec(data.total),
+          amountPaid: dec(data.amountPaid),
+          refundDue: data.refundDue ? purchase.refundDue.plus(data.refundDue.increment) : purchase.refundDue,
+        });
+        return purchase;
+      },
+      updateMany: async ({ where, data }: any) => {
+        if (purchase.refundDue.lessThan(where.refundDue.gte)) return { count: 0 };
+        purchase.refundDue = purchase.refundDue.minus(data.refundDue.decrement);
+        return { count: 1 };
+      },
+      findUniqueOrThrow: async () => purchase,
+    },
+  };
+  const prisma = stub<PrismaService>({
+    purchase: { findFirst: async () => purchase },
+    product: { findMany: async () => [] },
+    $transaction: async (fn: any) => fn(tx),
+  });
+  const service = new PurchasesService(
+    prisma,
+    stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
+    stub<PaymentsService>({ record: async (input: any) => ledger.push(input) }),
+  );
+
+  // Send 4 back: 200 of goods the supplier has been paid for.
+  const ret: any = await service.returnItems('b1', 'u1', 'pu1', {
+    items: [{ purchaseItemId: 'pi1', quantity: 4 }],
+  } as any);
+  assert.strictEqual(ret.refundDueFromSupplier, 200);
+  assert.strictEqual(Number(purchase.refundDue), 200, 'the supplier owes 200 back');
+  assert.strictEqual(Number(purchase.amountPaid), 300, 'paid now covers the smaller invoice');
+  assert.strictEqual(ledger.length, 0, 'no money has moved yet, so no ledger row');
+
+  await assert.rejects(
+    service.recordRefundReceived('b1', 'pu1', 250),
+    /more than the 200/,
+    'cannot record more than is owed',
+  );
+
+  await service.recordRefundReceived('b1', 'pu1', 200, { method: 'MOBILE' as any, userId: 'u1' });
+  assert.strictEqual(Number(purchase.refundDue), 0, 'nothing owed once received');
+  assert.deepStrictEqual(
+    ledger.map((p) => [p.type, p.amount, p.method, p.supplierId]),
+    [['SUPPLIER_REFUND', 200, 'MOBILE', 'sup1']],
+    'the ledger records the money when it arrives',
+  );
+}
+
+/**
+ * Goods that come back damaged are refunded like any return, but never reach
+ * the shelf: booked in and written off, with the reason on both.
+ */
+async function damagedReturnsAreWrittenOff() {
+  const h = returnHarness({
+    sale: { subtotal: 300, total: 300, amountPaid: 300 },
+    items: [
+      { id: 'good', quantity: 1, lineTotal: 100 },
+      { id: 'broken', quantity: 2, lineTotal: 200 },
+    ],
+    salePaymentMethod: PaymentMethod.CASH,
+    batchTracked: ['good', 'broken'],
+  });
+  const res = await h.ret([['good', 1], ['broken', 2]], {
+    reason: 'cracked in the box',
+    items: [
+      { saleItemId: 'good', quantity: 1 },
+      { saleItemId: 'broken', quantity: 2, restock: false },
+    ],
+  });
+  assert.strictEqual(res.refund, 300, 'damaged goods are refunded all the same');
+  assert.deepStrictEqual(
+    h.state.moves.map((m) => [m.productId, m.type, m.quantity, m.reason ?? null, m.note]),
+    [
+      ['p-good', 'RETURN_IN', 1, null, 'cracked in the box'],
+      ['p-broken', 'RETURN_IN', 2, null, 'cracked in the box'],
+      ['p-broken', 'ADJUSTMENT', -2, 'DAMAGE', 'Returned damaged: cracked in the box'],
+    ],
+    'the damaged line comes back and is written off, reason on both',
+  );
+  assert.strictEqual(h.state.stockBack, 1, 'only the good unit is back on the shelf');
+  assert.deepStrictEqual(
+    h.state.batchesBack,
+    [['p-good', 1]],
+    'the good unit rejoins a batch for expiry tracking; the written-off ones do not',
+  );
+  assert.strictEqual(h.state.payments[0].note, 'cracked in the box', 'the refund carries the reason');
+}
+
+/**
+ * A cashier pinned to one branch can't return a sale rung up at another: the
+ * route names the sale, not a store, so StoreScopeGuard has nothing to check.
+ */
+async function aPinnedCashierReturnsOnlyAtTheirStore() {
+  const h = returnHarness({
+    sale: { subtotal: 100, total: 100, amountPaid: 100 },
+    items: [{ id: 'si1', quantity: 1, lineTotal: 100 }],
+  });
+  h.sale.storeId = 's2'; // the module's `user` is a cashier pinned to s1
+  await assert.rejects(h.ret([['si1', 1]]), /store you are assigned to/);
+  await assert.rejects(h.quote([['si1', 1]]), /store you are assigned to/, 'nor preview one');
+  assert.strictEqual(h.state.transactions, 0, 'refused before anything is written');
+
+  assert.doesNotThrow(
+    () => assertOwnStore({ ...user, role: UserRole.OWNER }, 's2'),
+    'owners and managers move between branches',
+  );
+  assert.doesNotThrow(
+    () => assertOwnStore({ ...user, storeId: null }, 's2'),
+    'staff with no store assigned are not pinned',
+  );
+}
+
+/**
+ * A product charges exactly the tax its form shows. Staff choose the tax per
+ * product; changing that tax's rate moves every product on it, "No tax"
+ * really clears it, and a tax still on an active product can't vanish from
+ * under it.
+ */
+async function aProductChargesTheTaxItShows() {
+  const products = [
+    { id: 'p1', businessId: 'b1', taxId: 'vat', taxRate: 13, isActive: true },
+    { id: 'p2', businessId: 'b1', taxId: 'vat', taxRate: 13, isActive: true },
+    { id: 'p3', businessId: 'b1', taxId: null, taxRate: 0, isActive: true },
+    { id: 'old', businessId: 'b1', taxId: 'retired', taxRate: 5, isActive: false },
+  ] as any[];
+  const taxes = [
+    { id: 'vat', businessId: 'b1', rate: 13 },
+    { id: 'retired', businessId: 'b1', rate: 5 },
+  ] as any[];
+  const matches = (p: any, where: any) =>
+    Object.entries(where).every(([k, v]) => p[k] === v);
+  const db: any = {
+    tax: {
+      findFirst: async ({ where }: any) => taxes.find((t) => t.id === where.id) ?? null,
+      update: async ({ where, data }: any) => Object.assign(taxes.find((t) => t.id === where.id), data),
+      delete: async ({ where }: any) => taxes.splice(taxes.findIndex((t) => t.id === where.id), 1)[0],
+      updateMany: async () => ({ count: 0 }),
+    },
+    product: {
+      updateMany: async ({ where, data }: any) => {
+        const hit = products.filter((p) => matches(p, where));
+        hit.forEach((p) => Object.assign(p, data));
+        return { count: hit.length };
+      },
+      count: async ({ where }: any) => products.filter((p) => matches(p, where)).length,
+    },
+  };
+  db.$transaction = async (fn: any) => fn(db);
+  const taxesService = new TaxesService(stub<PrismaService>(db));
+
+  await taxesService.update('b1', 'vat', { rate: 15 } as any);
+  assert.deepStrictEqual(
+    products.map((p) => p.taxRate),
+    [15, 15, 0, 5],
+    'VAT 13% -> 15% reaches every product on VAT, and only those',
+  );
+
+  await assert.rejects(
+    taxesService.remove('b1', 'vat'),
+    /2 products use this tax/,
+    'a tax still on active products is not deleted from under them',
+  );
+  await taxesService.remove('b1', 'retired');
+  assert.deepStrictEqual(
+    [products[3].taxId, products[3].taxRate],
+    [null, 0],
+    'a retired product lets go of a deleted tax entirely',
+  );
+
+  // "No tax" on the product form clears the tax and the rate together.
+  let saved: any = null;
+  const productsService = new ProductsService(
+    stub<PrismaService>({
+      product: {
+        findFirst: async () => ({ id: 'p1', businessId: 'b1' }),
+        update: async ({ data }: any) => (saved = data),
+      },
+      category: { count: async () => 0 },
+    }),
+  );
+  await productsService.update('b1', 'p1', { taxId: null } as any);
+  assert.deepStrictEqual(
+    [saved.taxId, saved.taxRate],
+    [null, 0],
+    'choosing No tax stops the product charging the old rate',
+  );
+}
+
+/**
+ * A part-paid sale records the tender the money came in on. The sale itself
+ * says MIXED (part paid, part owed), and MIXED used to go on the payment row
+ * too -- where the drawer counted it as cash.
+ */
+async function aPartPaymentKeepsItsTender() {
+  const checkout = async (paymentMethod: PaymentMethod, amountPaid: number) => {
+    let sale: any = null;
+    const payments: any[] = [];
+    const prisma = stub<PrismaService>({
+      store: { findFirst: async () => ({ id: 's1' }) },
+      customer: { findFirst: async () => ({ id: 'c1' }) },
+      business: { findUnique: async () => ({ taxEnabled: true, taxInclusive: false }) },
+      product: {
+        findMany: async () => [
+          { id: 'p1', name: 'Phone case', sellingPrice: 400, costPrice: 300, taxRate: 0, isTaxable: true, isActive: true, isRxRequired: false, trackBatches: false, trackSerials: false },
+        ],
+      },
+      $transaction: async (fn: any) =>
+        fn({
+          sale: {
+            findFirst: async () => null,
+            create: async ({ data }: any) => (sale = { id: 'sale1', ...data }),
+          },
+          customer: { update: async () => ({}) },
+        }),
+    });
+    const service = new SalesService(
+      prisma,
+      stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
+      stub<MailService>({}),
+      stub<ShiftsService>({ resolveShiftId: async () => 'sh1' }),
+      stub<PaymentsService>({ record: async (input: any) => payments.push(input) }),
+    );
+    await service.create(user, {
+      items: [{ productId: 'p1', quantity: 1 }],
+      customerId: 'c1',
+      paymentMethod,
+      amountPaid,
+    } as any);
+    return { sale, payment: payments[0] };
+  };
+
+  const card = await checkout(PaymentMethod.CARD, 150);
+  assert.strictEqual(card.sale.paymentMethod, PaymentMethod.MIXED, 'the sale reads part paid');
+  assert.strictEqual(card.payment.method, PaymentMethod.CARD, 'the money reads card');
+  assert.strictEqual(card.payment.amount, 150);
+
+  // A client that names no tender for the part paid gets the counter default.
+  const credit = await checkout(PaymentMethod.CREDIT, 100);
+  assert.strictEqual(credit.payment.method, PaymentMethod.CASH);
+}
+
+/**
+ * A customer with a balance or any history can't be deleted. The database
+ * never refuses (the links are ON DELETE SET NULL), so the service has to.
+ */
+async function aCustomerWithHistoryIsKept() {
+  const build = (customer: { creditBalance: number }, sales: number, payments: number) => {
+    let deleted = false;
+    const prisma = stub<PrismaService>({
+      customer: {
+        findFirst: async () => ({ id: 'c1', businessId: 'b1', ...customer }),
+        delete: async () => {
+          deleted = true;
+          return { id: 'c1' };
+        },
+      },
+      sale: { count: async () => sales },
+      payment: { count: async () => payments },
+    });
+    const service = new CustomersService(prisma, stub<PaymentsService>({}));
+    return { service, wasDeleted: () => deleted };
+  };
+
+  const owes = build({ creditBalance: 250 }, 1, 0);
+  await assert.rejects(owes.service.remove('b1', 'c1'), /still owes/);
+  assert.ok(!owes.wasDeleted(), 'what they owe stays on the books');
+
+  const bought = build({ creditBalance: 0 }, 3, 0);
+  await assert.rejects(bought.service.remove('b1', 'c1'), /history/);
+
+  const paid = build({ creditBalance: 0 }, 0, 1);
+  await assert.rejects(paid.service.remove('b1', 'c1'), /history/);
+
+  const unused = build({ creditBalance: 0 }, 0, 0);
+  await unused.service.remove('b1', 'c1');
+  assert.ok(unused.wasDeleted(), 'a customer never used can go');
+}
+
+/**
+ * Credit ageing allocates what a customer owes across their credit sales. A
+ * return that cancels credit raises the sale's amountPaid *and* its
+ * refundedTotal by the amount cancelled; subtracting both made the sale look
+ * short by the return, and that part of the balance fell into `unattributed`.
+ */
+async function creditAgeingCountsAReturnOnce() {
+  const now = new Date('2026-09-25T12:00:00Z');
+  const daysAgo = (n: number) => new Date(now.getTime() - n * DAY_MS);
+  const prisma = stub<PrismaService>({
+    customer: {
+      findMany: async () => [
+        {
+          id: 'c1',
+          name: 'Ramesh',
+          phone: null,
+          // 1000 on credit, 300 of it returned (cancelling 300): owes 700.
+          // Plus a newer 200 on credit: 900 in all.
+          creditBalance: new Prisma.Decimal(900),
+          sales: [
+            { id: 's2', receiptNo: 'INV-2', createdAt: daysAgo(5), total: new Prisma.Decimal(200), refundedTotal: new Prisma.Decimal(0), amountPaid: new Prisma.Decimal(0) },
+            { id: 's1', receiptNo: 'INV-1', createdAt: daysAgo(45), total: new Prisma.Decimal(1000), refundedTotal: new Prisma.Decimal(300), amountPaid: new Prisma.Decimal(300) },
+          ],
+        },
+      ],
+    },
+  });
+  const reports = new ReportsService(prisma, stub<InventoryService>({}));
+  const ageing: any = await reports.creditAgeing('b1', { asOf: now });
+  assert.strictEqual(ageing.total, 900, 'the parts add up to what is owed');
+  assert.strictEqual(ageing.buckets.current, 200, 'the newer sale is current');
+  assert.strictEqual(ageing.buckets.days30, 700, 'the returned sale still carries its 700');
+  assert.strictEqual(ageing.unattributed, 0, 'nothing is left unexplained');
 }
 
 /**
@@ -587,19 +1455,21 @@ async function aStaleReadCannotOverReturnALine() {
     returnedQty: dec('0.000'),
     lineTotal: dec('100.00'),
   };
+  const staleSale = {
+    id: 'sale1',
+    businessId: 'b1',
+    storeId: 's1',
+    customerId: null,
+    status: SaleStatus.COMPLETED,
+    subtotal: dec('100.00'),
+    tax: dec('0.00'),
+    total: dec('100.00'),
+    refundedTotal: dec('0.00'),
+    amountPaid: dec('100.00'),
+    items: [stale],
+  };
   const prisma = stub<PrismaService>({
-    sale: {
-      findFirst: async () => ({
-        id: 'sale1',
-        businessId: 'b1',
-        storeId: 's1',
-        customerId: null,
-        status: SaleStatus.COMPLETED,
-        total: dec('100.00'),
-        amountPaid: dec('100.00'),
-        items: [stale],
-      }),
-    },
+    sale: { findFirst: async () => staleSale },
     product: { findMany: async () => [] },
     $transaction: async (fn: any) =>
       fn({
@@ -616,7 +1486,11 @@ async function aStaleReadCannotOverReturnALine() {
             return committed;
           },
         },
-        $queryRaw: async (_sql: any, ...params: any[]) => {
+        $queryRaw: async (sql: TemplateStringsArray, ...params: any[]) => {
+          // The sale lock. The read after it is the stale one here: that
+          // lock is what normally prevents this, and the guard below is what
+          // still holds if it ever doesn't.
+          if (sql.join('?').includes('FROM "Sale"')) return [{ id: 'sale1' }];
           const delta = new Prisma.Decimal(params[0]);
           if (committed.returnedQty.plus(delta).greaterThan(committed.quantity)) {
             return [];
@@ -624,8 +1498,12 @@ async function aStaleReadCannotOverReturnALine() {
           committed.returnedQty = committed.returnedQty.plus(delta);
           return [{ id: committed.id }];
         },
-        sale: { update: async ({ data }: any) => data },
+        sale: {
+          findUniqueOrThrow: async () => staleSale,
+          update: async ({ data }: any) => data,
+        },
         customer: { update: async () => ({}) },
+        payment: { findFirst: async () => null },
       }),
   });
   const inventory = stub<InventoryService>({
@@ -636,7 +1514,7 @@ async function aStaleReadCannotOverReturnALine() {
     prisma,
     inventory,
     stub<MailService>({}),
-    stub<ShiftsService>({}),
+    stub<ShiftsService>({ resolveShiftId: async () => null }),
     stub<PaymentsService>({ record: async () => undefined }),
   );
 
@@ -938,7 +1816,7 @@ async function permanentDeleteRefusesToDestroyHistory() {
 
   const makeService = (
     target: { id: string; name: string; isActive: boolean } | null,
-    counts: { sales: number; shifts: number; movements: number },
+    counts: { sales: number; shifts: number; movements: number; cash?: number },
   ) =>
     new UsersService(
       stub<PrismaService>({
@@ -952,6 +1830,7 @@ async function permanentDeleteRefusesToDestroyHistory() {
         sale: { count: async () => counts.sales },
         shift: { count: async () => counts.shifts },
         stockMovement: { count: async () => counts.movements },
+        cashMovement: { count: async () => counts.cash ?? 0 },
       }),
       principals,
     );
@@ -984,6 +1863,8 @@ async function permanentDeleteRefusesToDestroyHistory() {
     [{ sales: 42, shifts: 0, movements: 0 }, /42 sales/],
     [{ sales: 0, shifts: 1, movements: 0 }, /1 shift(?!s)/],
     [{ sales: 0, shifts: 0, movements: 7 }, /7 stock movements/],
+    // An owner who only ever paid out of a cashier's till has no shift of their own.
+    [{ sales: 0, shifts: 0, movements: 0, cash: 2 }, /2 cash pay in\/outs/],
   ] as const) {
     await assert.rejects(
       makeService({ id: 'u3', name: 'Ana', isActive: false }, counts).destroy('b1', 'u3', 'u1'),
@@ -2314,6 +3195,8 @@ async function main() {
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
   await shiftReportBalancesTheDrawer();
+  await cashControlOnAShift();
+  await oneDrawerOneShift();
   await everyPaymentLeavesATrail();
   await aStatementCountsAReturnOnce();
   await theLastActiveStoreStaysOpen();
@@ -2325,6 +3208,17 @@ async function main() {
   await serialRulesGuardEveryUnit();
   await unitsGovernFractionalQuantities();
   await partReturnLeavesTheSalePartiallyReturned();
+  await aHeldCartCannotBeReturned();
+  await aReturnGivesBackWhatWasPaidNotTheShelfPrice();
+  await aReturnCancelsOnlyCreditStillOwed();
+  await aReturnPreviewMatchesTheReturn();
+  await aSupplierRefundIsOwedUntilReceived();
+  await damagedReturnsAreWrittenOff();
+  await aPinnedCashierReturnsOnlyAtTheirStore();
+  await aProductChargesTheTaxItShows();
+  await aPartPaymentKeepsItsTender();
+  await aCustomerWithHistoryIsKept();
+  await creditAgeingCountsAReturnOnce();
   await aStaleReadCannotOverReturnALine();
   await verifyEmailAlwaysRequiresTheCode();
   envValidationRefusesUnsafeConfig();
