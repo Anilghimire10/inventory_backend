@@ -6,6 +6,7 @@ import {
   SaleStatus,
   PurchaseStatus,
   StockMovementType,
+  PaymentType,
 } from '@prisma/client';
 import * as argon2 from 'argon2';
 
@@ -17,6 +18,18 @@ const prisma = new PrismaClient();
  * Login: owner@demo.com / password123
  */
 async function main() {
+  // Seeding production is allowed -- it is how the first platform admin gets
+  // created -- but never with a password printed in this file, and never with
+  // the demo shop, whose login is in the README: on a live server either one
+  // is a door anyone can walk through.
+  const isProd = process.env.NODE_ENV === 'production';
+  if (isProd && (process.env.PLATFORM_ADMIN_PASSWORD ?? '').length < 12) {
+    throw new Error(
+      'NODE_ENV=production: set PLATFORM_ADMIN_PASSWORD (12+ characters) before seeding. ' +
+        'The built-in default is for local development only.',
+    );
+  }
+
   // ---- Platform super-admin (idempotent) ----
   const adminEmail = process.env.PLATFORM_ADMIN_EMAIL ?? 'admin@platform.com';
   const adminPassword = process.env.PLATFORM_ADMIN_PASSWORD ?? 'admin12345';
@@ -31,7 +44,17 @@ async function main() {
         passwordHash: await argon2.hash(adminPassword),
       },
     });
-    console.log(`Platform admin created: ${adminEmail} / ${adminPassword}`);
+    // The password only echoes back when it is the dev default: a real one
+    // would otherwise sit in the deploy log for as long as that is kept.
+    console.log(
+      `Platform admin created: ${adminEmail}` +
+        (process.env.PLATFORM_ADMIN_PASSWORD ? '' : ` / ${adminPassword}`),
+    );
+  }
+
+  if (isProd) {
+    console.log('NODE_ENV=production: demo business skipped.');
+    return;
   }
 
   // ---- Demo business (idempotent) ----
@@ -249,19 +272,22 @@ async function main() {
   const suppliers = await prisma.supplier.findMany({ where: { businessId: bid } });
 
   // ---- Customers ----
-  const customerDefs: Array<[string, string, string | null, number]> = [
-    ['Sita Gurung', '9841-000001', 'sita.g@example.com', 0],
-    ['Ram Bahadur Thapa', '9841-000002', null, 125.5],
-    ['Maya Sharma', '9841-000003', 'maya.s@example.com', 0],
-    ['Krishna Limbu', '9841-000004', null, 480.0],
-    ['Anita Maharjan', '9841-000005', 'anita.m@example.com', 0],
-    ['Deepak Adhikari', '9841-000006', null, 65.0],
-    ['Puja Karki', '9841-000007', 'puja.k@example.com', 0],
-    ['Rajan Shrestha', '9841-000008', null, 0],
+  // Every customer starts owing nothing: what they owe comes from the credit
+  // sales below, so each balance is explained by a sale on their statement.
+  // (Typed-in starting balances showed up as "can't be aged" on the Credit page.)
+  const customerDefs: Array<[string, string, string | null]> = [
+    ['Sita Gurung', '9841-000001', 'sita.g@example.com'],
+    ['Ram Bahadur Thapa', '9841-000002', null],
+    ['Maya Sharma', '9841-000003', 'maya.s@example.com'],
+    ['Krishna Limbu', '9841-000004', null],
+    ['Anita Maharjan', '9841-000005', 'anita.m@example.com'],
+    ['Deepak Adhikari', '9841-000006', null],
+    ['Puja Karki', '9841-000007', 'puja.k@example.com'],
+    ['Rajan Shrestha', '9841-000008', null],
   ];
-  for (const [name, phone, em, credit] of customerDefs) {
+  for (const [name, phone, em] of customerDefs) {
     await prisma.customer.create({
-      data: { businessId: bid, name, phone, email: em, creditBalance: credit },
+      data: { businessId: bid, name, phone, email: em },
     });
   }
   const customers = await prisma.customer.findMany({ where: { businessId: bid } });
@@ -381,6 +407,20 @@ async function main() {
         items: { create: itemRows },
       },
     });
+    // Paid in full on delivery -- which the ledger records, like the app does.
+    await prisma.payment.create({
+      data: {
+        businessId: bid,
+        storeId: sid,
+        type: PaymentType.SUPPLIER_PAYMENT,
+        amount: total,
+        method: PaymentMethod.CASH,
+        supplierId: supplier?.id,
+        purchaseId: purchase.id,
+        userId: owner?.id,
+        createdAt: receivedAt ?? createdAt,
+      },
+    });
 
     for (const [sku, qty] of items) {
       const product = await prisma.product.findFirst({ where: { businessId: bid, sku } });
@@ -431,6 +471,30 @@ async function main() {
   const rand = rng(20240818);
   const pick = <T,>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
 
+  // Yesterday's till, so the shift report (X/Z) has a real day behind it.
+  // Opened with a float, closed at night; its sales and payments carry its id.
+  const shiftDay = new Date(now);
+  shiftDay.setDate(shiftDay.getDate() - 1);
+  const shiftOpenedAt = new Date(shiftDay);
+  shiftOpenedAt.setHours(7, 30, 0, 0);
+  const shiftClosedAt = new Date(shiftDay);
+  shiftClosedAt.setHours(21, 0, 0, 0);
+  const openingFloat = 2000;
+  const shift = owner
+    ? await prisma.shift.create({
+        data: {
+          businessId: bid,
+          storeId: sid,
+          userId: owner.id,
+          openedAt: shiftOpenedAt,
+          openingFloat,
+          createdAt: shiftOpenedAt,
+        },
+      })
+    : null;
+  let shiftCash = 0;
+  let shiftRefunds = 0;
+
   for (let i = 0; i < 60; i++) {
     const daysAgo = Math.floor(rand() * 30);
     const hour = 8 + Math.floor(rand() * 12);
@@ -454,11 +518,17 @@ async function main() {
       roll < 0.85 ? SaleStatus.COMPLETED : roll < 0.95 ? SaleStatus.HELD : SaleStatus.RETURNED;
 
     const isCredit = rand() < 0.15 && status === SaleStatus.COMPLETED;
+    // Part paid now, the rest on the khata -- recorded as MIXED, the tender
+    // of the part paid going on the payment row.
+    const isPartCredit = !isCredit && status === SaleStatus.COMPLETED && rand() < 0.1;
+    const tender = pick(methods);
     const method: PaymentMethod = isCredit
       ? PaymentMethod.CREDIT
-      : status === SaleStatus.COMPLETED
-        ? pick(methods)
-        : PaymentMethod.CASH;
+      : isPartCredit
+        ? PaymentMethod.MIXED
+        : status === SaleStatus.COMPLETED
+          ? tender
+          : PaymentMethod.CASH;
 
     const customer = pick(customers);
     let subtotal = 0;
@@ -507,12 +577,16 @@ async function main() {
     const discountTotal = saleItems.reduce((s, it) => s + it.discount, 0);
     const tax = status === SaleStatus.COMPLETED ? Math.round(subtotal * 0.13 * 100) / 100 : 0;
     const total = Math.round((subtotal - discountTotal + tax) * 100) / 100;
+    // A returned sale was paid for before it came back; a held cart is not
+    // paid at all.
     const amountPaid =
-      status !== SaleStatus.COMPLETED || method === PaymentMethod.CREDIT
+      status === SaleStatus.HELD || method === PaymentMethod.CREDIT
         ? 0
-        : method === PaymentMethod.MIXED
-          ? total
+        : isPartCredit
+          ? Math.round(total * 50) / 100
           : total;
+    const onShift =
+      shift && daysAgo === 1 && status !== SaleStatus.HELD ? shift.id : null;
 
     const receiptNo = `REC-${receiptCounter++}`;
     const sale = await prisma.sale.create({
@@ -529,6 +603,7 @@ async function main() {
         total,
         paymentMethod: method,
         amountPaid,
+        shiftId: onShift,
         prescriptionRef:
           status === SaleStatus.COMPLETED && chosen.some((p) => p.isRxRequired)
             ? `RX-${10000 + Math.floor(rand() * 90000)}`
@@ -569,13 +644,107 @@ async function main() {
       }
     }
 
-    // credit sales bump the customer balance
-    if (method === PaymentMethod.CREDIT && customer) {
+    // The money behind the sale, as the app records it: what was paid at the
+    // till, and for a returned sale what was handed back.
+    const paidWith = isPartCredit ? tender : method;
+    if (amountPaid > 0) {
+      await prisma.payment.create({
+        data: {
+          businessId: bid,
+          storeId: sid,
+          type: PaymentType.SALE,
+          amount: amountPaid,
+          method: paidWith,
+          saleId: sale.id,
+          customerId: customer?.id,
+          shiftId: onShift,
+          userId: owner?.id,
+          createdAt,
+        },
+      });
+      if (paidWith === PaymentMethod.CASH) shiftCash += onShift ? amountPaid : 0;
+    }
+    if (status === SaleStatus.RETURNED) {
+      const returnedAt = new Date(createdAt.getTime() + 60 * 60 * 1000);
+      await prisma.payment.create({
+        data: {
+          businessId: bid,
+          storeId: sid,
+          type: PaymentType.REFUND,
+          amount: total,
+          method: PaymentMethod.CASH,
+          saleId: sale.id,
+          customerId: customer?.id,
+          shiftId: onShift,
+          userId: owner?.id,
+          createdAt: returnedAt,
+        },
+      });
+      if (onShift) shiftRefunds += total;
+    }
+
+    // whatever wasn't paid goes on the customer's khata
+    const owed = Math.round((total - amountPaid) * 100) / 100;
+    if (status === SaleStatus.COMPLETED && owed > 0 && customer) {
       await prisma.customer.update({
         where: { id: customer.id },
-        data: { creditBalance: { increment: total } },
+        data: { creditBalance: { increment: owed } },
       });
     }
+  }
+
+  // ---- A few customers paying their khata down ----
+  // So statements show both sides: what went on credit, and what came back.
+  const owing = await prisma.customer.findMany({
+    where: { businessId: bid, creditBalance: { gt: 0 } },
+    orderBy: { creditBalance: 'desc' },
+    take: 3,
+  });
+  for (const [i, c] of owing.entries()) {
+    const amount = Math.round(Number(c.creditBalance) * 40) / 100;
+    const paidAt = new Date(now);
+    paidAt.setDate(paidAt.getDate() - (i + 2));
+    await prisma.customer.update({
+      where: { id: c.id },
+      data: { creditBalance: { decrement: amount } },
+    });
+    await prisma.payment.create({
+      data: {
+        businessId: bid,
+        storeId: sid,
+        type: PaymentType.CUSTOMER_CREDIT,
+        amount,
+        method: i === 1 ? PaymentMethod.MOBILE : PaymentMethod.CASH,
+        customerId: c.id,
+        userId: owner?.id,
+        note: 'Paid towards khata',
+        createdAt: paidAt,
+      },
+    });
+  }
+
+  // ---- Close yesterday's till ----
+  // Expected cash is worked out the way the app does (float + cash taken -
+  // cash refunded); the count comes up 50 short so the variance report has
+  // something to show.
+  if (shift) {
+    const shiftSales = await prisma.sale.findMany({
+      where: { shiftId: shift.id },
+      select: { refundedTotal: true },
+    });
+    const expectedCash = Math.round((openingFloat + shiftCash - shiftRefunds) * 100) / 100;
+    const countedCash = expectedCash - 50;
+    await prisma.shift.update({
+      where: { id: shift.id },
+      data: {
+        closedAt: shiftClosedAt,
+        expectedCash,
+        countedCash,
+        variance: countedCash - expectedCash,
+        refundsAtClose: shiftSales.reduce((s, x) => s + Number(x.refundedTotal), 0),
+        note: 'Counted 50 short -- change given twice for one note.',
+      },
+    });
   }
 
   // ---- A couple of stock adjustments ----
