@@ -55,14 +55,25 @@ const num = (v: Prisma.Decimal | bigint | number | null | undefined) =>
 const SOLD_QTY = Prisma.sql`(si.quantity - si."returnedQty")`;
 
 /**
- * What those units brought in, before tax.
+ * What those units brought in, before tax and after every discount.
  *
- * On a tax-inclusive sale the unit price already holds the tax, so it is
- * scaled back to its pre-tax part; `taxRate` is 0 on untaxed lines, where
- * the factor is 1.
+ * Built the way the sale was: the line's amount less its own discount, with
+ * tax backed out on a tax-inclusive sale (`taxRate` is 0 on untaxed lines,
+ * where the factor is 1). That reproduces `Sale.subtotal` to the paisa. The
+ * bill discount then comes off each line in proportion to its share of that
+ * subtotal, which lands the sale on `subtotal - discount` -- what the shop
+ * kept once tax is set aside. Only the kept share of the line counts.
+ *
+ * This used to be `kept units x unitPrice`, which left out both discounts:
+ * every rupee knocked off at the till showed up as revenue and as profit.
+ *
+ * Not `lineTotal`: sales before tax-inclusive pricing stored it without tax
+ * and later ones with it, so it means different things on different rows.
  */
-const LINE_REVENUE = Prisma.sql`${SOLD_QTY} * si."unitPrice"
-  * CASE WHEN s."taxInclusive" THEN 100 / (100 + si."taxRate") ELSE 1 END`;
+const LINE_REVENUE = Prisma.sql`(${SOLD_QTY} / NULLIF(si.quantity, 0))
+  * (si.quantity * si."unitPrice" - si.discount)
+  * CASE WHEN s."taxInclusive" THEN 100 / (100 + si."taxRate") ELSE 1 END
+  * CASE WHEN s.subtotal > 0 THEN GREATEST(1 - s.discount / s.subtotal, 0) ELSE 1 END`;
 
 /**
  * What those units cost.
@@ -412,8 +423,9 @@ export class ReportsService {
    *
    * Profit prefers the cost snapshotted on each line at sale time and falls
    * back to the product's current cost for sales recorded before snapshotting
-   * existed. Quantities are net of returns. Revenue here is net of tax;
-   * "gross sales" is the customer-facing total incl. tax and discount.
+   * existed. Quantities are net of returns. Revenue here is net of tax and
+   * of line and bill discounts (see LINE_REVENUE); "gross sales" is what
+   * customers paid, tax included.
    */
   async analytics(
     businessId: string,
@@ -918,7 +930,7 @@ export class ReportsService {
         discount: true,
         taxRate: true,
         lineTotal: true,
-        sale: { select: { taxInclusive: true } },
+        sale: { select: { taxInclusive: true, subtotal: true, discount: true } },
       },
     });
 
@@ -942,7 +954,13 @@ export class ReportsService {
       );
       taxableAmount += lineNet;
       taxCollected += lineTax;
-      grossSales += lineNet + lineTax;
+      // A bill discount comes off after tax is worked out, so it changes
+      // neither figure above -- but the customer paid that much less.
+      // Without it, this report's gross sales ran above the Analytics
+      // revenue on the same page by every bill discount given.
+      const subtotal = Number(it.sale.subtotal);
+      const billShare = subtotal > 0 ? Number(it.sale.discount) / subtotal : 0;
+      grossSales += lineNet + lineTax - lineNet * billShare;
       if (rate > 0) {
         const cur = byRate.get(rate) ?? { taxableAmount: 0, tax: 0 };
         cur.taxableAmount += lineNet;
