@@ -6,7 +6,9 @@ import { once } from "node:events";
 import {
   IsBoolean,
   IsEnum,
+  IsNumber,
   IsOptional,
+  Min,
   IsString,
   Length,
   MaxLength,
@@ -96,6 +98,25 @@ export class UpdateBusinessDto {
   @IsOptional()
   @IsBoolean()
   taxEnabled?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      "Cashiers count the drawer at close without seeing what it should hold",
+  })
+  @IsOptional()
+  @IsBoolean()
+  shiftBlindClose?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      "Require a note when a drawer is off by more than this. null: never.",
+    example: 100,
+    nullable: true,
+  })
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  shiftVarianceNoteOver?: number | null;
 }
 
 @ApiTags("business")

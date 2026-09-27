@@ -152,25 +152,31 @@ model PlatformAdmin {
 }
 
 model Business {
-  id              String       @id @default(cuid())
-  name            String
-  type            BusinessType @default(OTHER)
-  salesModel      SalesModel   @default(RETAIL)
-  currency        String       @default("USD")
+  id                    String       @id @default(cuid())
+  name                  String
+  type                  BusinessType @default(OTHER)
+  salesModel            SalesModel   @default(RETAIL)
+  currency              String       @default("USD")
   /// IANA zone the shop's day is cut on -- reports, day buckets and the
   /// hour-of-day chart all key off this, not off the server's UTC clock.
-  timezone        String       @default("Asia/Kathmandu")
-  taxId           String? // PAN/VAT registration number
-  showTaxIdOnBill Boolean      @default(false) // when on, the PAN/VAT number prints on bills
-  taxInclusive    Boolean      @default(false) // selling prices include tax (backed out at sale time)
-  taxEnabled      Boolean      @default(true) // master switch: when off, no sale charges tax
-  isSuspended     Boolean      @default(false) // suspended by a platform admin
-  suspendedReason String? // shown to the business's users when sign-in is refused
-  suspendedAt     DateTime?
-  isSubscribed    Boolean      @default(true) // paid/active subscription (Fonepay later)
-  subscribedTo    DateTime? // subscription end date; null = no expiry
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  timezone              String       @default("Asia/Kathmandu")
+  taxId                 String? // PAN/VAT registration number
+  showTaxIdOnBill       Boolean      @default(false) // when on, the PAN/VAT number prints on bills
+  taxInclusive          Boolean      @default(false) // selling prices include tax (backed out at sale time)
+  taxEnabled            Boolean      @default(true) // master switch: when off, no sale charges tax
+  /// Cashiers count the drawer without being shown what it should hold, and
+  /// never see the variance. Owners and managers always see both.
+  shiftBlindClose       Boolean      @default(false)
+  /// A drawer off by more than this can't be closed without a note saying
+  /// why. Null: a note is never required.
+  shiftVarianceNoteOver Decimal?     @db.Decimal(12, 2)
+  isSuspended           Boolean      @default(false) // suspended by a platform admin
+  suspendedReason       String? // shown to the business's users when sign-in is refused
+  suspendedAt           DateTime?
+  isSubscribed          Boolean      @default(true) // paid/active subscription (Fonepay later)
+  subscribedTo          DateTime? // subscription end date; null = no expiry
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
 
   subscriptionPayments SubscriptionPayment[]
   platformAuditLogs    PlatformAuditLog[]
@@ -193,6 +199,7 @@ model Business {
   auditLogs      AuditLog[]
   supportTickets SupportTicket[]
   shifts         Shift[]
+  cashMovements  CashMovement[]
   payments       Payment[]
   serials        Serial[]
 }
@@ -250,6 +257,7 @@ model User {
   supportTickets SupportTicket[]
   payments       Payment[]
   shifts         Shift[]
+  cashMovements  CashMovement[]
 
   @@index([businessId])
 }
@@ -612,25 +620,39 @@ model SaleItem {
 // shiftId, so closing can compare the cash the drawer *should* hold with
 // what was physically counted.
 model Shift {
-  id           String    @id @default(cuid())
-  businessId   String
-  business     Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  storeId      String
-  store        Store     @relation(fields: [storeId], references: [id])
-  userId       String
-  user         User      @relation(fields: [userId], references: [id])
-  openedAt     DateTime  @default(now())
-  closedAt     DateTime?
-  openingFloat Decimal   @default(0) @db.Decimal(12, 2)
-  countedCash  Decimal?  @db.Decimal(12, 2) // what the cashier physically counted at close
-  expectedCash Decimal?  @db.Decimal(12, 2) // snapshot: float + cash in - cash refunds
-  variance     Decimal?  @db.Decimal(12, 2) // counted - expected
-  note         String?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  id             String    @id @default(cuid())
+  businessId     String
+  business       Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  storeId        String
+  store          Store     @relation(fields: [storeId], references: [id])
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  openedAt       DateTime  @default(now())
+  closedAt       DateTime?
+  openingFloat   Decimal   @default(0) @db.Decimal(12, 2)
+  countedCash    Decimal?  @db.Decimal(12, 2) // what the cashier physically counted at close
+  expectedCash   Decimal?  @db.Decimal(12, 2) // snapshot: float + cash in - cash refunds
+  variance       Decimal?  @db.Decimal(12, 2) // counted - expected
+  /// Snapshot at close of what had been handed back against this shift's
+  /// sales, so a return made later can't rewrite a Z report already counted.
+  refundsAtClose Decimal?  @db.Decimal(12, 2)
+  /// What the previous shift at this store said it left in the drawer, read
+  /// when this one opened. `openingFloat - carriedFloat` is cash that went
+  /// missing (or appeared) between two counts, before this cashier touched it.
+  carriedFloat   Decimal?  @db.Decimal(12, 2)
+  /// Of the cash counted at close, what stays in the drawer as the next
+  /// shift's float. The rest (`countedCash - cashLeft`) was taken away.
+  cashLeft       Decimal?  @db.Decimal(12, 2)
+  /// Notes and coins counted at close, `{ "500": 3, "100": 7 }`, when the
+  /// cashier counted by denomination rather than typing a total.
+  cashCount      Json?
+  note           String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  sales    Sale[]
-  payments Payment[]
+  sales         Sale[]
+  payments      Payment[]
+  cashMovements CashMovement[]
 
   // "One open shift per user PER STORE" is enforced by a partial unique index
   // on (userId, storeId) WHERE "closedAt" IS NULL — Prisma can't express
@@ -643,6 +665,50 @@ model Shift {
   // that an owner joins the cashier's drawer rather than opening a second
   // one, and by the sale path to resolve which drawer a sale lands in.
   @@index([storeId, closedAt])
+}
+
+/// Which way cash crossed the drawer outside a sale, refund or credit payment.
+enum CashMovementType {
+  PAY_IN // cash put into the drawer
+  PAY_OUT // cash taken out of it
+}
+
+/// Why. Fixed codes rather than free text so a report can total them.
+enum CashMovementReason {
+  FLOAT_TOPUP // more change added to the drawer (pay in)
+  EXPENSE // a small shop expense paid from the till: tea, milk, transport
+  SUPPLIER // a supplier paid in cash from the till
+  SAFE_DROP // excess cash moved to the safe or the bank
+  OWNER_DRAW // the owner took cash for themselves
+  OTHER // anything else -- a note is then required
+}
+
+/// Cash put into or taken out of a drawer while a shift is open.
+///
+/// Without these, every rupee paid out of the till for tea or a supplier
+/// showed up at close as the cashier being short. Rows are never edited or
+/// deleted: a mistake is corrected with an opposite movement, so the Z report
+/// can always be explained line by line. They can't be added once the shift
+/// is closed either -- the counted drawer is final.
+///
+/// A SUPPLIER pay out only records cash leaving the drawer. What the shop
+/// owes that supplier is settled on the purchase, as before.
+model CashMovement {
+  id         String             @id @default(cuid())
+  businessId String
+  business   Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  shiftId    String
+  shift      Shift              @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User               @relation(fields: [userId], references: [id])
+  type       CashMovementType
+  reason     CashMovementReason
+  amount     Decimal            @db.Decimal(12, 2)
+  note       String?
+  createdAt  DateTime           @default(now())
+
+  @@index([shiftId, createdAt])
+  @@index([businessId, createdAt])
 }
 
 // ---------- Money ----------

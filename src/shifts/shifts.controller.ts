@@ -10,7 +10,12 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { UserRole } from '@prisma/client';
 import { ShiftsService } from './shifts.service';
-import { CloseShiftDto, OpenShiftDto, QueryShiftDto } from './dto/shift.dto';
+import {
+  CashMovementDto,
+  CloseShiftDto,
+  OpenShiftDto,
+  QueryShiftDto,
+} from './dto/shift.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AuthUser } from '../common/types/auth-user';
@@ -59,6 +64,18 @@ export class ShiftsController {
     return this.shifts.openAtStore(u, scoped);
   }
 
+  /**
+   * What the last shift closed at this store left in the drawer, offered as
+   * the opening float. Null when it didn't say, or nothing has closed yet.
+   */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Get('float')
+  suggestedFloat(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
+    const scoped = scopeToStore(u, storeId);
+    if (!scoped) throw new BadRequestException('storeId is required');
+    return this.shifts.suggestedFloat(u, scoped);
+  }
+
   /** Shift history — owners and managers only. */
   @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get()
@@ -70,7 +87,18 @@ export class ShiftsController {
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
   @Get(':id/report')
   report(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.shifts.report(u.businessId, id, u.userId);
+    return this.shifts.report(u.businessId, id, u);
+  }
+
+  /** Pay in or pay out: cash into or out of an open drawer, with a reason. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
+  @Post(':id/movements')
+  addMovement(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: CashMovementDto,
+  ) {
+    return this.shifts.addMovement(u, id, dto);
   }
 
   /** Close with the counted cash; stores expected, counted and variance. */

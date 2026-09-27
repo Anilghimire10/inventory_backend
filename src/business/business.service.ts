@@ -105,6 +105,9 @@ export class BusinessService {
     // reports and no serial numbers.
     yield* this.pageTable('serial', (a) => this.prisma.serial.findMany({ ...a, where }));
     yield* this.pageTable('shift', (a) => this.prisma.shift.findMany({ ...a, where }));
+    yield* this.pageTable('cashMovement', (a) =>
+      this.prisma.cashMovement.findMany({ ...a, where }),
+    );
     yield* this.pageTable('payment', (a) => this.prisma.payment.findMany({ ...a, where }));
     yield* this.pageTable('auditLog', (a) => this.prisma.auditLog.findMany({ ...a, where }));
     yield* this.pageTable('supportTicket', (a) =>

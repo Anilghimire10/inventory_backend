@@ -183,7 +183,7 @@ export class UsersService {
    *  - The account must already be deactivated. Deletion is the second step of
    *    an offboarding that starts with `remove()`, never a one-click action on
    *    a working account.
-   *  - They must have no sales, shifts or stock movements. Sale.userId and
+   *  - They must have no sales, shifts, stock or cash movements. Sale.userId and
    *    StockMovement.userId are optional (onDelete defaults to SetNull), so a
    *    delete here would silently blank out who rang up every sale rather than
    *    fail loudly; Shift.userId is required, so the database would reject it
@@ -209,16 +209,20 @@ export class UsersService {
       );
     }
 
-    const [sales, shifts, movements] = await Promise.all([
+    const [sales, shifts, movements, cash] = await Promise.all([
       this.prisma.sale.count({ where: { userId: id } }),
       this.prisma.shift.count({ where: { userId: id } }),
       this.prisma.stockMovement.count({ where: { userId: id } }),
+      // An owner paying out of a cashier's till has no shift of their own
+      // there, so the shift count alone doesn't cover this.
+      this.prisma.cashMovement.count({ where: { userId: id } }),
     ]);
     const history = [
       sales && `${sales} sale${sales === 1 ? '' : 's'}`,
       shifts && `${shifts} shift${shifts === 1 ? '' : 's'}`,
       movements &&
         `${movements} stock movement${movements === 1 ? '' : 's'}`,
+      cash && `${cash} cash pay in/out${cash === 1 ? '' : 's'}`,
     ].filter(Boolean);
     if (history.length) {
       throw new ConflictException(
