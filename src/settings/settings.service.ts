@@ -35,7 +35,20 @@ export class SettingsService {
   }
 
   async update(
-    data: Partial<Pick<PlatformSettings, 'trialDays' | 'signupOpen' | 'maintenanceMessage' | 'auditRetentionDays'>>,
+    data: Partial<
+      Pick<
+        PlatformSettings,
+        | 'trialDays'
+        | 'signupOpen'
+        | 'maintenanceMessage'
+        | 'auditRetentionDays'
+        | 'billingName'
+        | 'billingTaxId'
+        | 'billingAddress'
+        | 'billingPhone'
+        | 'billingEmail'
+      >
+    >,
     updatedBy: string,
   ): Promise<PlatformSettings> {
     const value = await this.prisma.platformSettings.upsert({

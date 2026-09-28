@@ -26,6 +26,7 @@ import { BusinessService } from '../business/business.service';
 import { AuthService } from '../auth/auth.service';
 import { isSubscriptionActive } from '../common/subscription';
 import { SubscriptionRemindersService } from './subscription-reminders.service';
+import { PlatformBillingService } from './platform-billing.service';
 import {
   BusinessSort,
   CreateBusinessDto,
@@ -98,6 +99,7 @@ export class PlatformService {
     private mail: MailService,
     private audit: PlatformAuditService,
     private reminders: SubscriptionRemindersService,
+    private billing: PlatformBillingService,
     private business: BusinessService,
     private auth: AuthService,
     private settings: SettingsService,
@@ -496,7 +498,19 @@ export class PlatformService {
         previousEnd: business.subscribedTo?.toISOString() ?? null,
       },
     });
-    return { payment, business: updated };
+
+    // The payment is recorded whatever happens to the email: a mail outage
+    // must not make an admin record the same money twice. The result says
+    // how it went, and the receipt can be re-sent from the payments tab.
+    let receipt: { emailed: number; failed: number; error?: string } | undefined;
+    if (dto.emailReceipt) {
+      try {
+        receipt = await this.billing.emailReceipt(actor, payment.id);
+      } catch (e) {
+        receipt = { emailed: 0, failed: 0, error: (e as Error).message };
+      }
+    }
+    return { payment, business: updated, receipt };
   }
 
   /** "Send reminder now": bell notification + email to the owners. */

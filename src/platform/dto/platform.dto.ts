@@ -354,6 +354,11 @@ export class RecordPaymentDto {
   @IsString()
   @MaxLength(1000)
   note?: string;
+
+  @ApiPropertyOptional({ description: "Email the receipt to the business's owners" })
+  @IsOptional()
+  @IsBoolean()
+  emailReceipt?: boolean;
 }
 
 // ---- Shop users (support) ----
@@ -482,4 +487,60 @@ export class UpdatePlatformSettingsDto {
   @Min(30)
   @Max(3650)
   auditRetentionDays?: number | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Our trading name, printed on subscription receipts' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(200)
+  billingName?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Our PAN/VAT number, printed on receipts' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(50)
+  billingTaxId?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Our address, printed on receipts' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(300)
+  billingAddress?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Our phone, printed on receipts' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(50)
+  billingPhone?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'Our email, printed on receipts' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(254)
+  billingEmail?: string | null;
+}
+
+// ---- Renewals ----
+
+export class QueryRenewalsDto {
+  @ApiPropertyOptional({ description: 'Include subscriptions ending within this many days', default: 30 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(365)
+  days: number = 30;
+}
+
+export class RemindBusinessesDto {
+  @ApiProperty({ type: [String], description: 'Businesses to remind now' })
+  @IsArray()
+  @ArrayMaxSize(200)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  businessIds: string[];
 }

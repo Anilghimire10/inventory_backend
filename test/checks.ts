@@ -12,6 +12,7 @@ import { JwtService } from '@nestjs/jwt';
 import { PaymentMethod, PlatformRole, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
+import { PlatformBillingService, formatReceiptNo } from '../src/platform/platform-billing.service';
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
 import { PaymentsService } from '../src/payments/payments.service';
@@ -2561,6 +2562,70 @@ async function aNotificationIsReadPerPerson() {
   assert.strictEqual(writes.length, 0, "another shop's notification can't be touched");
 }
 
+/**
+ * Getting paid: receipt numbers print the same everywhere, the renewals list
+ * tells trials from paying shops and flags the overdue ones, and a bulk
+ * reminder sends once per shop and skips what it can't remind about.
+ */
+async function renewalsAndReceipts() {
+  assert.strictEqual(formatReceiptNo(42), 'SUB-000042');
+  assert.strictEqual(formatReceiptNo(1234567), 'SUB-1234567', 'no truncation past six digits');
+
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const reminded: string[] = [];
+  const audits: any[] = [];
+  const db: any = {
+    business: {
+      findMany: async (args: any) => {
+        if (args.select?.subscriptionPayments) {
+          return [
+            { id: 'late', name: 'Late', currency: 'NPR', subscribedTo: new Date(now - 2 * day),
+              _count: { subscriptionPayments: 1 },
+              subscriptionPayments: [{ amount: new Prisma.Decimal(2000), currency: 'NPR', periodFrom: new Date(), periodTo: new Date(), createdAt: new Date() }],
+              users: [] },
+            { id: 'trial', name: 'Trial', currency: 'NPR', subscribedTo: new Date(now + 5 * day),
+              _count: { subscriptionPayments: 0 }, subscriptionPayments: [], users: [] },
+          ];
+        }
+        // remind(): only businesses that exist and have an end date come back.
+        return args.where.id.in
+          .filter((id: string) => id !== 'ghost')
+          .map((id: string) => ({ id, name: id, subscribedTo: new Date(now + 3 * day) }));
+      },
+    },
+  };
+  const service = new PlatformBillingService(
+    stub<PrismaService>(db),
+    stub<MailService>({}),
+    stub<SettingsService>({}),
+    stub<PlatformAuditService>({ record: async (_a: unknown, action: string, d: unknown) => audits.push({ action, d }) }),
+    stub<SubscriptionRemindersService>({
+      remind: async (b: { id: string }) => {
+        reminded.push(b.id);
+        return { alreadySent: false, emailed: 1, failed: 0 };
+      },
+    }),
+  );
+
+  const rows = await service.renewals(30);
+  const late = rows.find((r) => r.id === 'late')!;
+  const trial = rows.find((r) => r.id === 'trial')!;
+  assert.strictEqual(late.overdue, true, 'past the end date is overdue');
+  assert.strictEqual(late.kind, 'paid');
+  assert.strictEqual(late.lastPayment?.amount, 2000, 'what they last paid, as a number');
+  assert.ok(late.accessEndsAt >= late.endsAt, 'lock-out comes at or after the end date (grace)');
+  assert.strictEqual(trial.kind, 'trial', 'never paid = trial');
+  assert.strictEqual(trial.overdue, false);
+  assert.strictEqual(trial.lastPayment, null);
+
+  const admin = { adminId: 'a1', email: 'a1@x.com' };
+  const res = await service.remind(admin, ['s1', 's1', 's2', 'ghost']);
+  assert.deepStrictEqual(reminded, ['s1', 's2'], 'each shop reminded once');
+  assert.deepStrictEqual(res, { reminded: 2, skipped: 1, emailed: 2, failed: 0 }, 'the unknown one is skipped, not fatal');
+  assert.strictEqual(audits.length, 2, 'one admin-log entry per shop, so each business page shows it');
+}
+
 /** A restarted server or a second run the same day must not email twice. */
 async function reminderGoesOutOncePerThreshold() {
   const keys = new Set<string>();
@@ -3239,6 +3304,7 @@ async function main() {
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
   await aNotificationIsReadPerPerson();
+  await renewalsAndReceipts();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();

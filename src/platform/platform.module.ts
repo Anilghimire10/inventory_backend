@@ -20,6 +20,8 @@ import { PlatformAnnouncementsService } from './platform-announcements.service';
 import { PlatformInsightsService } from './platform-insights.service';
 import { SubscriptionRemindersService } from './subscription-reminders.service';
 import { PlatformSettingsController } from './platform-settings.controller';
+import { PlatformBillingController } from './platform-billing.controller';
+import { PlatformBillingService } from './platform-billing.service';
 import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
 
 @Module({
@@ -48,6 +50,7 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     PlatformInsightsController,
     PlatformAnnouncementsController,
     PlatformSettingsController,
+    PlatformBillingController,
   ],
   providers: [
     PlatformAuthService,
@@ -58,6 +61,7 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     PlatformInsightsService,
     PlatformAnnouncementsService,
     SubscriptionRemindersService,
+    PlatformBillingService,
     PlatformJwtStrategy,
   ],
 })

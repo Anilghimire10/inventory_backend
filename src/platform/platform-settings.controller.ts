@@ -9,6 +9,14 @@ import { CurrentActor } from './current-admin.decorator';
 import { Actor, PlatformAuditService } from './platform-audit.service';
 import { UpdatePlatformSettingsDto } from './dto/platform.dto';
 
+const BILLING_FIELDS = [
+  'billingName',
+  'billingTaxId',
+  'billingAddress',
+  'billingPhone',
+  'billingEmail',
+] as const;
+
 /** Admin panel → Settings. Reading is open to SUPPORT; changing is not. */
 // @Public() skips the global tenant guard; PlatformAuthGuard enforces admin JWT.
 @ApiTags('admin')
@@ -55,6 +63,10 @@ export class PlatformSettingsController {
         ? { maintenanceMessage: dto.maintenanceMessage?.trim() || null }
         : {}),
       ...(dto.auditRetentionDays !== undefined ? { auditRetentionDays: dto.auditRetentionDays } : {}),
+      // Receipt details: blank clears, like the maintenance message.
+      ...Object.fromEntries(
+        BILLING_FIELDS.filter((k) => dto[k] !== undefined).map((k) => [k, dto[k]?.trim() || null]),
+      ),
     };
     await this.settings.update(data, actor.email);
     // Only what changed, with its old value, so the admin log reads as a diff.

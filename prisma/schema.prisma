@@ -846,7 +846,10 @@ model SubscriptionPayment {
   amount            Decimal                   @db.Decimal(12, 2)
   currency          String
   method            SubscriptionPaymentMethod
-  reference         String? // receipt number, bank reference
+  reference         String? // the payer's receipt or bank reference
+  /// Our receipt number, printed as SUB-000042. Sequential across the whole
+  /// platform, in the order payments were recorded.
+  receiptNo         Int                       @unique @default(autoincrement())
   periodFrom        DateTime
   periodTo          DateTime
   note              String?
@@ -982,6 +985,13 @@ model PlatformSettings {
   /// Shop activity-log (AuditLog) entries older than this are deleted daily.
   /// Null keeps them forever.
   auditRetentionDays Int?
+  /// Who a subscription receipt says was paid: the platform's own trading
+  /// name, PAN/VAT number and contact details. Blank lines are left off.
+  billingName        String?
+  billingTaxId       String?
+  billingAddress     String?
+  billingPhone       String?
+  billingEmail       String?
   updatedAt          DateTime @updatedAt
   updatedBy          String? // admin email snapshot
 }

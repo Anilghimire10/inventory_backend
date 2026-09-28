@@ -12,6 +12,7 @@ export type EmailType =
   | 'low-stock'
   | 'invite'
   | 'subscription-reminder'
+  | 'subscription-receipt'
   | 'announcement'
   | 'support-reply'
   | 'support-new';
@@ -23,6 +24,20 @@ interface SendArgs {
   type: EmailType;
   /** Whose email it is. Omitted, it is looked up from the recipient's account. */
   businessId?: string;
+}
+
+/** Everything a subscription receipt shows -- see PlatformBillingService.receipt. */
+export interface SubscriptionReceipt {
+  receiptNo: string;
+  issuedAt: Date;
+  seller: { name: string | null; taxId: string | null; address: string | null; phone: string | null; email: string | null };
+  buyer: { businessId: string; name: string; taxId: string | null };
+  amount: number;
+  currency: string;
+  methodLabel: string;
+  reference: string | null;
+  periodFrom: Date;
+  periodTo: Date;
 }
 
 /** Escape user-supplied text before it goes into an email's HTML. */
@@ -352,6 +367,38 @@ export class MailService {
         <p style="margin:16px 0 0;color:#475569">${
           contact ? `To renew, contact us: <strong>${contact}</strong>` : 'Contact us to renew.'
         }</p>
+      </div>`,
+    });
+  }
+
+  /** A receipt for a subscription payment the platform recorded. */
+  sendSubscriptionReceipt(to: string, name: string, r: SubscriptionReceipt) {
+    const day = (d: Date) => d.toISOString().slice(0, 10);
+    const seller = [r.seller.name, r.seller.taxId && `PAN/VAT ${r.seller.taxId}`, r.seller.address, r.seller.phone, r.seller.email]
+      .filter(Boolean)
+      .map((l) => esc(l as string))
+      .join('<br/>');
+    const row = (label: string, value: string) =>
+      `<tr><td style="padding:6px 0;color:#475569">${label}</td><td style="padding:6px 0;text-align:right">${value}</td></tr>`;
+    return this.send({
+      type: 'subscription-receipt',
+      to,
+      businessId: r.buyer.businessId,
+      subject: `Receipt ${r.receiptNo} for ${r.buyer.name}`,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 4px">Payment receipt</h2>
+        <p style="margin:0 0 16px;color:#475569">${esc(r.receiptNo)} · ${day(r.issuedAt)}</p>
+        ${seller ? `<p style="margin:0 0 16px;color:#475569;font-size:13px">${seller}</p>` : ''}
+        <p style="margin:0 0 12px">Hi ${esc(name)}, thank you -- we received your payment for <strong>${esc(r.buyer.name)}</strong>${
+          r.buyer.taxId ? ` (PAN/VAT ${esc(r.buyer.taxId)})` : ''
+        }.</p>
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+          ${row('Subscription period', `${day(r.periodFrom)} to ${day(r.periodTo)}`)}
+          ${row('Paid by', esc(r.methodLabel))}
+          ${r.reference ? row('Your reference', esc(r.reference)) : ''}
+          <tr><td style="padding:10px 0 0;border-top:1px solid #e2e8f0;font-weight:700">Amount paid</td><td style="padding:10px 0 0;border-top:1px solid #e2e8f0;text-align:right;font-weight:700">${esc(r.currency)} ${r.amount.toFixed(2)}</td></tr>
+        </table>
       </div>`,
     });
   }
