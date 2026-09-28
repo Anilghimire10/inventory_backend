@@ -2735,6 +2735,54 @@ async function announcementsScheduleAndTarget() {
   );
 }
 
+/**
+ * Support assignment: a deactivated admin can't be handed a ticket, and the
+ * first admin to reply to an unassigned ticket takes it.
+ */
+async function supportTicketsGetAnOwner() {
+  let assignedTo: string | null | undefined;
+  let ticket: any = {
+    id: 't1', businessId: 'b1', subject: 'Help', userEmail: 'o@x.com', userName: 'O',
+    status: 'OPEN', assignedAdmin: null, messages: [],
+  };
+  const db: any = {
+    supportTicket: {
+      findUnique: async () => ticket,
+      update: async ({ data }: any) => {
+        if ('assignedAdminId' in data) {
+          assignedTo = data.assignedAdminId;
+          ticket = { ...ticket, assignedAdmin: data.assignedAdminId ? { id: data.assignedAdminId, name: 'A' } : null };
+        }
+        return ticket;
+      },
+    },
+    supportMessage: { create: async () => ({}) },
+    notification: { create: async () => ({}) },
+    platformAdmin: {
+      findUnique: async () => ({ name: 'Anil' }),
+      findFirst: async (args: any) => (args.where.id === 'active' ? { id: 'active', email: 'a@x.com' } : null),
+    },
+  };
+  db.$transaction = async (ops: unknown[]) => Promise.all(ops);
+  const service = new SupportService(
+    stub<PrismaService>(db),
+    stub<MailService>({ sendSupportReply: async () => {} }),
+    stub<PlatformAuditService>({ record: async () => {} }),
+  );
+  const me = { adminId: 'me', email: 'me@x.com' };
+
+  await assert.rejects(service.assign(me, 't1', 'retired'), /does not exist or is deactivated/);
+  await service.replyFromAdmin(me, 't1', 'On it');
+  assert.strictEqual(assignedTo, 'me', 'answering an unassigned ticket takes it');
+
+  assignedTo = undefined;
+  await service.replyFromAdmin({ adminId: 'other', email: 'o@x.com' }, 't1', 'Also me');
+  assert.strictEqual(assignedTo, undefined, "a second admin replying doesn't steal it");
+
+  await service.assign(me, 't1', null);
+  assert.strictEqual(assignedTo, null, 'unassign');
+}
+
 /** A restarted server or a second run the same day must not email twice. */
 async function reminderGoesOutOncePerThreshold() {
   const keys = new Set<string>();
@@ -3416,6 +3464,7 @@ async function main() {
   await renewalsAndReceipts();
   await onboardingFlagsTheStuckShops();
   await announcementsScheduleAndTarget();
+  await supportTicketsGetAnOwner();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();

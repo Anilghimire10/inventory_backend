@@ -149,6 +149,7 @@ model PlatformAdmin {
   auditLogs        PlatformAuditLog[]
   businessNotes    BusinessNote[]
   supportMessages  SupportMessage[]
+  assignedTickets  SupportTicket[]
 }
 
 model Business {
@@ -968,25 +969,40 @@ enum SupportTicketStatus {
 
 /// A question or feedback from a shop, answered from the admin panel.
 model SupportTicket {
-  id            String              @id @default(cuid())
-  businessId    String
-  business      Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  id              String              @id @default(cuid())
+  businessId      String
+  business        Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
   /// Who raised it. SET NULL with a snapshot, so the ticket outlives the user.
-  userId        String?
-  user          User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
-  userName      String
-  userEmail     String
-  subject       String
-  status        SupportTicketStatus @default(OPEN)
+  userId          String?
+  user            User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userName        String
+  userEmail       String
+  subject         String
+  status          SupportTicketStatus @default(OPEN)
   /// Bumped by every message, so both inboxes sort by the latest activity.
-  lastMessageAt DateTime            @default(now())
-  createdAt     DateTime            @default(now())
-  updatedAt     DateTime            @updatedAt
+  lastMessageAt   DateTime            @default(now())
+  /// Which admin is handling it. Internal: shops never see this.
+  assignedAdminId String?
+  assignedAdmin   PlatformAdmin?      @relation(fields: [assignedAdminId], references: [id], onDelete: SetNull)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
 
   messages SupportMessage[]
 
   @@index([status, lastMessageAt])
   @@index([businessId, lastMessageAt])
+  @@index([assignedAdminId, status])
+}
+
+/// A canned answer for the support inbox. {name} and {business} are filled
+/// in with the ticket's person and shop when it's used.
+model SupportReplyTemplate {
+  id             String   @id @default(cuid())
+  title          String
+  body           String
+  createdByEmail String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 }
 
 /// One message in a ticket's thread, from the shop or from an admin.

@@ -1,11 +1,11 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { NotificationType, Prisma, SupportTicketStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { paginate } from '../common/dto/pagination.dto';
 import { AuthUser } from '../common/types/auth-user';
 import { Actor, PlatformAuditService } from '../platform/platform-audit.service';
-import { CreateTicketDto, QueryTicketsDto } from './dto/support.dto';
+import { AdminQueryTicketsDto, CreateTicketDto, QueryTicketsDto, ReplyTemplateDto } from './dto/support.dto';
 
 /** What a ticket list row carries: enough for an inbox, not the thread. */
 const LIST_SELECT = {
@@ -35,6 +35,12 @@ const THREAD_SELECT = {
 } satisfies Prisma.SupportTicketSelect;
 
 type ListRow = Prisma.SupportTicketGetPayload<{ select: typeof LIST_SELECT }>;
+
+/** What only the admin side sees: the shop, and which admin has the ticket. */
+const ADMIN_EXTRA = {
+  business: { select: { id: true, name: true } },
+  assignedAdmin: { select: { id: true, name: true } },
+} satisfies Prisma.SupportTicketSelect;
 
 /** Flatten the latest-message include into the fields an inbox shows. */
 function toListItem({ messages, _count, ...t }: ListRow) {
@@ -152,9 +158,12 @@ export class SupportService {
 
   // ---- Admin side ----
 
-  async listForAdmin(q: QueryTicketsDto) {
+  async listForAdmin(q: AdminQueryTicketsDto, actor: Actor) {
+    const assigned =
+      q.assigned === 'me' ? actor.adminId : q.assigned === 'none' ? null : q.assigned;
     const where: Prisma.SupportTicketWhereInput = {
       ...(q.status ? { status: q.status } : {}),
+      ...(q.assigned !== undefined ? { assignedAdminId: assigned } : {}),
       ...(q.search
         ? {
             OR: [
@@ -171,14 +180,14 @@ export class SupportService {
         orderBy: { lastMessageAt: 'desc' },
         skip: q.skip,
         take: q.limit,
-        select: { ...LIST_SELECT, business: { select: { id: true, name: true } } },
+        select: { ...LIST_SELECT, ...ADMIN_EXTRA },
       }),
       this.prisma.supportTicket.count({ where }),
       this.prisma.supportTicket.count({ where: { status: SupportTicketStatus.OPEN } }),
     ]);
     return {
       ...paginate(
-        rows.map(({ business, ...r }) => ({ ...toListItem(r), business })),
+        rows.map(({ business, assignedAdmin, ...r }) => ({ ...toListItem(r), business, assignedAdmin })),
         total,
         q.page,
         q.limit,
@@ -190,7 +199,7 @@ export class SupportService {
   async getForAdmin(id: string) {
     const ticket = await this.prisma.supportTicket.findUnique({
       where: { id },
-      select: { ...THREAD_SELECT, business: { select: { id: true, name: true } } },
+      select: { ...THREAD_SELECT, ...ADMIN_EXTRA },
     });
     if (!ticket) throw new NotFoundException('Ticket not found');
     return ticket;
@@ -219,7 +228,12 @@ export class SupportService {
           body: text,
         },
       }),
-      this.prisma.supportTicket.update({ where: { id }, data: { lastMessageAt: now } }),
+      // Whoever answers an unassigned ticket takes it, so the inbox always
+      // says whose it is once someone has picked it up.
+      this.prisma.supportTicket.update({
+        where: { id },
+        data: { lastMessageAt: now, ...(ticket.assignedAdmin ? {} : { assignedAdminId: actor.adminId }) },
+      }),
       this.prisma.notification.create({
         data: {
           businessId: ticket.businessId,
@@ -249,5 +263,53 @@ export class SupportService {
       });
     }
     return this.getForAdmin(id);
+  }
+
+  /** Hand a ticket to an admin (active ones only), or take it off them. */
+  async assign(actor: Actor, id: string, adminId: string | null) {
+    const ticket = await this.getForAdmin(id);
+    let to: { id: string; email: string } | null = null;
+    if (adminId) {
+      to = await this.prisma.platformAdmin.findFirst({
+        where: { id: adminId, isActive: true },
+        select: { id: true, email: true },
+      });
+      if (!to) throw new BadRequestException('That admin does not exist or is deactivated');
+    }
+    if ((ticket.assignedAdmin?.id ?? null) !== (to?.id ?? null)) {
+      await this.prisma.supportTicket.update({ where: { id }, data: { assignedAdminId: to?.id ?? null } });
+      await this.audit.record(actor, 'support.assign', {
+        businessId: ticket.businessId,
+        details: { ticketId: id, subject: ticket.subject, to: to?.email ?? null },
+      });
+    }
+    return this.getForAdmin(id);
+  }
+
+  // ---- Saved replies ----
+
+  listTemplates() {
+    return this.prisma.supportReplyTemplate.findMany({ orderBy: { title: 'asc' } });
+  }
+
+  createTemplate(actor: Actor, dto: ReplyTemplateDto) {
+    return this.prisma.supportReplyTemplate.create({
+      data: { title: dto.title.trim(), body: dto.body.trim(), createdByEmail: actor.email },
+    });
+  }
+
+  async updateTemplate(id: string, dto: ReplyTemplateDto) {
+    const res = await this.prisma.supportReplyTemplate.updateMany({
+      where: { id },
+      data: { title: dto.title.trim(), body: dto.body.trim() },
+    });
+    if (res.count === 0) throw new NotFoundException('Saved reply not found');
+    return this.prisma.supportReplyTemplate.findUnique({ where: { id } });
+  }
+
+  async deleteTemplate(id: string) {
+    const res = await this.prisma.supportReplyTemplate.deleteMany({ where: { id } });
+    if (res.count === 0) throw new NotFoundException('Saved reply not found');
+    return { ok: true };
   }
 }
