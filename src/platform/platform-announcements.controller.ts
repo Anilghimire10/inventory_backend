@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Public } from '../common/decorators/public.decorator';
 import { PlatformAuthGuard } from './platform-auth.guard';
@@ -24,5 +24,11 @@ export class PlatformAnnouncementsController {
   @Post()
   send(@CurrentActor() actor: Actor, @Body() dto: SendAnnouncementDto) {
     return this.announcements.send(actor, dto);
+  }
+
+  /** Stop a scheduled announcement before it goes out. */
+  @Post(':id/cancel')
+  cancel(@CurrentActor() actor: Actor, @Param('id') id: string) {
+    return this.announcements.cancel(actor, id);
   }
 }

@@ -775,16 +775,19 @@ model Payment {
 // (LOW_STOCK / EXPIRING) are reconciled from live inventory each fetch and
 // carry a dedupeKey; read/dismissed state is preserved across reconciliations.
 model Notification {
-  id         String           @id @default(cuid())
-  businessId String
-  business   Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  type       NotificationType @default(GENERAL)
-  title      String
-  body       String?
-  link       String?
-  dedupeKey  String? // stable identity for auto alerts; null for one-off notices
-  createdAt  DateTime         @default(now())
-  updatedAt  DateTime         @updatedAt
+  id             String           @id @default(cuid())
+  businessId     String
+  business       Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type           NotificationType @default(GENERAL)
+  title          String
+  body           String?
+  link           String?
+  dedupeKey      String? // stable identity for auto alerts; null for one-off notices
+  /// The platform announcement this came from, for its "seen by" count.
+  announcementId String?
+  announcement   Announcement?    @relation(fields: [announcementId], references: [id], onDelete: SetNull)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
 
   /// Who has read or dismissed it. Per person, not per shop: a notice goes to
   /// the whole business, but a cashier opening the bell must not mark it read
@@ -793,6 +796,37 @@ model Notification {
 
   @@unique([businessId, dedupeKey])
   @@index([businessId])
+  @@index([announcementId])
+}
+
+/// A message from the platform to shops' notification bells, sent now or
+/// at `scheduledFor`. Who it reached is fixed when it goes out: the audience
+/// is resolved at send time, so a scheduled "all trial shops" includes
+/// shops that started a trial after it was written.
+model Announcement {
+  id             String         @id @default(cuid())
+  title          String
+  body           String
+  /// all | selected | trial | active | expiring | expired
+  audience       String
+  /// For audience = selected.
+  businessIds    String[]
+  email          Boolean        @default(false)
+  createdByEmail String
+  createdAt      DateTime       @default(now())
+  /// Null: sent as soon as it was written.
+  scheduledFor   DateTime?
+  /// When it went out. Set first as a claim, so two servers can't both send it.
+  sentAt         DateTime?
+  cancelledAt    DateTime?
+  /// Filled in once sent.
+  businesses     Int?
+  emailed        Int?
+  failed         Int?
+  notifications  Notification[]
+
+  @@index([scheduledFor, sentAt])
+  @@index([createdAt])
 }
 
 /// One user's state for one notification. No row means unread and showing.

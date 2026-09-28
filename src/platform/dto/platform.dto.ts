@@ -454,6 +454,19 @@ export class SendAnnouncementDto {
   @IsOptional()
   @IsBoolean()
   email?: boolean;
+
+  @ApiPropertyOptional({
+    enum: ['all', 'trial', 'active', 'expiring', 'expired'],
+    description: 'Who gets it, by subscription status. Ignored when businessIds is given.',
+  })
+  @IsOptional()
+  @IsIn(['all', 'trial', 'active', 'expiring', 'expired'])
+  audience?: 'all' | 'trial' | 'active' | 'expiring' | 'expired';
+
+  @ApiPropertyOptional({ description: 'Send it later, up to 90 days ahead. Omitted or past: now.' })
+  @IsOptional()
+  @IsDateString()
+  scheduledFor?: string;
 }
 
 /** Admin panel → Settings. A field left out is unchanged; null clears it. */

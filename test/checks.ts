@@ -14,6 +14,7 @@ import { ShiftsService } from '../src/shifts/shifts.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
 import { PlatformBillingService, formatReceiptNo } from '../src/platform/platform-billing.service';
 import { PlatformService } from '../src/platform/platform.service';
+import { PlatformAnnouncementsService, audienceWhere } from '../src/platform/platform-announcements.service';
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
 import { PaymentsService } from '../src/payments/payments.service';
@@ -2666,6 +2667,74 @@ async function onboardingFlagsTheStuckShops() {
   assert.ok(by.get('busy')!.firstSaleAt, 'first sale date comes through');
 }
 
+/**
+ * Announcements: every audience keeps suspended shops out, a time a minute
+ * or less away (or in the past) means "now", a scheduled one reaches nobody
+ * until the job sends it, and the job never sends one twice.
+ */
+async function announcementsScheduleAndTarget() {
+  const now = new Date();
+  for (const audience of ['all', 'trial', 'active', 'expiring', 'expired', 'selected']) {
+    const w = JSON.stringify(audienceWhere({ audience, businessIds: ['b1'] }, now));
+    assert.ok(w.includes('"isSuspended":false'), `${audience}: suspended shops are never reached`);
+  }
+  assert.ok(JSON.stringify(audienceWhere({ audience: 'selected', businessIds: ['b1'] }, now)).includes('"in":["b1"]'));
+  assert.throws(() => audienceWhere({ audience: 'everyone', businessIds: [] }, now), /Unknown audience/);
+
+  const made: any[] = [];
+  const notes: any[] = [];
+  let claims = 0;
+  const db: any = {
+    announcement: {
+      create: async ({ data }: any) => {
+        const a = { id: `a${made.length + 1}`, ...data, createdAt: new Date(), cancelledAt: null };
+        made.push(a);
+        return a;
+      },
+      update: async () => ({}),
+      findMany: async () => made.filter((a) => a.scheduledFor && !a.sentAt),
+      updateMany: async ({ where }: any) => {
+        const a = made.find((x) => x.id === where.id);
+        if (!a || a.sentAt) return { count: 0 };
+        a.sentAt = new Date();
+        claims++;
+        return { count: 1 };
+      },
+    },
+    business: {
+      findMany: async () => [{ id: 'b1', name: 'Shop' }],
+      count: async () => 1,
+    },
+    notification: { createMany: async ({ data }: any) => notes.push(...data) },
+  };
+  const service = new PlatformAnnouncementsService(
+    stub<PrismaService>(db),
+    stub<MailService>({}),
+    stub<PlatformAuditService>({ record: async () => {} }),
+  );
+  const admin = { adminId: 'x', email: 'x@y.com' };
+
+  const past = await service.send(admin, { title: 'Hi there', body: 'b', scheduledFor: new Date(Date.now() - 5000).toISOString() });
+  assert.strictEqual(past.scheduled, false, 'a time already gone means now');
+  assert.strictEqual(notes.length, 1, 'and it went out');
+  assert.strictEqual(notes[0].announcementId, 'a1', 'linked for its "seen by" count');
+
+  const later = await service.send(admin, { title: 'Later on', body: 'b', audience: 'trial', scheduledFor: new Date(Date.now() + 3600_000).toISOString() });
+  assert.strictEqual(later.scheduled, true);
+  assert.strictEqual(notes.length, 1, 'scheduled: nobody reached yet');
+
+  made[1].scheduledFor = new Date(Date.now() - 1000); // it's due now
+  await service.runDue();
+  await service.runDue(); // a second run (or a second server) finds nothing left to send
+  assert.strictEqual(notes.length, 2, 'the job sent it exactly once');
+  assert.strictEqual(claims, 1, 'claimed once');
+
+  await assert.rejects(
+    service.send(admin, { title: 'Too far', body: 'b', scheduledFor: new Date(Date.now() + 91 * 86400_000).toISOString() }),
+    /within 90 days/,
+  );
+}
+
 /** A restarted server or a second run the same day must not email twice. */
 async function reminderGoesOutOncePerThreshold() {
   const keys = new Set<string>();
@@ -3346,6 +3415,7 @@ async function main() {
   await aNotificationIsReadPerPerson();
   await renewalsAndReceipts();
   await onboardingFlagsTheStuckShops();
+  await announcementsScheduleAndTarget();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();
