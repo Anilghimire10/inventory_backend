@@ -13,6 +13,7 @@ import { PaymentMethod, PlatformRole, Prisma, SaleStatus, UserRole } from '@pris
 import { ShiftsService } from '../src/shifts/shifts.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
 import { PlatformBillingService, formatReceiptNo } from '../src/platform/platform-billing.service';
+import { PlatformService } from '../src/platform/platform.service';
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
 import { PaymentsService } from '../src/payments/payments.service';
@@ -2626,6 +2627,45 @@ async function renewalsAndReceipts() {
   assert.strictEqual(audits.length, 2, 'one admin-log entry per shop, so each business page shows it');
 }
 
+/**
+ * Onboarding: each setup step is read from the right count, and "stuck"
+ * means old enough to have sold by now but hasn't -- a shop that signed up
+ * today isn't stuck yet.
+ */
+async function onboardingFlagsTheStuckShops() {
+  const day = 24 * 60 * 60 * 1000;
+  const shop = (id: string, ageDays: number, c: Record<string, number>) => ({
+    id, name: id, type: 'GROCERY', createdAt: new Date(Date.now() - ageDays * day),
+    isSubscribed: true, subscribedTo: new Date(Date.now() + 5 * day),
+    _count: { products: 0, users: 1, sales: 0, shifts: 0, subscriptionPayments: 0, ...c },
+    users: [{ name: 'Owner', email: `${id}@x.com` }], stores: [],
+  });
+  const service = new PlatformService(
+    stub<PrismaService>({
+      business: {
+        findMany: async () => [
+          shop('quiet', 5, { products: 12 }),
+          shop('new', 0, {}),
+          shop('busy', 10, { products: 40, users: 3, sales: 90, shifts: 4, subscriptionPayments: 2 }),
+        ],
+      },
+      sale: { groupBy: async () => [{ businessId: 'busy', _min: { createdAt: new Date('2026-09-01') } }] },
+      $queryRaw: async () => [],
+    }),
+    stub<MailService>({}), stub<PlatformAuditService>({}), stub<SubscriptionRemindersService>({}),
+    stub<PlatformBillingService>({}), stub<BusinessService>({}), stub<AuthService>({}), stub<SettingsService>({}),
+  );
+  const rows = await service.onboarding({ scope: 'all' });
+  const by = new Map(rows.map((r) => [r.id, r]));
+  assert.deepStrictEqual(by.get('quiet')!.steps, { products: true, firstSale: false, staff: false, shiftClosed: false, paid: false });
+  assert.strictEqual(by.get('quiet')!.stuck, true, '5 days, products in, still no sale: stuck');
+  assert.strictEqual(by.get('new')!.stuck, false, 'signed up today: not stuck yet');
+  assert.strictEqual(by.get('busy')!.done, 5, 'every step done');
+  assert.strictEqual(by.get('busy')!.stuck, false);
+  assert.strictEqual(by.get('busy')!.trialEndsAt, null, 'a paying shop has no trial end');
+  assert.ok(by.get('busy')!.firstSaleAt, 'first sale date comes through');
+}
+
 /** A restarted server or a second run the same day must not email twice. */
 async function reminderGoesOutOncePerThreshold() {
   const keys = new Set<string>();
@@ -3305,6 +3345,7 @@ async function main() {
   await reminderGoesOutOncePerThreshold();
   await aNotificationIsReadPerPerson();
   await renewalsAndReceipts();
+  await onboardingFlagsTheStuckShops();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();

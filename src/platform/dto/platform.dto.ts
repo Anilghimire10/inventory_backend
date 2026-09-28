@@ -544,3 +544,16 @@ export class RemindBusinessesDto {
   @MaxLength(64, { each: true })
   businessIds: string[];
 }
+
+// ---- Onboarding ----
+
+export class QueryOnboardingDto {
+  @ApiPropertyOptional({
+    enum: ['trial', 'recent', 'all'],
+    default: 'trial',
+    description: 'trial: shops still on their free trial; recent: signed up in the last 30 days; all: every shop',
+  })
+  @IsOptional()
+  @IsIn(['trial', 'recent', 'all'])
+  scope: 'trial' | 'recent' | 'all' = 'trial';
+}

@@ -33,6 +33,7 @@ import {
   CreateBusinessNoteDto,
   DeleteBusinessDto,
   QueryBusinessesDto,
+  QueryOnboardingDto,
   RecordPaymentDto,
   SubscriptionFilter,
   SuspendDto,
@@ -530,6 +531,93 @@ export class PlatformService {
       details: { daysLeft, emailed: res.emailed, failed: res.failed },
     });
     return { daysLeft, emailed: res.emailed, failed: res.failed };
+  }
+
+  /**
+   * How far each shop has got with setting up: products added, a first sale,
+   * staff invited, a shift counted and closed, and paying. "Stuck" is a shop
+   * that signed up at least 3 days ago and still hasn't sold anything --
+   * the ones to call before their trial runs out. At most 300 shops, newest
+   * first; the page sorts and filters the rest.
+   */
+  async onboarding(q: QueryOnboardingDto) {
+    const now = new Date();
+    const where: Prisma.BusinessWhereInput = {
+      isSuspended: false,
+      ...(q.scope === 'trial' ? subscriptionWhere('trial', now, 7) : {}),
+      ...(q.scope === 'recent' ? { createdAt: { gte: new Date(now.getTime() - 30 * DAY_MS) } } : {}),
+    };
+    const rows = await this.prisma.business.findMany({
+      where,
+      orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
+      take: 300,
+      select: {
+        id: true,
+        name: true,
+        type: true,
+        createdAt: true,
+        isSubscribed: true,
+        subscribedTo: true,
+        _count: {
+          select: {
+            products: { where: { isActive: true } },
+            users: { where: { isActive: true } },
+            sales: { where: { status: { not: SaleStatus.HELD } } },
+            shifts: { where: { closedAt: { not: null } } },
+            subscriptionPayments: true,
+          },
+        },
+        users: {
+          where: { role: UserRole.OWNER, isActive: true },
+          select: { name: true, email: true },
+          take: 1,
+        },
+        stores: { where: { phone: { not: null } }, select: { phone: true }, take: 1 },
+      },
+    });
+    if (rows.length === 0) return [];
+    const ids = rows.map((b) => b.id);
+    const [firstSales, lastActive] = await Promise.all([
+      this.prisma.sale.groupBy({
+        by: ['businessId'],
+        where: { businessId: { in: ids }, status: { not: SaleStatus.HELD } },
+        _min: { createdAt: true },
+      }),
+      this.lastActive(ids),
+    ]);
+    const firstSaleAt = new Map(firstSales.map((f) => [f.businessId, f._min.createdAt]));
+
+    return rows.map((b) => {
+      const steps = {
+        products: b._count.products > 0,
+        firstSale: b._count.sales > 0,
+        staff: b._count.users > 1,
+        shiftClosed: b._count.shifts > 0,
+        paid: b._count.subscriptionPayments > 0,
+      };
+      const ageDays = Math.floor((now.getTime() - b.createdAt.getTime()) / DAY_MS);
+      return {
+        id: b.id,
+        name: b.name,
+        type: b.type,
+        createdAt: b.createdAt,
+        ageDays,
+        trialEndsAt: b._count.subscriptionPayments === 0 ? b.subscribedTo : null,
+        subscriptionStatus: subscriptionStatus(b, b._count.subscriptionPayments, now),
+        steps,
+        done: Object.values(steps).filter(Boolean).length,
+        counts: {
+          products: b._count.products,
+          sales: b._count.sales,
+          staff: b._count.users,
+        },
+        firstSaleAt: firstSaleAt.get(b.id) ?? null,
+        lastActiveAt: lastActive.get(b.id) ?? null,
+        stuck: !steps.firstSale && ageDays >= 3,
+        owner: b.users[0] ?? null,
+        phone: b.stores[0]?.phone ?? null,
+      };
+    });
   }
 
   // ---- Per-business drill-downs (super-admin) ----

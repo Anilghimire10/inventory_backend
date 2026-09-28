@@ -22,6 +22,7 @@ import {
   CreateBusinessNoteDto,
   DeleteBusinessDto,
   QueryBusinessesDto,
+  QueryOnboardingDto,
   RecordPaymentDto,
   SetSubscriptionDto,
   SuspendDto,
@@ -126,6 +127,12 @@ export class PlatformController {
     @Body() dto: SetSubscriptionDto,
   ) {
     return this.platform.setSubscription(actor, id, dto.isSubscribed, dto.subscribedTo ?? null);
+  }
+
+  /** Setup progress per shop, and the ones stuck before their first sale. */
+  @Get('onboarding')
+  onboarding(@Query() q: QueryOnboardingDto) {
+    return this.platform.onboarding(q);
   }
 
   @Get('businesses/:id/payments')
