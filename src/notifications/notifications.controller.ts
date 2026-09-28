@@ -30,21 +30,21 @@ export class NotificationsController {
 
   @Get()
   list(@CurrentUser() u: AuthUser) {
-    return this.notifications.list(u.businessId);
+    return this.notifications.list(u.businessId, u.userId);
   }
 
   @Post('read-all')
   markAllRead(@CurrentUser() u: AuthUser) {
-    return this.notifications.markAllRead(u.businessId);
+    return this.notifications.markAllRead(u.businessId, u.userId);
   }
 
   @Post(':id/read')
   markRead(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.notifications.markRead(u.businessId, id);
+    return this.notifications.markRead(u.businessId, u.userId, id);
   }
 
   @Delete(':id')
   dismiss(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.notifications.dismiss(u.businessId, id);
+    return this.notifications.dismiss(u.businessId, u.userId, id);
   }
 }

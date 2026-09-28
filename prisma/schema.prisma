@@ -250,14 +250,15 @@ model User {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  sales          Sale[]
-  stockMovements StockMovement[]
-  emailTokens    EmailToken[]
-  auditLogs      AuditLog[]
-  supportTickets SupportTicket[]
-  payments       Payment[]
-  shifts         Shift[]
-  cashMovements  CashMovement[]
+  sales                Sale[]
+  stockMovements       StockMovement[]
+  emailTokens          EmailToken[]
+  auditLogs            AuditLog[]
+  supportTickets       SupportTicket[]
+  payments             Payment[]
+  shifts               Shift[]
+  cashMovements        CashMovement[]
+  notificationReceipts NotificationReceipt[]
 
   @@index([businessId])
 }
@@ -774,21 +775,38 @@ model Payment {
 // (LOW_STOCK / EXPIRING) are reconciled from live inventory each fetch and
 // carry a dedupeKey; read/dismissed state is preserved across reconciliations.
 model Notification {
-  id          String           @id @default(cuid())
-  businessId  String
-  business    Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  type        NotificationType @default(GENERAL)
-  title       String
-  body        String?
-  link        String?
-  dedupeKey   String? // stable identity for auto alerts; null for one-off notices
-  readAt      DateTime?
-  dismissedAt DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
+  id         String           @id @default(cuid())
+  businessId String
+  business   Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type       NotificationType @default(GENERAL)
+  title      String
+  body       String?
+  link       String?
+  dedupeKey  String? // stable identity for auto alerts; null for one-off notices
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  /// Who has read or dismissed it. Per person, not per shop: a notice goes to
+  /// the whole business, but a cashier opening the bell must not mark it read
+  /// for the owner, nor dismiss it for everyone.
+  receipts NotificationReceipt[]
 
   @@unique([businessId, dedupeKey])
   @@index([businessId])
+}
+
+/// One user's state for one notification. No row means unread and showing.
+model NotificationReceipt {
+  id             String       @id @default(cuid())
+  notificationId String
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  readAt         DateTime?
+  dismissedAt    DateTime?
+
+  @@unique([notificationId, userId])
+  @@index([userId])
 }
 
 // ---------- Audit / activity log ----------

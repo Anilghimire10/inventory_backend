@@ -21,8 +21,12 @@ export class NotificationsService {
   ) {}
 
   /**
-   * List active (non-dismissed) notifications, newest first, plus the unread
-   * count.
+   * The caller's notifications -- everything sent to their business that they
+   * haven't dismissed -- newest first, with *their* read state and unread count.
+   *
+   * Read and dismissed are per person (`NotificationReceipt`). They used to sit
+   * on the shared row, so a cashier opening the bell marked every announcement
+   * read for the owner, and a cashier dismissing one hid it from everybody.
    *
    * This is a **pure read**. It used to call `sync()` first, which made the
    * single most expensive endpoint in the system out of a bell that every
@@ -34,48 +38,89 @@ export class NotificationsService {
    * Reconciliation now runs on a timer instead (`AlertSyncCron`), so the cost
    * is per business every 10 minutes rather than per user every minute.
    */
-  async list(businessId: string) {
-    const items = await this.prisma.notification.findMany({
-      where: { businessId, dismissedAt: null },
+  async list(businessId: string, userId: string) {
+    const rows = await this.prisma.notification.findMany({
+      where: {
+        businessId,
+        receipts: { none: { userId, dismissedAt: { not: null } } },
+      },
       orderBy: { createdAt: 'desc' },
       take: 100,
+      include: { receipts: { where: { userId }, select: { readAt: true } } },
     });
+    const items = rows.map(({ receipts, ...n }) => ({
+      ...n,
+      readAt: receipts[0]?.readAt ?? null,
+    }));
     const unreadCount = items.filter((n) => !n.readAt).length;
     return { items, unreadCount };
   }
 
-  async markRead(businessId: string, id: string) {
-    await this.prisma.notification.updateMany({
-      where: { id, businessId, readAt: null },
-      data: { readAt: new Date() },
+  async markRead(businessId: string, userId: string, id: string) {
+    const own = await this.prisma.notification.findFirst({
+      where: { id, businessId },
+      select: { id: true },
     });
+    if (own) await this.stamp(userId, [own.id], 'readAt');
     return { ok: true };
   }
 
-  async markAllRead(businessId: string) {
-    await this.prisma.notification.updateMany({
-      where: { businessId, readAt: null, dismissedAt: null },
-      data: { readAt: new Date() },
+  async markAllRead(businessId: string, userId: string) {
+    const unread = await this.prisma.notification.findMany({
+      where: {
+        businessId,
+        receipts: {
+          none: {
+            userId,
+            OR: [{ readAt: { not: null } }, { dismissedAt: { not: null } }],
+          },
+        },
+      },
+      select: { id: true },
     });
+    await this.stamp(userId, unread.map((n) => n.id), 'readAt');
     return { ok: true };
   }
 
   /**
-   * Dismiss (delete) a notification. We soft-dismiss so a still-active auto
-   * alert won't immediately reappear on the next reconciliation.
+   * Dismiss a notification -- for the caller only. Soft, so a still-active
+   * auto alert won't reappear for them on the next reconciliation.
    */
-  async dismiss(businessId: string, id: string) {
-    await this.prisma.notification.updateMany({
-      where: { id, businessId, dismissedAt: null },
-      data: { dismissedAt: new Date() },
+  async dismiss(businessId: string, userId: string, id: string) {
+    const own = await this.prisma.notification.findFirst({
+      where: { id, businessId },
+      select: { id: true },
     });
+    if (own) await this.stamp(userId, [own.id], 'dismissedAt');
     return { ok: true };
+  }
+
+  /**
+   * Set `field` on this user's receipts for these notifications, keeping the
+   * first time it was set. Creates the receipts that don't exist yet and fills
+   * the field on those that do; together in one transaction, so a double
+   * click can't produce two rows (the unique key) or move the timestamp.
+   */
+  private async stamp(userId: string, ids: string[], field: 'readAt' | 'dismissedAt') {
+    if (!ids.length) return;
+    const now = new Date();
+    await this.prisma.$transaction([
+      this.prisma.notificationReceipt.createMany({
+        data: ids.map((notificationId) => ({ notificationId, userId, [field]: now })),
+        skipDuplicates: true,
+      }),
+      this.prisma.notificationReceipt.updateMany({
+        where: { userId, notificationId: { in: ids }, [field]: null },
+        data: { [field]: now },
+      }),
+    ]);
   }
 
   /**
    * Reconcile auto alerts (low stock / expiring) against live inventory:
    *  - create rows for newly-triggered conditions (unread),
-   *  - refresh the text of conditions that still hold (preserving read/dismissed),
+   *  - refresh the text of conditions that still hold (receipts -- who has read
+   *    or dismissed it -- are left alone),
    *  - delete rows whose condition has resolved.
    * GENERAL notifications are never touched here.
    *
@@ -126,8 +171,8 @@ export class NotificationsService {
       },
     });
 
-    // Upsert current alerts. `update` deliberately leaves readAt/dismissedAt
-    // alone.
+    // Upsert current alerts. `update` only refreshes the text, so everyone's
+    // receipts (read / dismissed) survive it.
     //
     // Batched into one `$transaction` rather than awaited one at a time: this
     // was a sequential round trip per alert, so a business sitting on 40

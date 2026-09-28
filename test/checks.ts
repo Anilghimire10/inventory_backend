@@ -11,6 +11,7 @@ import { createHash } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
 import { PaymentMethod, PlatformRole, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
+import { NotificationsService } from '../src/notifications/notifications.service';
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
 import { PaymentsService } from '../src/payments/payments.service';
@@ -2517,6 +2518,49 @@ async function adminCannotLockOutThePanel() {
   );
 }
 
+/**
+ * Read and dismissed belong to the person, not the shop: a cashier opening
+ * the bell must not clear the owner's badge or hide a notice from them.
+ */
+async function aNotificationIsReadPerPerson() {
+  const writes: { userId: string; notificationId: string }[] = [];
+  const updates: any[] = [];
+  const db: any = {
+    notification: {
+      findMany: async (args: any) => {
+        // markAllRead asks only for what *this* user hasn't read or dismissed.
+        assert.strictEqual(args.where.receipts.none.userId, 'u2', 'the unread query is scoped to the caller');
+        return [{ id: 'n1' }, { id: 'n2' }];
+      },
+      findFirst: async (args: any) => (args.where.businessId === 'b1' ? { id: args.where.id } : null),
+    },
+    notificationReceipt: {
+      createMany: (args: any) => {
+        writes.push(...args.data);
+        return args;
+      },
+      updateMany: (args: any) => {
+        updates.push(args.where);
+        return args;
+      },
+    },
+  };
+  db.$transaction = async (ops: unknown[]) => ops;
+  const service = new NotificationsService(stub<PrismaService>(db), stub<InventoryService>({}));
+
+  await service.markAllRead('b1', 'u2');
+  assert.deepStrictEqual(
+    writes.map((w) => [w.notificationId, w.userId]),
+    [['n1', 'u2'], ['n2', 'u2']],
+    "receipts are written for the caller only -- nobody else's badge moves",
+  );
+  assert.strictEqual(updates[0].readAt, null, 'an existing read time is kept, not moved');
+
+  writes.length = 0;
+  await service.dismiss('other-shop', 'u2', 'n9');
+  assert.strictEqual(writes.length, 0, "another shop's notification can't be touched");
+}
+
 /** A restarted server or a second run the same day must not email twice. */
 async function reminderGoesOutOncePerThreshold() {
   const keys = new Set<string>();
@@ -3194,6 +3238,7 @@ async function main() {
   await viewAsOwnerIsReadOnly();
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
+  await aNotificationIsReadPerPerson();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();
