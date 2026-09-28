@@ -2,11 +2,14 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
 import { PrismaService } from '../prisma/prisma.service';
+import { MailService } from '../mail/mail.service';
 import { normalizeEmail } from '../common/email';
 import { Actor, PlatformAuditService } from './platform-audit.service';
 import { ChangePasswordDto, DisableTwoFactorDto } from './dto/platform.dto';
@@ -34,15 +37,27 @@ type TotpState = {
   totpLockedUntil: Date | null;
 };
 
+/** A session still counts while it hasn't been ended and its token hasn't expired. */
+const openSession = (now = new Date()) => ({ revokedAt: null, expiresAt: { gt: now } });
+
 @Injectable()
 export class PlatformAuthService {
+  private readonly logger = new Logger(PlatformAuthService.name);
+
   constructor(
     private prisma: PrismaService,
     private jwt: JwtService,
     private audit: PlatformAuditService,
+    private mail: MailService,
   ) {}
 
-  async login(rawEmail: string, password: string, ip: string | null, code?: string) {
+  async login(
+    rawEmail: string,
+    password: string,
+    ip: string | null,
+    code?: string,
+    userAgent?: string | null,
+  ) {
     const email = normalizeEmail(rawEmail);
     const admin = await this.prisma.platformAdmin.findUnique({
       where: { email },
@@ -89,8 +104,10 @@ export class PlatformAuthService {
     }
 
     await this.audit.record({ adminId: admin.id, email, ip }, 'admin.login');
+    await this.alertIfNewDevice(admin, ip, userAgent ?? null);
+    const accessToken = await this.openSession(admin.id, ip, userAgent ?? null);
     return {
-      accessToken: this.sign(admin.id),
+      accessToken,
       admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
     };
   }
@@ -116,7 +133,7 @@ export class PlatformAuthService {
       },
     });
     await this.audit.record(actor, 'admin.change-password');
-    return { message: 'Password changed.', accessToken: this.sign(admin.id) };
+    return { message: 'Password changed.', accessToken: await this.keepOnlyThisSession(actor) };
   }
 
   // ---- Two-factor (TOTP) ----
@@ -169,7 +186,7 @@ export class PlatformAuthService {
       data: { totpEnabledAt: new Date(), passwordChangedAt: new Date() },
     });
     await this.audit.record(actor, 'admin.2fa.enable');
-    return { enabled: true, accessToken: this.sign(admin.id) };
+    return { enabled: true, accessToken: await this.keepOnlyThisSession(actor) };
   }
 
   /** Turn it off yourself: needs the password and a current code. */
@@ -243,7 +260,142 @@ export class PlatformAuthService {
     return 'locked';
   }
 
-  private sign(adminId: string) {
-    return this.jwt.sign({ sub: adminId, scope: 'platform' });
+  // ---- Sessions ----
+
+  /**
+   * Start a session and sign its token. The session's expiry is read back
+   * from the token itself, so the two can never disagree about how long it
+   * lasts (PLATFORM_JWT_EXPIRES_IN).
+   */
+  private async openSession(adminId: string, ip: string | null, userAgent: string | null) {
+    const session = await this.prisma.adminSession.create({
+      data: { adminId, ip, userAgent: userAgent?.slice(0, 500) ?? null, expiresAt: new Date(Date.now() + 12 * 3600_000) },
+    });
+    const token = this.jwt.sign({ sub: adminId, scope: 'platform', sid: session.id });
+    const exp = this.jwt.decode<{ exp?: number } | null>(token)?.exp;
+    if (exp) {
+      await this.prisma.adminSession.update({ where: { id: session.id }, data: { expiresAt: new Date(exp * 1000) } });
+    }
+    return token;
+  }
+
+  /**
+   * After a password change or turning on two-factor, every other session
+   * ends -- the strategy's passwordChangedAt check already refuses their
+   * tokens, and closing the rows keeps the sessions list honest. This one
+   * carries on with a fresh token for the same session.
+   */
+  private async keepOnlyThisSession(actor: Actor) {
+    const adminId = actor.adminId!;
+    await this.prisma.adminSession.updateMany({
+      where: { adminId, revokedAt: null, ...(actor.sessionId ? { id: { not: actor.sessionId } } : {}) },
+      data: { revokedAt: new Date() },
+    });
+    if (actor.sessionId) {
+      const s = await this.prisma.adminSession.findUnique({ where: { id: actor.sessionId } });
+      if (s && !s.revokedAt) return this.jwt.sign({ sub: adminId, scope: 'platform', sid: s.id });
+    }
+    // A pre-session token: start a proper session for it now.
+    return this.openSession(adminId, actor.ip ?? null, null);
+  }
+
+  /**
+   * Email the admin when they sign in from a browser this account hasn't used
+   * before -- the one sign that someone else has the password. Not on an
+   * account's very first sign-in, and never blocking the sign-in if the email
+   * fails.
+   */
+  private async alertIfNewDevice(admin: { id: string; email: string; name: string }, ip: string | null, userAgent: string | null) {
+    if (!userAgent) return;
+    const [before, seen] = await Promise.all([
+      this.prisma.adminSession.count({ where: { adminId: admin.id } }),
+      this.prisma.adminSession.count({ where: { adminId: admin.id, userAgent: userAgent.slice(0, 500) } }),
+    ]);
+    if (before === 0 || seen > 0) return;
+    this.mail
+      .sendAdminNewSignIn(admin.email, admin.name, new Date(), ip, describeDevice(userAgent))
+      .catch((e: Error) => this.logger.warn(`New sign-in alert to ${admin.email} failed: ${e.message}`));
+  }
+
+  /** Sign this session out. */
+  async logout(actor: Actor) {
+    if (actor.sessionId) {
+      await this.prisma.adminSession.updateMany({
+        where: { id: actor.sessionId, adminId: actor.adminId!, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+    }
+    await this.audit.record(actor, 'admin.logout');
+    return { ok: true };
+  }
+
+  /** The signed-in admin's open sessions, newest first, this one flagged. */
+  async sessions(actor: Actor) {
+    const rows = await this.prisma.adminSession.findMany({
+      where: { adminId: actor.adminId!, ...openSession() },
+      orderBy: { lastSeenAt: 'desc' },
+      select: { id: true, createdAt: true, lastSeenAt: true, expiresAt: true, ip: true, userAgent: true },
+    });
+    return rows.map((r) => ({
+      ...r,
+      device: r.userAgent ? describeDevice(r.userAgent) : 'Unknown device',
+      current: r.id === actor.sessionId,
+    }));
+  }
+
+  /** End one of your own sessions. */
+  async revokeSession(actor: Actor, id: string) {
+    const res = await this.prisma.adminSession.updateMany({
+      where: { id, adminId: actor.adminId!, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    if (res.count === 0) throw new NotFoundException('Session not found');
+    await this.audit.record(actor, 'admin.session.revoke', { details: { sessionId: id } });
+    return { ok: true };
+  }
+
+  /** "Sign out everywhere else": every session of yours but this one. */
+  async revokeOtherSessions(actor: Actor) {
+    const res = await this.prisma.adminSession.updateMany({
+      where: {
+        adminId: actor.adminId!,
+        revokedAt: null,
+        ...(actor.sessionId ? { id: { not: actor.sessionId } } : {}),
+      },
+      data: { revokedAt: new Date() },
+    });
+    await this.audit.record(actor, 'admin.session.revoke-others', { details: { ended: res.count } });
+    return { ended: res.count };
   }
 }
+
+/**
+ * "Chrome on macOS" from a user-agent string. Rough on purpose: enough for
+ * someone to recognise their own browser in a list or an alert email.
+ */
+export function describeDevice(ua: string): string {
+  const browser = /Edg\//.test(ua)
+    ? 'Edge'
+    : /OPR\/|Opera/.test(ua)
+      ? 'Opera'
+      : /Firefox\//.test(ua)
+        ? 'Firefox'
+        : /Chrome\//.test(ua)
+          ? 'Chrome'
+          : /Safari\//.test(ua)
+            ? 'Safari'
+            : 'A browser';
+  const os = /Windows/.test(ua)
+    ? 'Windows'
+    : /Android/.test(ua)
+      ? 'Android'
+      : /iPhone|iPad|iOS/.test(ua)
+        ? 'iOS'
+        : /Mac OS X|Macintosh/.test(ua)
+          ? 'macOS'
+          : /Linux/.test(ua)
+            ? 'Linux'
+            : 'an unknown system';
+  return `${browser} on ${os}`;
+}
+

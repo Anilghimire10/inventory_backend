@@ -559,6 +559,11 @@ export class UpdatePlatformSettingsDto {
   @IsString()
   @MaxLength(254)
   billingEmail?: string | null;
+
+  @ApiPropertyOptional({ description: 'Make two-factor sign-in mandatory for every admin' })
+  @IsOptional()
+  @IsBoolean()
+  requireAdminTwoFactor?: boolean;
 }
 
 // ---- Renewals ----

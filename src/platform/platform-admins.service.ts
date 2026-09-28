@@ -137,4 +137,22 @@ export class PlatformAdminsService {
     });
     return updated;
   }
+
+  /**
+   * End all of an admin's sessions. passwordChangedAt is bumped too, which
+   * also retires any token issued before sessions were tracked.
+   */
+  async signOutEverywhere(actor: Actor, id: string) {
+    const target = await this.prisma.platformAdmin.findUnique({ where: { id }, select: { id: true, email: true } });
+    if (!target) throw new NotFoundException('Admin not found');
+    const now = new Date();
+    const [ended] = await this.prisma.$transaction([
+      this.prisma.adminSession.updateMany({ where: { adminId: id, revokedAt: null }, data: { revokedAt: now } }),
+      this.prisma.platformAdmin.update({ where: { id }, data: { passwordChangedAt: now } }),
+    ]);
+    await this.audit.record(actor, 'admin.sign-out-everywhere', {
+      details: { adminId: id, email: target.email, sessions: ended.count },
+    });
+    return { ended: ended.count };
+  }
 }

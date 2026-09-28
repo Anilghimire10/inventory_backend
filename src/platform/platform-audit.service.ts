@@ -10,6 +10,8 @@ export interface Actor {
   adminId: string | null;
   email: string;
   ip?: string | null;
+  /** The admin panel session acting, when there is one. Not written to the log. */
+  sessionId?: string | null;
 }
 
 /** The admin-side audit trail: suspensions, payments, resets, logins. */

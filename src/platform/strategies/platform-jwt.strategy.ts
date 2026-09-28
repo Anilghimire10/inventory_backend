@@ -4,18 +4,28 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PlatformRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { SettingsService } from '../../settings/settings.service';
 import { platformJwtSecret } from '../../common/env.validation';
 
 export interface PlatformJwtPayload {
   sub: string; // platform admin id
   scope: 'platform';
+  /** AdminSession id. Absent on tokens issued before sessions were tracked. */
+  sid?: string;
 }
+
+/** How stale lastSeenAt may get before a request refreshes it. */
+const LAST_SEEN_EVERY_MS = 5 * 60 * 1000;
 
 export interface PlatformPrincipal {
   adminId: string;
   email: string;
   name: string;
   role: PlatformRole;
+  /** The session this request belongs to; null for a pre-session token. */
+  sessionId: string | null;
+  /** Two-factor is required on the platform and this admin hasn't set it up. */
+  twoFactorRequired: boolean;
 }
 
 /**
@@ -31,6 +41,7 @@ export class PlatformJwtStrategy extends PassportStrategy(
   constructor(
     config: ConfigService,
     private prisma: PrismaService,
+    private settings: SettingsService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -60,6 +71,31 @@ export class PlatformJwtStrategy extends PassportStrategy(
     ) {
       throw new UnauthorizedException('Your sign-in details changed, please sign in again');
     }
-    return { adminId: admin.id, email: admin.email, name: admin.name, role: admin.role };
+    // A tracked session must still be open: signing out, "sign out everywhere"
+    // and an admin ending it from their Account page all close it here,
+    // before the token itself would have expired.
+    if (payload.sid) {
+      const session = await this.prisma.adminSession.findUnique({ where: { id: payload.sid } });
+      if (
+        !session ||
+        session.adminId !== admin.id ||
+        session.revokedAt ||
+        session.expiresAt.getTime() < Date.now()
+      ) {
+        throw new UnauthorizedException('This session was signed out, please sign in again');
+      }
+      if (Date.now() - session.lastSeenAt.getTime() > LAST_SEEN_EVERY_MS) {
+        await this.prisma.adminSession.update({ where: { id: session.id }, data: { lastSeenAt: new Date() } });
+      }
+    }
+    const { requireAdminTwoFactor } = await this.settings.get();
+    return {
+      adminId: admin.id,
+      email: admin.email,
+      name: admin.name,
+      role: admin.role,
+      sessionId: payload.sid ?? null,
+      twoFactorRequired: requireAdminTwoFactor && !admin.totpEnabledAt,
+    };
   }
 }

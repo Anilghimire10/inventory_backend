@@ -12,6 +12,6 @@ export const CurrentActor = createParamDecorator(
   (_data: unknown, ctx: ExecutionContext): Actor => {
     const req = ctx.switchToHttp().getRequest();
     const admin = req.user as PlatformPrincipal;
-    return { adminId: admin.adminId, email: admin.email, ip: req.ip ?? null };
+    return { adminId: admin.adminId, email: admin.email, ip: req.ip ?? null, sessionId: admin.sessionId };
   },
 );

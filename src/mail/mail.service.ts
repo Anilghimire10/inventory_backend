@@ -13,6 +13,7 @@ export type EmailType =
   | 'invite'
   | 'subscription-reminder'
   | 'subscription-receipt'
+  | 'admin-new-sign-in'
   | 'announcement'
   | 'support-reply'
   | 'support-new';
@@ -399,6 +400,25 @@ export class MailService {
           ${r.reference ? row('Your reference', esc(r.reference)) : ''}
           <tr><td style="padding:10px 0 0;border-top:1px solid #e2e8f0;font-weight:700">Amount paid</td><td style="padding:10px 0 0;border-top:1px solid #e2e8f0;text-align:right;font-weight:700">${esc(r.currency)} ${r.amount.toFixed(2)}</td></tr>
         </table>
+      </div>`,
+    });
+  }
+
+  /** An admin account signed in from a browser it hasn't used before. */
+  sendAdminNewSignIn(to: string, name: string, at: Date, ip: string | null, device: string) {
+    return this.send({
+      type: 'admin-new-sign-in',
+      to,
+      subject: 'New sign-in to the admin panel',
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">New sign-in to your admin account</h2>
+        <p style="margin:0 0 8px">Hi ${esc(name)},</p>
+        <p style="margin:0 0 16px;color:#475569">Your account was just used to sign in from a browser it hasn't used before:</p>
+        <p style="margin:0 0 16px"><strong>${esc(device)}</strong><br/>
+          <span style="color:#475569">${at.toISOString().replace('T', ' ').slice(0, 16)} UTC${ip ? ` · IP ${esc(ip)}` : ''}</span></p>
+        <p style="margin:0;color:#475569">If this was you, there's nothing to do. If not, change your password now
+          and sign out everywhere from your Account page -- this account can see every shop's data.</p>
       </div>`,
     });
   }

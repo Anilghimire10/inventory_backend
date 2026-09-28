@@ -38,6 +38,15 @@ export class PlatformAdminsController {
     return this.admins.update(actor, id, dto);
   }
 
+  /**
+   * Sign another admin out of every session now -- a lost laptop, someone
+   * leaving. Full admins only (support can't write here at all).
+   */
+  @Post('admins/:id/sign-out')
+  signOut(@CurrentActor() actor: Actor, @Param('id') id: string) {
+    return this.admins.signOutEverywhere(actor, id);
+  }
+
   /** What admins did. `?search=` matches the action, e.g. "suspend". */
   @Get('audit-log')
   auditLog(@Query() q: QueryAuditLogDto) {

@@ -47,6 +47,7 @@ export class SettingsService {
         | 'billingAddress'
         | 'billingPhone'
         | 'billingEmail'
+        | 'requireAdminTwoFactor'
       >
     >,
     updatedBy: string,

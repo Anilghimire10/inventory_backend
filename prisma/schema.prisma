@@ -150,6 +150,7 @@ model PlatformAdmin {
   businessNotes    BusinessNote[]
   supportMessages  SupportMessage[]
   assignedTickets  SupportTicket[]
+  sessions         AdminSession[]
 }
 
 model Business {
@@ -994,6 +995,23 @@ model SupportTicket {
   @@index([assignedAdminId, status])
 }
 
+/// One signed-in admin panel session. The token carries its id, so a
+/// session can be listed, and ended from anywhere, before its token expires.
+model AdminSession {
+  id         String        @id @default(cuid())
+  adminId    String
+  admin      PlatformAdmin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  createdAt  DateTime      @default(now())
+  /// Refreshed at most every few minutes, not on every request.
+  lastSeenAt DateTime      @default(now())
+  expiresAt  DateTime
+  ip         String?
+  userAgent  String?
+  revokedAt  DateTime?
+
+  @@index([adminId, revokedAt])
+}
+
 /// A canned answer for the support inbox. {name} and {business} are filled
 /// in with the ticket's person and shop when it's used.
 model SupportReplyTemplate {
@@ -1024,24 +1042,27 @@ model SupportMessage {
 /// Platform-wide settings edited from the admin panel. A single row (id 1),
 /// created on first read.
 model PlatformSettings {
-  id                 Int      @id @default(1)
+  id                    Int      @id @default(1)
   /// Free trial for new signups, in days. Null falls back to env TRIAL_DAYS.
-  trialDays          Int?
+  trialDays             Int?
   /// When false, the public register form is closed; admins still create
   /// businesses from the panel (2C.5).
-  signupOpen         Boolean  @default(true)
+  signupOpen            Boolean  @default(true)
   /// Shown as a banner across the shop app (and its sign-in page) while set.
-  maintenanceMessage String?
+  maintenanceMessage    String?
   /// Shop activity-log (AuditLog) entries older than this are deleted daily.
   /// Null keeps them forever.
-  auditRetentionDays Int?
+  auditRetentionDays    Int?
   /// Who a subscription receipt says was paid: the platform's own trading
   /// name, PAN/VAT number and contact details. Blank lines are left off.
-  billingName        String?
-  billingTaxId       String?
-  billingAddress     String?
-  billingPhone       String?
-  billingEmail       String?
-  updatedAt          DateTime @updatedAt
-  updatedBy          String? // admin email snapshot
+  billingName           String?
+  billingTaxId          String?
+  billingAddress        String?
+  billingPhone          String?
+  billingEmail          String?
+  /// When on, an admin without two-factor can only reach their Account page
+  /// (to set it up) until they do.
+  requireAdminTwoFactor Boolean  @default(false)
+  updatedAt             DateTime @updatedAt
+  updatedBy             String? // admin email snapshot
 }

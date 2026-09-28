@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Patch, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Patch, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Public } from '../common/decorators/public.decorator';
 import { PrismaService } from '../prisma/prisma.service';
@@ -56,6 +56,17 @@ export class PlatformSettingsController {
   @Patch()
   async update(@CurrentActor() actor: Actor, @Body() dto: UpdatePlatformSettingsDto) {
     const before = await this.settings.get();
+    // Turning the requirement on from an account without two-factor would
+    // lock that admin out of this very page on the next click.
+    if (dto.requireAdminTwoFactor && !before.requireAdminTwoFactor) {
+      const me = await this.prisma.platformAdmin.findUnique({
+        where: { id: actor.adminId! },
+        select: { totpEnabledAt: true },
+      });
+      if (!me?.totpEnabledAt) {
+        throw new BadRequestException('Turn on two-factor for your own account first (Account page).');
+      }
+    }
     const data = {
       ...(dto.trialDays !== undefined ? { trialDays: dto.trialDays } : {}),
       ...(dto.signupOpen !== undefined ? { signupOpen: dto.signupOpen } : {}),
@@ -63,6 +74,7 @@ export class PlatformSettingsController {
         ? { maintenanceMessage: dto.maintenanceMessage?.trim() || null }
         : {}),
       ...(dto.auditRetentionDays !== undefined ? { auditRetentionDays: dto.auditRetentionDays } : {}),
+      ...(dto.requireAdminTwoFactor !== undefined ? { requireAdminTwoFactor: dto.requireAdminTwoFactor } : {}),
       // Receipt details: blank clears, like the maintenance message.
       ...Object.fromEntries(
         BILLING_FIELDS.filter((k) => dto[k] !== undefined).map((k) => [k, dto[k]?.trim() || null]),

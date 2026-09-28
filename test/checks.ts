@@ -78,7 +78,7 @@ import {
   verifyTotp,
 } from '../src/common/totp';
 import { PlatformAuditService } from '../src/platform/platform-audit.service';
-import { PlatformAuthService } from '../src/platform/platform-auth.service';
+import { PlatformAuthService, describeDevice } from '../src/platform/platform-auth.service';
 import { BusinessController } from '../src/business/business.controller';
 import { BusinessService } from '../src/business/business.service';
 import { SubscriptionRemindersService } from '../src/platform/subscription-reminders.service';
@@ -2340,6 +2340,7 @@ async function adminTotpLocksAfterRepeatedWrongCodes() {
       totpLockedUntil: null,
       passwordChangedAt: null,
     };
+    let sessionsEnded = false;
     const apply = (data: any) => {
       for (const [k, v] of Object.entries(data)) {
         row[k] = v && typeof v === 'object' && 'increment' in v ? row[k] + (v as any).increment : v;
@@ -2359,9 +2360,19 @@ async function adminTotpLocksAfterRepeatedWrongCodes() {
             return { count: 1 };
           },
         },
+        adminSession: {
+          updateMany: async () => {
+            sessionsEnded = true;
+            return { count: 2 };
+          },
+          findUnique: async () => null,
+          create: async () => ({ id: 'sess-new' }),
+          update: async () => ({}),
+        },
       }),
       new JwtService({ secret: 'p'.repeat(48) }),
       stub<PlatformAuditService>({ record: async () => undefined }),
+      stub<MailService>({}),
     );
     // acceptCode is private; the lock logic is what's under test, not login's
     // password check (argon2 would need a real hash here).
@@ -2387,6 +2398,8 @@ async function adminTotpLocksAfterRepeatedWrongCodes() {
     const res = await service.enableTwoFactor({ adminId: 'a1', email: row.email, ip: null }, next);
     assert.ok(res.accessToken, 'enabling returns a token for this session');
     assert.ok(row.passwordChangedAt instanceof Date, 'and retires the tokens issued before it');
+    assert.ok(sessionsEnded, 'and ends the other sessions, so the list stays honest');
+    assert.strictEqual((new JwtService({}).decode(res.accessToken) as any).sid, 'sess-new', 'the fresh token belongs to a session');
   } finally {
     if (saved.jwt === undefined) delete process.env.JWT_SECRET;
     else process.env.JWT_SECRET = saved.jwt;
@@ -2791,6 +2804,23 @@ function logDateRange() {
   assert.strictEqual(both.createdAt.gte.toISOString(), '2026-09-01T00:00:00.000Z');
   assert.strictEqual(both.createdAt.lte.toISOString(), '2026-09-30T23:59:59.000Z');
   assert.deepStrictEqual(Object.keys((createdBetween({ to: '2026-09-30T00:00:00Z' }) as any).createdAt), ['lte'], 'open start');
+}
+
+/** The device names in the sessions list and the new sign-in email. */
+function devicesAreRecognisable() {
+  const ua = {
+    chromeMac: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36',
+    safariIphone: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    edgeWin: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36 Edg/129.0',
+    firefoxLinux: 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0',
+    chromeAndroid: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Mobile Safari/537.36',
+  };
+  assert.strictEqual(describeDevice(ua.chromeMac), 'Chrome on macOS');
+  assert.strictEqual(describeDevice(ua.safariIphone), 'Safari on iOS', 'an iPhone is iOS, not macOS');
+  assert.strictEqual(describeDevice(ua.edgeWin), 'Edge on Windows', 'Edge says Chrome too; Edge wins');
+  assert.strictEqual(describeDevice(ua.firefoxLinux), 'Firefox on Linux');
+  assert.strictEqual(describeDevice(ua.chromeAndroid), 'Chrome on Android', 'Android says Linux too; Android wins');
+  assert.strictEqual(describeDevice('curl/8.4'), 'A browser on an unknown system');
 }
 
 /** A restarted server or a second run the same day must not email twice. */
@@ -3476,6 +3506,7 @@ async function main() {
   await announcementsScheduleAndTarget();
   await supportTicketsGetAnOwner();
   logDateRange();
+  devicesAreRecognisable();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();
