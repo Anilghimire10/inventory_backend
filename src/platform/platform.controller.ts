@@ -22,6 +22,7 @@ import {
   CreateBusinessNoteDto,
   DeleteBusinessDto,
   QueryBusinessesDto,
+  DateRangeQueryDto,
   QueryOnboardingDto,
   RecordPaymentDto,
   SetSubscriptionDto,
@@ -254,7 +255,13 @@ export class PlatformController {
 
   /** Global activity feed across all businesses. */
   @Get('activity')
-  activity(@CurrentActor() actor: Actor, @Query() q: PaginationDto) {
+  activity(@CurrentActor() actor: Actor, @Query() q: DateRangeQueryDto) {
     return this.platform.activityFeed(actor, q);
+  }
+
+  /** All subscription payments, newest first; ?from=&to= by when recorded. */
+  @Get('payments')
+  allPayments(@Query() q: DateRangeQueryDto) {
+    return this.platform.allPayments(q);
   }
 }

@@ -140,7 +140,31 @@ export class UpdateAdminDto {
   role?: PlatformRole;
 }
 
-export class QueryAuditLogDto extends PaginationDto {
+/** A created-at window for the log lists: either end optional, ISO times. */
+export class DateRangeQueryDto extends PaginationDto {
+  @ApiPropertyOptional({ example: '2026-09-01T00:00:00.000Z' })
+  @IsOptional()
+  @IsDateString()
+  from?: string;
+
+  @ApiPropertyOptional({ example: '2026-09-30T23:59:59.999Z' })
+  @IsOptional()
+  @IsDateString()
+  to?: string;
+}
+
+/** `createdAt` within [from, to]; nothing when neither is given. */
+export function createdBetween(q: { from?: string; to?: string }) {
+  if (!q.from && !q.to) return {};
+  return {
+    createdAt: {
+      ...(q.from ? { gte: new Date(q.from) } : {}),
+      ...(q.to ? { lte: new Date(q.to) } : {}),
+    },
+  };
+}
+
+export class QueryAuditLogDto extends DateRangeQueryDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()

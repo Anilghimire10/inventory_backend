@@ -42,13 +42,15 @@ export class PlatformInsightsService {
    * - signups per week for the last 12 weeks (UTC, Monday-start);
    * - active: a sale in the last 7 days;
    * - at risk: has sold before, but nothing in 14 days, and not suspended;
-   * - subscription payments collected this month and last, per currency.
+   * - subscription payments collected this month and last, per currency;
+   * - trial to paid, lapsed paying shops, and renewals due this month
+   *   (see `subscriptionHealth`).
    */
   async growth(now = new Date()) {
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
     const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
 
-    const [weeks, active, atRisk, businesses, newThisMonth, paidThis, paidLast] = await Promise.all([
+    const [weeks, active, atRisk, businesses, newThisMonth, paidThis, paidLast, health] = await Promise.all([
       this.prisma.$queryRaw<{ week: Date; count: number }[]>`
         SELECT date_trunc('week', "createdAt") AS week, COUNT(*)::int AS count
         FROM "Business"
@@ -73,6 +75,7 @@ export class PlatformInsightsService {
       this.prisma.business.count({ where: { createdAt: { gte: monthStart } } }),
       this.paymentsBetween(monthStart, now),
       this.paymentsBetween(lastMonthStart, monthStart),
+      this.subscriptionHealth(now, monthStart),
     ]);
 
     // One entry per week, including the empty ones, so the chart has no gaps.
@@ -97,6 +100,62 @@ export class PlatformInsightsService {
       },
       paymentsThisMonth: paidThis,
       paymentsLastMonth: paidLast,
+      ...health,
+    };
+  }
+
+  /**
+   * How well trials turn into customers, and customers stay:
+   *
+   * - trial to paid: shops that have paid at least once, out of those plus
+   *   the ones whose trial ended without paying. Trials still running count
+   *   in neither -- they haven't decided yet.
+   * - lapsed: shops that paid before and are now past their end date, out of
+   *   every shop that has ever paid.
+   * - due this month: paying shops whose paid-until falls in this calendar
+   *   month (UTC), at what they paid last time, per currency.
+   *
+   * Suspended shops and ones without an end date (comped) are left out.
+   */
+  private async subscriptionHealth(now: Date, monthStart: Date) {
+    const nextMonth = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 1));
+    const [counts, due] = await Promise.all([
+      this.prisma.$queryRaw<{ converted: number; trialsLost: number; lapsed: number }[]>`
+        SELECT COUNT(*) FILTER (WHERE p.n IS NOT NULL)::int                                   AS converted,
+               COUNT(*) FILTER (WHERE p.n IS NULL AND b."subscribedTo" < ${utcBound(now)})::int     AS "trialsLost",
+               COUNT(*) FILTER (WHERE p.n IS NOT NULL AND b."subscribedTo" < ${utcBound(now)})::int AS lapsed
+        FROM "Business" b
+        LEFT JOIN (SELECT "businessId", COUNT(*) AS n FROM "SubscriptionPayment" GROUP BY 1) p
+          ON p."businessId" = b.id
+        WHERE NOT b."isSuspended" AND b."isSubscribed" AND b."subscribedTo" IS NOT NULL
+      `,
+      this.prisma.$queryRaw<{ currency: string; total: Prisma.Decimal; count: number }[]>`
+        SELECT last.currency, SUM(last.amount) AS total, COUNT(*)::int AS count
+        FROM "Business" b
+        JOIN LATERAL (
+          SELECT sp.amount, sp.currency FROM "SubscriptionPayment" sp
+          WHERE sp."businessId" = b.id ORDER BY sp."createdAt" DESC LIMIT 1
+        ) last ON TRUE
+        WHERE NOT b."isSuspended" AND b."isSubscribed"
+          AND b."subscribedTo" >= ${utcBound(monthStart)} AND b."subscribedTo" < ${utcBound(nextMonth)}
+        GROUP BY last.currency
+        ORDER BY last.currency
+      `,
+    ]);
+    const c = counts[0] ?? { converted: 0, trialsLost: 0, lapsed: 0 };
+    const decided = c.converted + c.trialsLost;
+    return {
+      trialToPaid: {
+        converted: c.converted,
+        endedUnpaid: c.trialsLost,
+        rate: decided ? round2((c.converted / decided) * 100) : null,
+      },
+      lapsed: {
+        count: c.lapsed,
+        ofPaying: c.converted,
+        rate: c.converted ? round2((c.lapsed / c.converted) * 100) : null,
+      },
+      dueThisMonth: due.map((d) => ({ currency: d.currency, total: round2(Number(d.total)), count: d.count })),
     };
   }
 

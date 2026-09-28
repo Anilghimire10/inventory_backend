@@ -31,6 +31,8 @@ import {
   BusinessSort,
   CreateBusinessDto,
   CreateBusinessNoteDto,
+  DateRangeQueryDto,
+  createdBetween,
   DeleteBusinessDto,
   QueryBusinessesDto,
   QueryOnboardingDto,
@@ -1008,10 +1010,11 @@ export class PlatformService {
   }
 
   /** Global activity feed across every business (super-admin monitoring). */
-  async activityFeed(actor: Actor, q: PaginationDto) {
-    const where: Prisma.AuditLogWhereInput = q.search
-      ? { action: { contains: q.search, mode: 'insensitive' } }
-      : {};
+  async activityFeed(actor: Actor, q: DateRangeQueryDto) {
+    const where: Prisma.AuditLogWhereInput = {
+      ...(q.search ? { action: { contains: q.search, mode: 'insensitive' } } : {}),
+      ...createdBetween(q),
+    };
     const [data, total] = await Promise.all([
       this.prisma.auditLog.findMany({
         where,
@@ -1027,8 +1030,41 @@ export class PlatformService {
     ]);
     // Cross-tenant by definition, so it is the broadest read on the panel.
     await this.audit.record(actor, 'activity.view', {
-      details: { search: q.search ?? null, page: q.page, returned: data.length, total },
+      details: {
+        search: q.search ?? null,
+        from: q.from ?? null,
+        to: q.to ?? null,
+        page: q.page,
+        returned: data.length,
+        total,
+      },
     });
+    return paginate(data, total, q.page, q.limit);
+  }
+
+  /**
+   * Every subscription payment on the platform, newest first, with the shop
+   * and receipt number -- for the books. `from`/`to` bound when it was
+   * recorded.
+   */
+  async allPayments(q: DateRangeQueryDto) {
+    const where: Prisma.SubscriptionPaymentWhereInput = {
+      ...createdBetween(q),
+      ...(q.search ? { business: { name: { contains: q.search, mode: 'insensitive' } } } : {}),
+    };
+    const [data, total] = await Promise.all([
+      this.prisma.subscriptionPayment.findMany({
+        where,
+        skip: q.skip,
+        take: q.limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          business: { select: { id: true, name: true, taxId: true } },
+          recordedByAdmin: { select: { id: true, name: true } },
+        },
+      }),
+      this.prisma.subscriptionPayment.count({ where }),
+    ]);
     return paginate(data, total, q.page, q.limit);
   }
 

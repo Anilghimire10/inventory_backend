@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { paginate } from '../common/dto/pagination.dto';
-import { QueryAuditLogDto } from './dto/platform.dto';
+import { QueryAuditLogDto, createdBetween } from './dto/platform.dto';
 
 /** Who did something in the admin panel, and from where. */
 export interface Actor {
@@ -51,6 +51,7 @@ export class PlatformAuditService {
       ...(q.adminId ? { adminId: q.adminId } : {}),
       ...(q.businessId ? { businessId: q.businessId } : {}),
       ...(q.search ? { action: { contains: q.search, mode: 'insensitive' } } : {}),
+      ...createdBetween(q),
     };
     const [data, total] = await Promise.all([
       this.prisma.platformAuditLog.findMany({

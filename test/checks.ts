@@ -14,6 +14,7 @@ import { ShiftsService } from '../src/shifts/shifts.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
 import { PlatformBillingService, formatReceiptNo } from '../src/platform/platform-billing.service';
 import { PlatformService } from '../src/platform/platform.service';
+import { createdBetween } from '../src/platform/dto/platform.dto';
 import { PlatformAnnouncementsService, audienceWhere } from '../src/platform/platform-announcements.service';
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
@@ -2783,6 +2784,15 @@ async function supportTicketsGetAnOwner() {
   assert.strictEqual(assignedTo, null, 'unassign');
 }
 
+/** Log date filters: either end optional, and nothing at all when neither is set. */
+function logDateRange() {
+  assert.deepStrictEqual(createdBetween({}), {}, 'no range, no filter');
+  const both = createdBetween({ from: '2026-09-01T00:00:00Z', to: '2026-09-30T23:59:59Z' }) as any;
+  assert.strictEqual(both.createdAt.gte.toISOString(), '2026-09-01T00:00:00.000Z');
+  assert.strictEqual(both.createdAt.lte.toISOString(), '2026-09-30T23:59:59.000Z');
+  assert.deepStrictEqual(Object.keys((createdBetween({ to: '2026-09-30T00:00:00Z' }) as any).createdAt), ['lte'], 'open start');
+}
+
 /** A restarted server or a second run the same day must not email twice. */
 async function reminderGoesOutOncePerThreshold() {
   const keys = new Set<string>();
@@ -3465,6 +3475,7 @@ async function main() {
   await onboardingFlagsTheStuckShops();
   await announcementsScheduleAndTarget();
   await supportTicketsGetAnOwner();
+  logDateRange();
   await shiftReportBalancesTheDrawer();
   await cashControlOnAShift();
   await oneDrawerOneShift();
