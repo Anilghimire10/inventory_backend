@@ -1,17 +1,33 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { NotificationType, Prisma, SupportTicketStatus, UserRole } from '@prisma/client';
+import { NotificationType, Prisma, SupportTicketCategory, SupportTicketStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { paginate } from '../common/dto/pagination.dto';
 import { AuthUser } from '../common/types/auth-user';
 import { Actor, PlatformAuditService } from '../platform/platform-audit.service';
-import { AdminQueryTicketsDto, CreateTicketDto, QueryTicketsDto, ReplyTemplateDto } from './dto/support.dto';
+import {
+  AdminQueryTicketsDto,
+  CreateTicketDto,
+  QueryTicketsDto,
+  ReplyTemplateDto,
+  UpdateTicketDto,
+} from './dto/support.dto';
+
+/** How a category reads in the support inbox's email. */
+export const CATEGORY_LABEL: Record<SupportTicketCategory, string> = {
+  BILLING: 'Billing',
+  PROBLEM: 'Problem',
+  HOW_TO: 'How to',
+  FEATURE: 'Feature request',
+  OTHER: 'Other',
+};
 
 /** What a ticket list row carries: enough for an inbox, not the thread. */
 const LIST_SELECT = {
   id: true,
   subject: true,
   status: true,
+  category: true,
   userName: true,
   userEmail: true,
   lastMessageAt: true,
@@ -28,6 +44,7 @@ const LIST_SELECT = {
 const THREAD_SELECT = {
   ...LIST_SELECT,
   businessId: true,
+  userId: true,
   messages: {
     orderBy: { createdAt: 'asc' },
     select: { id: true, fromAdmin: true, authorName: true, body: true, createdAt: true },
@@ -87,6 +104,7 @@ export class SupportService {
     if (!author) throw new NotFoundException('User not found');
     const subject = dto.subject.trim();
     const body = dto.body.trim();
+    const category = dto.category ?? SupportTicketCategory.OTHER;
     const ticket = await this.prisma.supportTicket.create({
       data: {
         businessId: user.businessId,
@@ -94,6 +112,7 @@ export class SupportService {
         userName: author.name,
         userEmail: author.email,
         subject,
+        category,
         messages: { create: { fromAdmin: false, authorName: author.name, body } },
       },
       select: THREAD_SELECT,
@@ -103,7 +122,14 @@ export class SupportService {
     const inbox = process.env.SUPPORT_EMAIL?.trim();
     if (inbox) {
       this.mail
-        .sendSupportNew(inbox, author.business.name, `${author.name} <${author.email}>`, subject, body)
+        .sendSupportNew(
+          inbox,
+          author.business.name,
+          `${author.name} <${author.email}>`,
+          subject,
+          body,
+          CATEGORY_LABEL[category],
+        )
         .catch((e: Error) => this.logger.warn(`New-ticket email failed: ${e.message}`));
     }
     return ticket;
@@ -136,23 +162,35 @@ export class SupportService {
     return ticket;
   }
 
-  /** The shop adds to its thread. A closed ticket reopens: they still need help. */
+  /**
+   * The shop adds to its thread. A closed ticket reopens: they still need
+   * help. The support inbox is emailed, as for a new ticket, so a follow-up
+   * doesn't wait until someone happens to open the panel.
+   */
   async replyFromShop(user: AuthUser, id: string, body: string) {
-    await this.getForShop(user, id);
+    const ticket = await this.getForShop(user, id);
     const author = await this.prisma.user.findUnique({
       where: { id: user.userId },
-      select: { name: true },
+      select: { name: true, email: true, business: { select: { name: true } } },
     });
+    const text = body.trim();
     const now = new Date();
     await this.prisma.$transaction([
       this.prisma.supportMessage.create({
-        data: { ticketId: id, fromAdmin: false, authorName: author?.name ?? user.email, body: body.trim() },
+        data: { ticketId: id, fromAdmin: false, authorName: author?.name ?? user.email, body: text },
       }),
       this.prisma.supportTicket.update({
         where: { id },
         data: { status: SupportTicketStatus.OPEN, lastMessageAt: now },
       }),
     ]);
+
+    const inbox = process.env.SUPPORT_EMAIL?.trim();
+    if (inbox && author) {
+      this.mail
+        .sendSupportFollowUp(inbox, author.business.name, `${author.name} <${author.email}>`, ticket.subject, text)
+        .catch((e: Error) => this.logger.warn(`Support follow-up email failed: ${e.message}`));
+    }
     return this.getForShop(user, id);
   }
 
@@ -163,6 +201,8 @@ export class SupportService {
       q.assigned === 'me' ? actor.adminId : q.assigned === 'none' ? null : q.assigned;
     const where: Prisma.SupportTicketWhereInput = {
       ...(q.status ? { status: q.status } : {}),
+      ...(q.category ? { category: q.category } : {}),
+      ...(q.businessId ? { businessId: q.businessId } : {}),
       ...(q.assigned !== undefined ? { assignedAdminId: assigned } : {}),
       ...(q.search
         ? {
@@ -174,7 +214,7 @@ export class SupportService {
           }
         : {}),
     };
-    const [rows, total, open] = await Promise.all([
+    const [rows, total, open, awaiting] = await Promise.all([
       this.prisma.supportTicket.findMany({
         where,
         orderBy: { lastMessageAt: 'desc' },
@@ -184,6 +224,7 @@ export class SupportService {
       }),
       this.prisma.supportTicket.count({ where }),
       this.prisma.supportTicket.count({ where: { status: SupportTicketStatus.OPEN } }),
+      this.countAwaitingReply(),
     ]);
     return {
       ...paginate(
@@ -193,7 +234,29 @@ export class SupportService {
         q.limit,
       ),
       openCount: open,
+      // What the sidebar badge shows: only tickets someone on our side still
+      // owes an answer, so it clears once they are answered.
+      awaitingCount: awaiting,
     };
+  }
+
+  /**
+   * Open tickets whose latest message is from the shop -- the same rule as
+   * `awaitingReply` on a row. "Latest message" isn't something Prisma can
+   * filter on, hence the SQL; (ticketId, createdAt) is indexed.
+   */
+  private async countAwaitingReply(): Promise<number> {
+    const [row] = await this.prisma.$queryRaw<{ n: bigint }[]>`
+      SELECT count(*) AS n
+      FROM "SupportTicket" t
+      WHERE t.status = 'OPEN'
+        AND (
+          SELECT m."fromAdmin" FROM "SupportMessage" m
+          WHERE m."ticketId" = t.id
+          ORDER BY m."createdAt" DESC, m.id DESC
+          LIMIT 1
+        ) = false`;
+    return Number(row?.n ?? 0);
   }
 
   async getForAdmin(id: string) {
@@ -206,9 +269,11 @@ export class SupportService {
   }
 
   /**
-   * Answer a ticket. The shop hears about it twice: the bell, which says only
-   * that there is a reply (it is business-wide, and the ticket may be one
-   * staff member's own), and an email to whoever raised it, with the text.
+   * Answer a ticket. Whoever raised it hears about it twice: their own bell,
+   * linking to the ticket, and an email with the text. The bell notice is
+   * theirs alone -- a cashier's ticket is not the rest of the shop's
+   * business. If that person has since been removed, it falls back to the
+   * whole shop, where the owner and managers can still open the ticket.
    */
   async replyFromAdmin(actor: Actor, id: string, body: string) {
     const ticket = await this.getForAdmin(id);
@@ -238,8 +303,10 @@ export class SupportService {
         data: {
           businessId: ticket.businessId,
           type: NotificationType.GENERAL,
+          userId: ticket.userId,
           title: `Support replied: ${ticket.subject}`.slice(0, 200),
-          body: 'Open Help & support to read it.',
+          body: 'Tap to read the reply.',
+          link: `/support?ticket=${id}`,
         },
       }),
     ]);
@@ -253,13 +320,22 @@ export class SupportService {
     return this.getForAdmin(id);
   }
 
-  async setStatus(actor: Actor, id: string, status: SupportTicketStatus) {
+  /** Close or reopen, and/or correct the category. Each change is logged. */
+  async update(actor: Actor, id: string, dto: UpdateTicketDto) {
     const ticket = await this.getForAdmin(id);
-    if (ticket.status !== status) {
+    const { status, category } = dto;
+    if (status && ticket.status !== status) {
       await this.prisma.supportTicket.update({ where: { id }, data: { status } });
       await this.audit.record(actor, status === SupportTicketStatus.CLOSED ? 'support.close' : 'support.reopen', {
         businessId: ticket.businessId,
         details: { ticketId: id, subject: ticket.subject },
+      });
+    }
+    if (category && ticket.category !== category) {
+      await this.prisma.supportTicket.update({ where: { id }, data: { category } });
+      await this.audit.record(actor, 'support.category', {
+        businessId: ticket.businessId,
+        details: { ticketId: id, subject: ticket.subject, from: ticket.category, to: category },
       });
     }
     return this.getForAdmin(id);

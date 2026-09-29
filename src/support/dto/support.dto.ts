@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { SupportTicketStatus } from '@prisma/client';
+import { SupportTicketCategory, SupportTicketStatus } from '@prisma/client';
 import { IsEnum, IsOptional, IsString, MaxLength, MinLength, ValidateIf } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
@@ -15,6 +15,13 @@ export class CreateTicketDto {
   @MinLength(1)
   @MaxLength(5000)
   body: string;
+
+  // Optional so an app build from before categories can still ask: its
+  // tickets land as OTHER.
+  @ApiPropertyOptional({ enum: SupportTicketCategory, default: SupportTicketCategory.OTHER })
+  @IsOptional()
+  @IsEnum(SupportTicketCategory)
+  category?: SupportTicketCategory;
 }
 
 export class SupportMessageDto {
@@ -32,10 +39,17 @@ export class QueryTicketsDto extends PaginationDto {
   status?: SupportTicketStatus;
 }
 
-export class SetTicketStatusDto {
-  @ApiProperty({ enum: SupportTicketStatus })
+/** Close or reopen a ticket, or correct its category. Either or both. */
+export class UpdateTicketDto {
+  @ApiPropertyOptional({ enum: SupportTicketStatus })
+  @IsOptional()
   @IsEnum(SupportTicketStatus)
-  status: SupportTicketStatus;
+  status?: SupportTicketStatus;
+
+  @ApiPropertyOptional({ enum: SupportTicketCategory })
+  @IsOptional()
+  @IsEnum(SupportTicketCategory)
+  category?: SupportTicketCategory;
 }
 
 /** The admin inbox also filters by who is handling a ticket. */
@@ -45,6 +59,18 @@ export class AdminQueryTicketsDto extends QueryTicketsDto {
   @IsString()
   @MaxLength(64)
   assigned?: string;
+
+  @ApiPropertyOptional({ enum: SupportTicketCategory })
+  @IsOptional()
+  @IsEnum(SupportTicketCategory)
+  category?: SupportTicketCategory;
+
+  /** One shop's tickets, for the Support tab on its business page. */
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  businessId?: string;
 }
 
 export class AssignTicketDto {

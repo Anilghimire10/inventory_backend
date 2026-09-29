@@ -9,8 +9,8 @@ import {
   AdminQueryTicketsDto,
   AssignTicketDto,
   ReplyTemplateDto,
-  SetTicketStatusDto,
   SupportMessageDto,
+  UpdateTicketDto,
 } from './dto/support.dto';
 
 /**
@@ -75,9 +75,10 @@ export class PlatformSupportController {
     return this.support.assign(actor, id, dto.adminId);
   }
 
+  /** Close or reopen, and/or correct the category the shop picked. */
   @SupportMayWrite()
   @Patch(':id')
-  setStatus(@CurrentActor() actor: Actor, @Param('id') id: string, @Body() dto: SetTicketStatusDto) {
-    return this.support.setStatus(actor, id, dto.status);
+  update(@CurrentActor() actor: Actor, @Param('id') id: string, @Body() dto: UpdateTicketDto) {
+    return this.support.update(actor, id, dto);
   }
 }

@@ -16,7 +16,8 @@ export type EmailType =
   | 'admin-new-sign-in'
   | 'announcement'
   | 'support-reply'
-  | 'support-new';
+  | 'support-new'
+  | 'support-followup';
 
 interface SendArgs {
   to: string;
@@ -442,15 +443,38 @@ export class MailService {
   }
 
   /** A shop raised a ticket: tell the support inbox (SUPPORT_EMAIL). */
-  sendSupportNew(to: string, businessName: string, from: string, subject: string, body: string) {
+  sendSupportNew(
+    to: string,
+    businessName: string,
+    from: string,
+    subject: string,
+    body: string,
+    category: string,
+  ) {
     return this.send({
       type: 'support-new',
       to,
-      subject: `Support: ${subject}`,
+      subject: `Support [${category}]: ${subject}`,
       html: `
       <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
         <h2 style="margin:0 0 16px">${esc(subject)}</h2>
-        <p style="margin:0 0 16px;color:#475569">From ${esc(from)} at <strong>${esc(businessName)}</strong></p>
+        <p style="margin:0 0 16px;color:#475569">${esc(category)} · from ${esc(from)} at <strong>${esc(businessName)}</strong></p>
+        <p style="margin:0 0 16px;white-space:pre-line">${esc(body)}</p>
+        <p style="margin:0;color:#94a3b8;font-size:12px">Answer it from the admin panel's Support page.</p>
+      </div>`,
+    });
+  }
+
+  /** A shop added to its ticket: tell the support inbox, as for a new one. */
+  sendSupportFollowUp(to: string, businessName: string, from: string, subject: string, body: string) {
+    return this.send({
+      type: 'support-followup',
+      to,
+      subject: `Re: Support: ${subject}`,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">${esc(subject)}</h2>
+        <p style="margin:0 0 16px;color:#475569">${esc(from)} at <strong>${esc(businessName)}</strong> replied:</p>
         <p style="margin:0 0 16px;white-space:pre-line">${esc(body)}</p>
         <p style="margin:0;color:#94a3b8;font-size:12px">Answer it from the admin panel's Support page.</p>
       </div>`,

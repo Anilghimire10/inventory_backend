@@ -261,6 +261,7 @@ model User {
   shifts               Shift[]
   cashMovements        CashMovement[]
   notificationReceipts NotificationReceipt[]
+  notifications        Notification[]
 
   @@index([businessId])
 }
@@ -784,6 +785,10 @@ model Notification {
   title          String
   body           String?
   link           String?
+  /// Set when the notice is for one person only (a reply to their support
+  /// ticket). Null: everyone in the business sees it.
+  userId         String?
+  user           User?            @relation(fields: [userId], references: [id], onDelete: Cascade)
   dedupeKey      String? // stable identity for auto alerts; null for one-off notices
   /// The platform announcement this came from, for its "seen by" count.
   announcementId String?
@@ -799,6 +804,7 @@ model Notification {
   @@unique([businessId, dedupeKey])
   @@index([businessId])
   @@index([announcementId])
+  @@index([userId])
 }
 
 /// A message from the platform to shops' notification bells, sent now or
@@ -968,25 +974,36 @@ enum SupportTicketStatus {
   CLOSED
 }
 
+/// What a ticket is about. The shop picks it when asking; an admin can
+/// correct it from the inbox.
+enum SupportTicketCategory {
+  BILLING // subscription, payments, receipts
+  PROBLEM // something isn't working
+  HOW_TO // how do I ...
+  FEATURE // a feature request
+  OTHER
+}
+
 /// A question or feedback from a shop, answered from the admin panel.
 model SupportTicket {
-  id              String              @id @default(cuid())
+  id              String                @id @default(cuid())
   businessId      String
-  business        Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business        Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
   /// Who raised it. SET NULL with a snapshot, so the ticket outlives the user.
   userId          String?
-  user            User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user            User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
   userName        String
   userEmail       String
   subject         String
-  status          SupportTicketStatus @default(OPEN)
+  status          SupportTicketStatus   @default(OPEN)
+  category        SupportTicketCategory @default(OTHER)
   /// Bumped by every message, so both inboxes sort by the latest activity.
-  lastMessageAt   DateTime            @default(now())
+  lastMessageAt   DateTime              @default(now())
   /// Which admin is handling it. Internal: shops never see this.
   assignedAdminId String?
-  assignedAdmin   PlatformAdmin?      @relation(fields: [assignedAdminId], references: [id], onDelete: SetNull)
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
+  assignedAdmin   PlatformAdmin?        @relation(fields: [assignedAdminId], references: [id], onDelete: SetNull)
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
 
   messages SupportMessage[]
 

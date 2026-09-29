@@ -5,6 +5,14 @@ import { InventoryService } from '../inventory/inventory.service';
 
 const EXPIRY_WINDOW_DAYS = 30;
 
+/**
+ * What one person's bell holds: their business's notices, minus the ones
+ * addressed to someone else there (a reply to another person's ticket).
+ */
+function visibleTo(businessId: string, userId: string): Prisma.NotificationWhereInput {
+  return { businessId, OR: [{ userId: null }, { userId }] };
+}
+
 interface DesiredAlert {
   type: NotificationType;
   dedupeKey: string;
@@ -41,7 +49,7 @@ export class NotificationsService {
   async list(businessId: string, userId: string) {
     const rows = await this.prisma.notification.findMany({
       where: {
-        businessId,
+        ...visibleTo(businessId, userId),
         receipts: { none: { userId, dismissedAt: { not: null } } },
       },
       orderBy: { createdAt: 'desc' },
@@ -58,7 +66,7 @@ export class NotificationsService {
 
   async markRead(businessId: string, userId: string, id: string) {
     const own = await this.prisma.notification.findFirst({
-      where: { id, businessId },
+      where: { id, ...visibleTo(businessId, userId) },
       select: { id: true },
     });
     if (own) await this.stamp(userId, [own.id], 'readAt');
@@ -68,7 +76,7 @@ export class NotificationsService {
   async markAllRead(businessId: string, userId: string) {
     const unread = await this.prisma.notification.findMany({
       where: {
-        businessId,
+        ...visibleTo(businessId, userId),
         receipts: {
           none: {
             userId,
@@ -88,7 +96,7 @@ export class NotificationsService {
    */
   async dismiss(businessId: string, userId: string, id: string) {
     const own = await this.prisma.notification.findFirst({
-      where: { id, businessId },
+      where: { id, ...visibleTo(businessId, userId) },
       select: { id: true },
     });
     if (own) await this.stamp(userId, [own.id], 'dismissedAt');
