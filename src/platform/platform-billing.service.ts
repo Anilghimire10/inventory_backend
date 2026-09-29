@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { SubscriptionPaymentMethod, UserRole } from '@prisma/client';
+import { UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailService, SubscriptionReceipt } from '../mail/mail.service';
 import { SettingsService } from '../settings/settings.service';
@@ -7,16 +7,9 @@ import { DAY_MS, accessEndsAt, daysUntil } from '../common/subscription';
 import { Actor, PlatformAuditService } from './platform-audit.service';
 import { SubscriptionRemindersService } from './subscription-reminders.service';
 
-const METHOD_LABEL: Record<SubscriptionPaymentMethod, string> = {
-  CASH: 'Cash',
-  BANK: 'Bank transfer',
-  ESEWA: 'eSewa',
-  KHALTI: 'Khalti',
-  OTHER: 'Other',
-};
+import { toReceipt } from '../subscription/receipt';
 
-/** SUB-000042: the receipt number as printed. */
-export const formatReceiptNo = (n: number) => `SUB-${String(n).padStart(6, '0')}`;
+export { formatReceiptNo } from '../subscription/receipt';
 
 /**
  * Getting paid: receipts for recorded subscription payments, and the list of
@@ -44,25 +37,7 @@ export class PlatformBillingService {
       include: { business: { select: { id: true, name: true, taxId: true } } },
     });
     if (!p) throw new NotFoundException('Payment not found');
-    const s = await this.settings.get();
-    return {
-      receiptNo: formatReceiptNo(p.receiptNo),
-      issuedAt: p.createdAt,
-      seller: {
-        name: s.billingName,
-        taxId: s.billingTaxId,
-        address: s.billingAddress,
-        phone: s.billingPhone,
-        email: s.billingEmail,
-      },
-      buyer: { businessId: p.business.id, name: p.business.name, taxId: p.business.taxId },
-      amount: Number(p.amount),
-      currency: p.currency,
-      methodLabel: METHOD_LABEL[p.method],
-      reference: p.reference,
-      periodFrom: p.periodFrom,
-      periodTo: p.periodTo,
-    };
+    return toReceipt(p, await this.settings.get());
   }
 
   /**

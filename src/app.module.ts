@@ -33,6 +33,7 @@ import { CreditModule } from './credit/credit.module';
 import { ShiftsModule } from './shifts/shifts.module';
 import { SettingsModule } from './settings/settings.module';
 import { SupportModule } from './support/support.module';
+import { SubscriptionModule } from './subscription/subscription.module';
 import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-only.guard';
 
 @Module({
@@ -81,6 +82,7 @@ import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-o
     ShiftsModule,
     SettingsModule,
     SupportModule,
+    SubscriptionModule,
   ],
   controllers: [HealthController],
   providers: [
