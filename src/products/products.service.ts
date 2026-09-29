@@ -10,8 +10,9 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { GenerateVariantsDto } from './dto/generate-variants.dto';
+import { expiredCutoff, soonCutoff } from '../common/expiry';
+import { readProductRow } from './product-import';
 import { paginate } from '../common/dto/pagination.dto';
-import { normalizeUnit } from '../common/units';
 
 const DETAIL_INCLUDE = {
   categories: { select: { id: true, name: true } },
@@ -114,6 +115,8 @@ export class ProductsService {
             ],
           }
         : {}),
+      // Under AND, so it can't collide with the search's OR.
+      ...(q.expiry ? { AND: [this.expiryWhere(q.expiry, q.storeId)] } : {}),
     };
 
     const page = { where, skip: q.skip, take: q.limit, orderBy: { name: 'asc' as const } };
@@ -124,7 +127,7 @@ export class ProductsService {
         this.prisma.product.findMany({ ...page, include: this.detailInclude }),
         this.prisma.product.count({ where }),
       ]);
-      return paginate(data, total, q.page, q.limit);
+      return paginate(await this.withExpiry(data), total, q.page, q.limit);
     }
 
     // Scoped to a store: carry that store's stock on the row.
@@ -164,7 +167,57 @@ export class ProductsService {
         effectiveReorderLevel: here?.reorderLevel || product.reorderLevel,
       };
     });
-    return paginate(rows, total, q.page, q.limit);
+    return paginate(await this.withExpiry(rows, q.storeId), total, q.page, q.limit);
+  }
+
+  /**
+   * Products past (or near) their expiry: the product's own date, or a batch
+   * that still holds stock -- at `storeId` when given, else at any store.
+   */
+  private expiryWhere(kind: 'expired' | 'soon', storeId?: string): Prisma.ProductWhereInput {
+    const now = new Date();
+    const range =
+      kind === 'expired' ? { lte: expiredCutoff(now) } : { gt: expiredCutoff(now), lte: soonCutoff(now) };
+    return {
+      OR: [
+        { expiryDate: range },
+        {
+          batches: {
+            some: { quantity: { gt: 0 }, expiryDate: range, ...(storeId ? { storeId } : {}) },
+          },
+        },
+      ],
+    };
+  }
+
+  /**
+   * Batch expiry on each row, for the badges on the product list and the till:
+   * how much sits in batches already past their date, and when the next
+   * in-date batch expires. At `storeId` when given (the till sells from one
+   * store), otherwise across all of them. One query for the whole page.
+   */
+  private async withExpiry<T extends { id: string; trackBatches: boolean }>(rows: T[], storeId?: string) {
+    const ids = rows.filter((r) => r.trackBatches).map((r) => r.id);
+    const batches = ids.length
+      ? await this.prisma.batch.findMany({
+          where: {
+            productId: { in: ids },
+            quantity: { gt: 0 },
+            expiryDate: { not: null },
+            ...(storeId ? { storeId } : {}),
+          },
+          select: { productId: true, expiryDate: true, quantity: true },
+        })
+      : [];
+    const cutoff = expiredCutoff();
+    const info = new Map<string, { expiredQty: number; nextBatchExpiry: Date | null }>();
+    for (const b of batches) {
+      const e = info.get(b.productId) ?? { expiredQty: 0, nextBatchExpiry: null };
+      if (b.expiryDate! <= cutoff) e.expiredQty = Math.round((e.expiredQty + Number(b.quantity)) * 1000) / 1000;
+      else if (!e.nextBatchExpiry || b.expiryDate! < e.nextBatchExpiry) e.nextBatchExpiry = b.expiryDate;
+      info.set(b.productId, e);
+    }
+    return rows.map((r) => ({ ...r, expiry: info.get(r.id) ?? { expiredQty: 0, nextBatchExpiry: null } }));
   }
 
   /**
@@ -506,20 +559,28 @@ export class ProductsService {
       orderBy: { name: 'asc' },
       include: { categories: { select: { name: true } } },
     });
+    // Every column the import reads, in the same shape, so a file exported,
+    // edited in Excel and imported back changes only what was edited.
+    const yesNo = (b: boolean) => (b ? 'yes' : 'no');
     return products.map((p) => ({
       name: p.name,
       sku: p.sku ?? '',
       barcode: p.barcode ?? '',
       brand: p.brand ?? '',
+      description: p.description ?? '',
       unit: p.unit,
       costPrice: Number(p.costPrice),
       sellingPrice: Number(p.sellingPrice),
       taxRate: Number(p.taxRate),
+      isTaxable: yesNo(p.isTaxable),
       reorderLevel: p.reorderLevel,
-      variantOf: p.parentId ?? '',
-      variantName: p.variantName ?? '',
       categories: p.categories.map((c) => c.name).join('|'),
-      isActive: p.isActive,
+      isRxRequired: yesNo(p.isRxRequired),
+      expiryDate: p.expiryDate ? p.expiryDate.toISOString().slice(0, 10) : '',
+      trackBatches: yesNo(p.trackBatches),
+      trackSerials: yesNo(p.trackSerials),
+      variantName: p.variantName ?? '',
+      isActive: yesNo(p.isActive),
     }));
   }
 
@@ -540,131 +601,140 @@ export class ProductsService {
    *   2. write the plan in chunks, each chunk one pipelined transaction;
    *   3. seed stock rows for everything created, as one `createMany`.
    */
-  async bulkImport(businessId: string, items: Record<string, unknown>[]) {
+  async bulkImport(businessId: string, items: Record<string, unknown>[], opts: { dryRun?: boolean } = {}) {
     if (items.length > 5000) {
       throw new BadRequestException('Import is limited to 5000 rows at a time');
     }
-    const num = (v: unknown) => {
-      const n = Number(v);
-      return Number.isFinite(n) && n >= 0 ? n : 0;
-    };
-    // Objects/arrays have no sensible cell value -- String() would silently
-    // stringify them to "[object Object]" and import that as the product name.
-    // Treated as blank so the row fails validation and is reported instead.
-    const str = (v: unknown) => {
-      if (typeof v === 'string') return v.trim();
-      if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint') {
-        return String(v);
-      }
-      return '';
-    };
-
     const errors: { row: number; error: string }[] = [];
 
-    // ---- Pass 1: parse ----------------------------------------------------
-    type Parsed = {
-      row: number;
-      sku: string | null;
-      data: {
-        name: string;
-        barcode: string | null;
-        brand: string | null;
-        unit: string;
-        costPrice: number;
-        sellingPrice: number;
-        taxRate: number;
-        reorderLevel: number;
-      };
+    // ---- Pass 1: read every row ---------------------------------------
+    // A cell that is blank (or a column that isn't in the file) means "leave
+    // it as it is" on an existing product and "use the default" on a new one.
+    // It used to mean 0: re-importing a sheet with an empty cost column set
+    // every product's cost to nothing, and "1,200" -- how Excel writes a
+    // thousand -- silently became a price of 0. Now a number is read the way
+    // a person writes it, and anything unreadable is refused with its row.
+    type Fields = {
+      name?: string;
+      barcode?: string | null;
+      brand?: string | null;
+      description?: string | null;
+      unit?: string;
+      costPrice?: number;
+      sellingPrice?: number;
+      taxRate?: number;
+      reorderLevel?: number;
+      isTaxable?: boolean;
+      isRxRequired?: boolean;
+      expiryDate?: Date | null;
+      // New products only: switching tracking on a product that already has
+      // stock would leave its units without batches or serials on file.
+      trackBatches?: boolean;
+      trackSerials?: boolean;
     };
+    type Parsed = { row: number; sku: string | null; barcode: string | null; fields: Fields; categories?: string[] };
     const parsed: Parsed[] = [];
+
     for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      const name = str(it.name);
-      if (!name) {
-        errors.push({ row: i + 1, error: 'Name is required' });
-        continue;
+      const row = i + 1;
+      try {
+        parsed.push({ row, ...readProductRow(items[i]) });
+      } catch (e) {
+        errors.push({ row, error: (e as Error).message });
       }
-      const sku = str(it.sku);
-      const barcode = str(it.barcode);
-      const brand = str(it.brand);
-      // Same caps as CreateProductDto. Rows never pass through the DTO, and
-      // this route keeps the large body limit, so without this a single cell
-      // could carry megabytes into the product table.
-      const tooLong = (
-        [
-          ['Name', name, 200],
-          ['SKU', sku, 100],
-          ['Barcode', barcode, 100],
-          ['Brand', brand, 200],
-        ] as const
-      ).find(([, value, max]) => value.length > max);
-      if (tooLong) {
-        errors.push({
-          row: i + 1,
-          error: `${tooLong[0]} is longer than ${tooLong[2]} characters`,
-        });
-        continue;
-      }
-      parsed.push({
-        row: i + 1,
-        sku: sku || null,
-        data: {
-          name,
-          barcode: barcode || null,
-          brand: brand || null,
-          unit: normalizeUnit(it.unit) ?? 'pcs',
-          costPrice: num(it.costPrice),
-          sellingPrice: num(it.sellingPrice),
-          taxRate: num(it.taxRate),
-          reorderLevel: Math.round(num(it.reorderLevel)),
-        },
-      });
     }
 
-    // Every existing SKU in one query instead of a findFirst per row.
+    // ---- Pass 2: match to existing products -----------------------------
+    // By SKU first; a row without one by barcode, so a product exported
+    // without a SKU updates itself on the way back in rather than coming
+    // back as a copy.
     const skus = [...new Set(parsed.map((r) => r.sku).filter((v): v is string => !!v))];
-    const existing = skus.length
+    const barcodes = [...new Set(parsed.filter((r) => !r.sku && r.barcode).map((r) => r.barcode as string))];
+    const existing = skus.length || barcodes.length
       ? await this.prisma.product.findMany({
-          where: { businessId, sku: { in: skus } },
-          select: { id: true, sku: true },
+          where: {
+            businessId,
+            OR: [
+              ...(skus.length ? [{ sku: { in: skus } }] : []),
+              ...(barcodes.length ? [{ barcode: { in: barcodes } }] : []),
+            ],
+          },
+          select: { id: true, sku: true, barcode: true },
         })
       : [];
-    const idBySku = new Map(existing.map((p) => [p.sku as string, p.id]));
+    const idBySku = new Map(existing.filter((p) => p.sku).map((p) => [p.sku as string, p.id]));
+    const idByBarcode = new Map(existing.filter((p) => p.barcode).map((p) => [p.barcode as string, p.id]));
 
-    // ---- Pass 2: plan -----------------------------------------------------
-    // A SKU repeated inside one file collapses to its last row, which is what
-    // the row-at-a-time version ended up with: each later occurrence found the
-    // product the earlier one had just written and overwrote it. The counts
-    // are reported the same way too -- one create plus an update per repeat
-    // for a new SKU, an update per row for one that already existed.
-    type Op = { row: number; repeats: number; data: Parsed['data'] } & (
+    type Op = { row: number; repeats: number; fields: Fields; categories?: string[] } & (
       | { kind: 'create'; sku: string | null }
       | { kind: 'update'; id: string }
     );
-
     const ops: Op[] = [];
     const seen = new Map<string, number>();
     for (const r of parsed) {
-      if (!r.sku) {
-        // No SKU is no identity: always a new product, never deduped.
-        ops.push({ kind: 'create', row: r.row, repeats: 0, sku: null, data: r.data });
-        continue;
-      }
-      const at = seen.get(r.sku);
+      // Same identity twice in one file: the later row wins, merged over the
+      // earlier one, and counts as a repeat.
+      const key = r.sku ? `sku:${r.sku}` : r.barcode ? `bc:${r.barcode}` : null;
+      const at = key ? seen.get(key) : undefined;
       if (at !== undefined) {
-        // Last row wins, and the repeat is counted -- but only once the write
-        // succeeds, so a chunk that fails doesn't inflate the summary.
-        ops[at] = { ...ops[at], row: r.row, repeats: ops[at].repeats + 1, data: r.data };
+        ops[at] = {
+          ...ops[at],
+          row: r.row,
+          repeats: ops[at].repeats + 1,
+          fields: { ...ops[at].fields, ...r.fields },
+          categories: r.categories ?? ops[at].categories,
+        };
         continue;
       }
-      seen.set(r.sku, ops.length);
-      const id = idBySku.get(r.sku);
-      ops.push(
-        id
-          ? { kind: 'update', row: r.row, repeats: 0, id, data: r.data }
-          : { kind: 'create', row: r.row, repeats: 0, sku: r.sku, data: r.data },
-      );
+      if (key) seen.set(key, ops.length);
+      const id = r.sku ? idBySku.get(r.sku) : r.barcode ? idByBarcode.get(r.barcode) : undefined;
+      if (id) {
+        const { trackBatches: _b, trackSerials: _s, ...fields } = r.fields;
+        ops.push({ kind: 'update', row: r.row, repeats: 0, id, fields, categories: r.categories });
+      } else if (!r.fields.name) {
+        errors.push({ row: r.row, error: 'Name is required for a new product' });
+      } else {
+        ops.push({ kind: 'create', row: r.row, repeats: 0, sku: r.sku, fields: r.fields, categories: r.categories });
+      }
     }
+
+    const summary = {
+      created: ops.filter((o) => o.kind === 'create').length,
+      updated: ops.filter((o) => o.kind === 'update').length + ops.reduce((n, o) => n + o.repeats, 0),
+    };
+    if (opts.dryRun) {
+      errors.sort((a, b) => a.row - b.row);
+      return {
+        dryRun: true,
+        ...summary,
+        errors,
+        // What the first rows will do, so the screen can show a sample.
+        preview: ops.slice(0, 20).map((o) => ({
+          row: o.row,
+          action: o.kind,
+          name: o.fields.name ?? null,
+          sku: o.kind === 'create' ? o.sku : null,
+        })),
+      };
+    }
+
+    // Categories named in the file: found by name, created when new.
+    const categoryNames = [...new Set(ops.flatMap((o) => o.categories ?? []))];
+    const categoryIds = new Map<string, string>();
+    if (categoryNames.length) {
+      const found = await this.prisma.category.findMany({
+        where: { businessId, name: { in: categoryNames, mode: 'insensitive' } },
+        select: { id: true, name: true },
+      });
+      for (const c of found) categoryIds.set(c.name.toLowerCase(), c.id);
+      for (const name of categoryNames) {
+        if (categoryIds.has(name.toLowerCase())) continue;
+        const c = await this.prisma.category.create({ data: { businessId, name }, select: { id: true } });
+        categoryIds.set(name.toLowerCase(), c.id);
+      }
+    }
+    const cats = (names?: string[]) =>
+      names?.map((n) => ({ id: categoryIds.get(n.toLowerCase())! })).filter((c) => c.id);
 
     // ---- Pass 3: write ----------------------------------------------------
     // 200 rows per transaction. Small enough that a chunk's locks are held
@@ -682,20 +752,30 @@ export class ProductsService {
       } else {
         updated++;
       }
-      // Each collapsed repeat of this SKU was an update in the old row-at-a-
-      // time version, so it still reads as one.
       updated += op.repeats;
     };
 
     const runOp = (op: Op) =>
       op.kind === 'create'
         ? this.prisma.product.create({
-            data: { businessId, sku: op.sku, ...op.data },
+            data: {
+              businessId,
+              sku: op.sku,
+              ...op.fields,
+              name: op.fields.name!,
+              unit: op.fields.unit ?? 'pcs',
+              ...(op.categories ? { categories: { connect: cats(op.categories) } } : {}),
+            },
             select: { id: true },
           })
         : this.prisma.product.update({
             where: { id: op.id },
-            data: op.data,
+            data: {
+              ...op.fields,
+              // A categories column replaces the product's categories; no
+              // column leaves them alone.
+              ...(op.categories ? { categories: { set: cats(op.categories) } } : {}),
+            },
             select: { id: true },
           });
 

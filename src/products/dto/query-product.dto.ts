@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
 /**
@@ -76,4 +76,14 @@ export class QueryProductDto extends PaginationDto {
   @QueryBoolean()
   @IsBoolean()
   trackSerials?: boolean;
+
+  @ApiPropertyOptional({
+    enum: ['expired', 'soon'],
+    description:
+      'expired: the product, or stock in one of its batches, is past its expiry date. ' +
+      'soon: expires within 30 days and not yet expired. Batches count at `storeId` when given.',
+  })
+  @IsOptional()
+  @IsIn(['expired', 'soon'])
+  expiry?: 'expired' | 'soon';
 }

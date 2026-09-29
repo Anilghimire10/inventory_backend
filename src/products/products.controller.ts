@@ -14,8 +14,8 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiTags } from '@nestjs/swagger';
-import { ArrayNotEmpty, ArrayUnique, IsArray, IsString, MaxLength } from 'class-validator';
+import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
+import { ArrayNotEmpty, ArrayUnique, IsArray, IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -44,6 +44,11 @@ export class ImportProductsDto {
   @ApiProperty({ type: [Object], description: 'Rows parsed from a CSV/Excel file' })
   @IsArray()
   items: Record<string, unknown>[];
+
+  @ApiPropertyOptional({ description: 'Check the file and say what would happen, without saving anything' })
+  @IsOptional()
+  @IsBoolean()
+  dryRun?: boolean;
 }
 
 @ApiTags('products')
@@ -78,7 +83,7 @@ export class ProductsController {
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
   @Post('import')
   importProducts(@CurrentUser() u: AuthUser, @Body() dto: ImportProductsDto) {
-    return this.products.bulkImport(u.businessId, dto.items);
+    return this.products.bulkImport(u.businessId, dto.items, { dryRun: dto.dryRun });
   }
 
   /** Export every product as flat rows for CSV download. */
