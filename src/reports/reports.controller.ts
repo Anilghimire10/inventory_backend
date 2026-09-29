@@ -30,20 +30,14 @@ export class ReportsController {
   // Financial reports & analytics are management-level.
   @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get('sales-summary')
-  salesSummary(
-    @CurrentUser() u: AuthUser,
-    @Query() { from, to, storeId }: ReportRangeDto,
-  ) {
-    return this.reports.salesSummary(u.businessId, { from, to, storeId });
+  async salesSummary(@CurrentUser() u: AuthUser, @Query() q: ReportRangeDto) {
+    return this.reports.salesSummary(u.businessId, await this.reports.resolveRange(u.businessId, q));
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get('tax')
-  taxReport(
-    @CurrentUser() u: AuthUser,
-    @Query() { from, to, storeId }: ReportRangeDto,
-  ) {
-    return this.reports.taxReport(u.businessId, { from, to, storeId });
+  async taxReport(@CurrentUser() u: AuthUser, @Query() q: ReportRangeDto) {
+    return this.reports.taxReport(u.businessId, await this.reports.resolveRange(u.businessId, q));
   }
 
   /**
@@ -60,10 +54,7 @@ export class ReportsController {
 
   @Roles(UserRole.OWNER, UserRole.MANAGER)
   @Get('analytics')
-  analytics(
-    @CurrentUser() u: AuthUser,
-    @Query() { from, to, storeId }: ReportRangeDto,
-  ) {
-    return this.reports.analytics(u.businessId, { from, to, storeId });
+  async analytics(@CurrentUser() u: AuthUser, @Query() q: ReportRangeDto) {
+    return this.reports.analytics(u.businessId, await this.reports.resolveRange(u.businessId, q));
   }
 }

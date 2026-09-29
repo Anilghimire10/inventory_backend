@@ -1,6 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import {
+  AdjustmentReason,
+  CashMovementReason,
+  CashMovementType,
   PaymentMethod,
+  PaymentType,
   Prisma,
   SaleStatus,
   StockMovementType,
@@ -134,6 +138,25 @@ export class ReportsService {
    * against each other -- a rollup that filtered differently from the totals
    * it sits beside would be the hardest kind of bug to spot on a chart.
    */
+  /**
+   * The instants a report covers. Calendar days (`fromDay` / `toDay`) are
+   * cut on the shop's own clock and win over raw `from` / `to` instants, so
+   * the range and the per-day buckets inside it agree on where a day starts.
+   */
+  async resolveRange(
+    businessId: string,
+    q: { from?: string; to?: string; fromDay?: string; toDay?: string; storeId?: string },
+  ): Promise<{ from?: string; to?: string; storeId?: string }> {
+    if (!q.fromDay && !q.toDay) return { from: q.from, to: q.to, storeId: q.storeId };
+    const tz = await this.timezone(businessId);
+    return {
+      storeId: q.storeId,
+      from: q.fromDay ? startOfDayKey(tz, q.fromDay).toISOString() : q.from,
+      // The last millisecond of `toDay`: the next local midnight, less one.
+      to: q.toDay ? new Date(startOfDayKey(tz, addDays(q.toDay, 1)).getTime() - 1).toISOString() : q.to,
+    };
+  }
+
   private saleFilterSql(
     businessId: string,
     opts: { storeId?: string; from?: string; to?: string },
@@ -828,7 +851,7 @@ export class ReportsService {
     const unattributedSales = staffSaleRows.find((r) => r.userId === null);
 
     // Inventory performance (across the selected period)
-    const [inventoryValue, onHand, movements, needs] = await Promise.all([
+    const [inventoryValue, onHand, movements, needs, leaks, byStore] = await Promise.all([
       this.inventoryValue(businessId, opts.storeId),
       this.prisma.stockItem.aggregate({
         where: { businessId, ...(opts.storeId ? { storeId: opts.storeId } : {}) },
@@ -836,6 +859,8 @@ export class ReportsService {
       }),
       this.stockMovementDaily(businessId, opts.storeId, tz, from, to),
       this.needsAttention(businessId, opts.storeId),
+      this.moneyLeaks(businessId, opts),
+      opts.storeId ? Promise.resolve([]) : this.byStore(businessId, opts),
     ]);
     const totalUnits = byProduct.reduce((s, p) => s + p.quantitySold, 0);
     const stockTurnover =
@@ -851,6 +876,25 @@ export class ReportsService {
         ? round2((totalUnits / (totalUnits + onHandUnits)) * 100)
         : 0;
 
+    // Days of stock left at this period's selling pace: stock at cost over
+    // the cost of goods sold per day. Unlike turnover, it doesn't change with
+    // the length of the range picked. "All time" measures its pace from the
+    // first day with a sale. Null when nothing sold -- no pace to measure.
+    const firstDay = byDay.find((d) => d.count > 0)?.date;
+    const rangeDays =
+      from && to
+        ? Math.max(Math.ceil((new Date(to).getTime() - new Date(from).getTime()) / 86_400_000), 1)
+        : firstDay
+          ? Math.max(Math.ceil((Date.now() - startOfDayKey(tz, firstDay).getTime()) / 86_400_000), 1)
+          : 0;
+    const dailyCost = rangeDays > 0 ? cost / rangeDays : 0;
+    const daysOfCover = dailyCost > 0 ? Math.round(inventoryValue / dailyCost) : null;
+
+    // What the shop actually kept: gross profit, less till expenses and the
+    // cost of stock written off. Discounts and refunds are already out of
+    // revenue (and so of gross profit), so they aren't taken off twice.
+    const netProfit = round2(profit - leaks.expenses.total - leaks.writeOffs.value);
+
     return {
       timezone: tz,
       totals: {
@@ -861,7 +905,12 @@ export class ReportsService {
         profit,
         margin: netRevenue > 0 ? round2((profit / netRevenue) * 100) : 0,
         units: totalUnits,
+        // Sales including tax less net sales: the tax collected on them.
+        tax: round2(bookedRevenue(agg) - netRevenue),
+        netProfit,
       },
+      money: leaks,
+      byStore,
       comparison: prev
         ? {
             revenue: prev.revenue,
@@ -885,6 +934,7 @@ export class ReportsService {
       inventory: {
         value: inventoryValue,
         stockTurnover,
+        daysOfCover,
         sellThrough,
         deadStockValue: round2(needs.deadStockValue),
         deadStockPct: needs.deadStockPct,
@@ -1169,6 +1219,208 @@ export class ReportsService {
    * Daily stock-movement buckets (purchases in, sales out, adjustments net)
    * plus a running closing-stock index for the selected window.
    */
+  /**
+   * Where money goes between the shelf and the bank, for the period:
+   *
+   * - discounts given at the till, in total and by who gave them;
+   * - refunds: cash handed back on returns (a return on a credit sale cancels
+   *   the debt instead, so it isn't here), and units taken back;
+   * - write-offs: stock taken off the shelf by hand as damaged, expired,
+   *   stolen, missing at a count or otherwise -- valued at today's cost
+   *   price, since a movement doesn't record what the unit cost;
+   * - expenses paid out of the till (Cash in/out, reason Expense), and owner
+   *   drawings, which are shown but aren't a cost.
+   */
+  private async moneyLeaks(businessId: string, opts: { storeId?: string; from?: string; to?: string }) {
+    const filter = this.saleFilterSql(businessId, opts);
+    const within = (col: Prisma.Sql) => Prisma.sql`
+      ${opts.from ? Prisma.sql`AND ${col} >= ${utcBound(new Date(opts.from))}` : Prisma.empty}
+      ${opts.to ? Prisma.sql`AND ${col} <= ${utcBound(new Date(opts.to))}` : Prisma.empty}`;
+    const store = (col: Prisma.Sql) => (opts.storeId ? Prisma.sql`AND ${col} = ${opts.storeId}` : Prisma.empty);
+
+    const [discountRows, refundRows, returnRows, lossRows, cashRows] = await Promise.all([
+      // Line and bill discounts together, per person who rang the sale.
+      this.prisma.$queryRaw<
+        {
+          userId: string | null;
+          name: string | null;
+          amount: Prisma.Decimal | null;
+          discounted: bigint;
+          sales: bigint;
+          rung: Prisma.Decimal | null;
+        }[]
+      >`
+        SELECT s."userId" AS "userId", u.name AS name,
+               SUM(s.discount + COALESCE(l.d, 0))                          AS amount,
+               COUNT(*) FILTER (WHERE s.discount > 0 OR COALESCE(l.d, 0) > 0) AS discounted,
+               COUNT(*)                                                     AS sales,
+               SUM(s.total)                                                 AS rung
+        FROM "Sale" s
+        LEFT JOIN LATERAL (
+          SELECT SUM(si.discount) AS d FROM "SaleItem" si WHERE si."saleId" = s.id
+        ) l ON TRUE
+        LEFT JOIN "User" u ON u.id = s."userId"
+        WHERE ${filter}
+        GROUP BY 1, 2
+      `,
+      this.prisma.$queryRaw<{ amount: Prisma.Decimal | null; count: bigint }[]>`
+        SELECT SUM(pm.amount) AS amount, COUNT(*) AS count
+        FROM "Payment" pm
+        WHERE pm."businessId" = ${businessId}
+          AND pm.type = ${PaymentType.REFUND}::"PaymentType"
+          ${store(Prisma.sql`pm."storeId"`)}
+          ${within(Prisma.sql`pm."createdAt"`)}
+      `,
+      this.prisma.$queryRaw<{ units: Prisma.Decimal | null; sales: bigint }[]>`
+        SELECT SUM(m.quantity) AS units, COUNT(DISTINCT m.reference) AS sales
+        FROM "StockMovement" m
+        WHERE m."businessId" = ${businessId}
+          AND m.type = ${StockMovementType.RETURN_IN}::"StockMovementType"
+          ${store(Prisma.sql`m."storeId"`)}
+          ${within(Prisma.sql`m."createdAt"`)}
+      `,
+      this.prisma.$queryRaw<{ reason: AdjustmentReason | null; units: Prisma.Decimal | null; value: Prisma.Decimal | null }[]>`
+        SELECT m.reason AS reason,
+               SUM(-m.quantity)                 AS units,
+               SUM(-m.quantity * p."costPrice") AS value
+        FROM "StockMovement" m
+        JOIN "Product" p ON p.id = m."productId"
+        WHERE m."businessId" = ${businessId}
+          AND m.type = ${StockMovementType.ADJUSTMENT}::"StockMovementType"
+          AND m.quantity < 0
+          ${store(Prisma.sql`m."storeId"`)}
+          ${within(Prisma.sql`m."createdAt"`)}
+        GROUP BY 1
+      `,
+      this.prisma.$queryRaw<{ reason: CashMovementReason; amount: Prisma.Decimal | null; count: bigint }[]>`
+        SELECT cm.reason AS reason, SUM(cm.amount) AS amount, COUNT(*) AS count
+        FROM "CashMovement" cm
+        JOIN "Shift" sh ON sh.id = cm."shiftId"
+        WHERE cm."businessId" = ${businessId}
+          AND cm.type = ${CashMovementType.PAY_OUT}::"CashMovementType"
+          AND cm.reason IN (
+            ${CashMovementReason.EXPENSE}::"CashMovementReason",
+            ${CashMovementReason.OWNER_DRAW}::"CashMovementReason"
+          )
+          ${store(Prisma.sql`sh."storeId"`)}
+          ${within(Prisma.sql`cm."createdAt"`)}
+        GROUP BY 1
+      `,
+    ]);
+
+    const byStaff = discountRows
+      .map((r) => {
+        const amount = round2(num(r.amount));
+        const rung = num(r.rung);
+        return {
+          userId: r.userId,
+          name: r.name ?? (r.userId ? 'Unknown user' : 'Not recorded'),
+          amount,
+          discounted: Number(r.discounted),
+          sales: Number(r.sales),
+          // Share of what would have been charged without the discounts.
+          pct: rung + amount > 0 ? round2((amount / (rung + amount)) * 100) : 0,
+        };
+      })
+      .filter((r) => r.amount > 0)
+      .sort((a, b) => b.amount - a.amount);
+    const discountTotal = round2(byStaff.reduce((sum, r) => sum + r.amount, 0));
+    const rungTotal = discountRows.reduce((sum, r) => sum + num(r.rung), 0);
+
+    const writeOffs = lossRows
+      .map((r) => ({ reason: r.reason ?? 'OTHER', units: round2(num(r.units)), value: round2(num(r.value)) }))
+      .filter((r) => r.units > 0)
+      .sort((a, b) => b.value - a.value);
+    const cash = (reason: CashMovementReason) => cashRows.find((r) => r.reason === reason);
+    const sales = discountRows.reduce((n, r) => n + Number(r.sales), 0);
+    const returnedSales = Number(returnRows[0]?.sales ?? 0);
+
+    return {
+      discounts: {
+        total: discountTotal,
+        salesWithDiscount: byStaff.reduce((n, r) => n + r.discounted, 0),
+        pct: rungTotal + discountTotal > 0 ? round2((discountTotal / (rungTotal + discountTotal)) * 100) : 0,
+        byStaff,
+      },
+      refunds: {
+        total: round2(num(refundRows[0]?.amount)),
+        count: Number(refundRows[0]?.count ?? 0),
+        unitsReturned: round2(num(returnRows[0]?.units)),
+        // Returns processed in the period against sales made in it: a rough
+        // return rate, fine for spotting a trend.
+        returnRate: sales > 0 ? round2((returnedSales / sales) * 100) : 0,
+      },
+      writeOffs: {
+        value: round2(writeOffs.reduce((sum, r) => sum + r.value, 0)),
+        units: round2(writeOffs.reduce((sum, r) => sum + r.units, 0)),
+        byReason: writeOffs,
+      },
+      expenses: {
+        total: round2(num(cash(CashMovementReason.EXPENSE)?.amount)),
+        count: Number(cash(CashMovementReason.EXPENSE)?.count ?? 0),
+      },
+      ownerDrawings: round2(num(cash(CashMovementReason.OWNER_DRAW)?.amount)),
+    };
+  }
+
+  /**
+   * Each branch side by side: sales, net sales, gross profit and orders.
+   * Empty for a single-store shop -- there is nothing to compare.
+   */
+  private async byStore(businessId: string, opts: { from?: string; to?: string }) {
+    const stores = await this.prisma.store.findMany({
+      where: { businessId },
+      select: { id: true, name: true, isActive: true },
+    });
+    if (stores.length < 2) return [];
+    const filter = this.saleFilterSql(businessId, opts);
+    const [saleRows, lineRows] = await Promise.all([
+      this.prisma.$queryRaw<{ storeId: string; name: string; orders: bigint; sales: Prisma.Decimal | null }[]>`
+        SELECT s."storeId" AS "storeId", st.name AS name,
+               COUNT(*) AS orders, SUM(s.total - s."refundedTotal") AS sales
+        FROM "Sale" s
+        JOIN "Store" st ON st.id = s."storeId"
+        WHERE ${filter}
+        GROUP BY 1, 2
+      `,
+      this.prisma.$queryRaw<{ storeId: string; revenue: Prisma.Decimal | null; cost: Prisma.Decimal | null }[]>`
+        SELECT s."storeId" AS "storeId", SUM(${LINE_REVENUE}) AS revenue, SUM(${LINE_COST}) AS cost
+        FROM "SaleItem" si
+        JOIN "Sale"    s ON s.id = si."saleId"
+        JOIN "Product" p ON p.id = si."productId"
+        WHERE ${filter} AND ${SOLD_QTY} > 0
+        GROUP BY 1
+      `,
+    ]);
+    const lines = new Map(lineRows.map((r) => [r.storeId, r]));
+    const salesBy = new Map(saleRows.map((r) => [r.storeId, r]));
+    const totalSales = saleRows.reduce((sum, r) => sum + num(r.sales), 0);
+    // Every active branch, and any closed one that still sold in the period:
+    // a branch with nothing rung up is the row most worth seeing.
+    return stores
+      .filter((st) => st.isActive || salesBy.has(st.id))
+      .map((st) => ({ storeId: st.id, name: st.name, orders: 0n, sales: null, ...salesBy.get(st.id) }))
+      .map((r) => {
+        const l = lines.get(r.storeId);
+        const netRevenue = round2(num(l?.revenue));
+        const profit = round2(netRevenue - num(l?.cost));
+        const orders = Number(r.orders);
+        const sales = round2(num(r.sales));
+        return {
+          storeId: r.storeId,
+          name: r.name,
+          sales,
+          netRevenue,
+          profit,
+          margin: netRevenue > 0 ? round2((profit / netRevenue) * 100) : 0,
+          orders,
+          averageBill: orders > 0 ? round2(sales / orders) : 0,
+          share: totalSales > 0 ? round2((sales / totalSales) * 100) : 0,
+        };
+      })
+      .sort((a, b) => b.sales - a.sales);
+  }
+
   private async stockMovementDaily(
     businessId: string,
     storeId: string | undefined,

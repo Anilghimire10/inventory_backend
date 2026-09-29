@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsDateString, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsDateString, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 
 /**
  * The range and branch a report covers.
@@ -18,6 +18,22 @@ export class ReportRangeDto {
   @IsOptional()
   @IsDateString()
   to?: string;
+
+  /**
+   * A calendar day in the shop's own time zone (YYYY-MM-DD). Preferred over
+   * `from`: "today" then means the shop's today, not the browser's -- they
+   * differ for an owner checking in from abroad, or a device set wrong.
+   */
+  @ApiPropertyOptional({ example: '2026-06-01' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'fromDay must be YYYY-MM-DD' })
+  fromDay?: string;
+
+  /** Last calendar day included, in the shop's time zone. */
+  @ApiPropertyOptional({ example: '2026-06-30' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'toDay must be YYYY-MM-DD' })
+  toDay?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
