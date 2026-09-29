@@ -578,6 +578,7 @@ export class PurchasesService {
             businessId,
             productId: item.productId,
             purchaseId: purchase.id,
+            storeId: purchase.storeId,
             quantity: r.quantity,
             serials: r.serials,
           });

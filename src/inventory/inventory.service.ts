@@ -12,7 +12,9 @@ import {
 } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { AdjustStockDto, SetReorderLevelDto } from './dto/adjust-stock.dto';
+import { AdjustStockDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
+import { isExpired, soonCutoff } from '../common/expiry';
+import { readStockRow, type StockRow } from './stock-import';
 import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
   ExpiringDto,
@@ -26,6 +28,39 @@ import { allowsFraction } from '../common/units';
 
 /** Quantities are numeric(12,3); keep JS float arithmetic on that grid. */
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+/** Where a serialised unit is, in words, for error messages and the till. */
+function describeSerial(r: {
+  status: SerialStatus;
+  store?: { name: string } | null;
+  sale?: { receiptNo: string } | null;
+}): string {
+  switch (r.status) {
+    case SerialStatus.IN_STOCK:
+      return r.store ? `in stock at ${r.store.name}` : 'in stock';
+    case SerialStatus.SOLD:
+      return r.sale ? `sold on ${r.sale.receiptNo}` : 'sold';
+    case SerialStatus.RETURNED_TO_SUPPLIER:
+      return 'returned to the supplier';
+    case SerialStatus.DAMAGED:
+      return 'written off as damaged';
+    case SerialStatus.LOST:
+      return 'written off as lost';
+  }
+}
+
+/** What a serialised unit removed by hand becomes. */
+function serialStatusFor(reason: AdjustmentReason): 'DAMAGED' | 'LOST' {
+  return reason === AdjustmentReason.DAMAGE || reason === AdjustmentReason.EXPIRED ? 'DAMAGED' : 'LOST';
+}
+
+const REASON_NOTE: Record<AdjustmentReason, string> = {
+  DAMAGE: 'Damaged',
+  THEFT: 'Stolen or lost',
+  COUNT_CORRECTION: 'Count correction',
+  EXPIRED: 'Expired',
+  OTHER: 'Removed by hand',
+};
 
 /** A Prisma client or an active transaction client. */
 type Db = PrismaClient | Prisma.TransactionClient;
@@ -242,22 +277,228 @@ export class InventoryService {
   }
 
   /** Manual stock adjustment (damage, count correction, etc.). */
+  /**
+   * A manual stock change. For a serialised product the units must be named:
+   * added ones go on file as in stock, removed ones come off it -- DAMAGED
+   * for damage or expiry, LOST otherwise -- so the serial list and the count
+   * move together.
+   */
   async adjust(businessId: string, userId: string, dto: AdjustStockDto) {
     await this.assertStoreAndProduct(businessId, dto.storeId, dto.productId);
-    return this.prisma.$transaction(
-      (tx) =>
-        this.applyMovement(tx, {
-          businessId,
-          storeId: dto.storeId,
-          productId: dto.productId,
-          type: StockMovementType.ADJUSTMENT,
-          quantity: dto.delta,
-          reason: dto.reason,
-          note: dto.note,
-          userId,
-        }),
-      TX_OPTS,
+    const product = await this.prisma.product.findUnique({
+      where: { id: dto.productId },
+      select: { name: true, trackSerials: true },
+    });
+    const serials = InventoryService.checkSerials(
+      { name: product!.name, trackSerials: product!.trackSerials },
+      Math.abs(dto.delta),
+      dto.serials,
     );
+    return this.prisma.$transaction(async (tx) => {
+      const moved = await this.applyMovement(tx, {
+        businessId,
+        storeId: dto.storeId,
+        productId: dto.productId,
+        type: StockMovementType.ADJUSTMENT,
+        quantity: dto.delta,
+        reason: dto.reason,
+        note: dto.note,
+        userId,
+      });
+      if (serials.length) {
+        const unit = { businessId, storeId: dto.storeId, productId: dto.productId, serials };
+        if (dto.delta > 0) {
+          await this.receiveSerials(tx, { ...unit, note: dto.note ?? 'Added by hand', allowLost: true });
+        } else {
+          await this.removeSerials(tx, {
+            ...unit,
+            status: serialStatusFor(dto.reason),
+            note: dto.note ?? REASON_NOTE[dto.reason],
+          });
+        }
+      }
+      return moved;
+    }, TX_OPTS);
+  }
+
+  /**
+   * Opening stock from a spreadsheet: each row adds a quantity of one product
+   * at one branch -- with its batch and expiry, and its serial numbers for a
+   * serialised product -- the way stock counted on day one gets into the app.
+   *
+   * Everything is checked first (`dryRun` stops there): the product, the
+   * branch, whole units where they must be, one serial per unit and none
+   * already on file. Then each good row is posted on its own, so one row
+   * failing doesn't lose the rest; failures come back by row.
+   */
+  async importStock(
+    businessId: string,
+    userId: string,
+    items: Record<string, unknown>[],
+    opts: { dryRun?: boolean; storeId?: string } = {},
+  ) {
+    if (items.length > 5000) throw new BadRequestException('Import is limited to 5000 rows at a time');
+    const errors: { row: number; error: string }[] = [];
+    const stores = await this.prisma.store.findMany({ where: { businessId }, select: { id: true, name: true } });
+    const rows: { row: number; data: StockRow }[] = [];
+    items.forEach((it, i) => {
+      try {
+        rows.push({ row: i + 1, data: readStockRow(it) });
+      } catch (e) {
+        errors.push({ row: i + 1, error: (e as Error).message });
+      }
+    });
+
+    // Products, one query: by SKU, barcode or exact name.
+    const pick = (f: (d: StockRow) => string | null) => [...new Set(rows.map((r) => f(r.data)).filter((v): v is string => !!v))];
+    const skus = pick((d) => d.sku);
+    const barcodes = pick((d) => (d.sku ? null : d.barcode));
+    const names = pick((d) => (d.sku || d.barcode ? null : d.name));
+    const products = await this.prisma.product.findMany({
+      where: {
+        businessId,
+        OR: [
+          ...(skus.length ? [{ sku: { in: skus } }] : []),
+          ...(barcodes.length ? [{ barcode: { in: barcodes } }] : []),
+          ...(names.length ? [{ name: { in: names, mode: 'insensitive' as const } }] : []),
+        ],
+      },
+      select: { id: true, name: true, sku: true, barcode: true, unit: true, trackBatches: true, trackSerials: true, costPrice: true },
+    });
+    const bySku = new Map(products.filter((p) => p.sku).map((p) => [p.sku!, p]));
+    const byBarcode = new Map(products.filter((p) => p.barcode).map((p) => [p.barcode!, p]));
+    const byName = new Map<string, typeof products>();
+    for (const p of products) {
+      const k = p.name.toLowerCase();
+      byName.set(k, [...(byName.get(k) ?? []), p]);
+    }
+    const storeByName = new Map(stores.map((s) => [s.name.toLowerCase(), s.id]));
+    const defaultStore = opts.storeId && stores.some((s) => s.id === opts.storeId) ? opts.storeId : stores.length === 1 ? stores[0].id : null;
+
+    // Serials already on file, and repeated within the file.
+    const allSerials = rows.flatMap((r) => r.data.serials);
+    const onFile = allSerials.length
+      ? new Set(
+          (
+            await this.prisma.serial.findMany({
+              where: { businessId, serialNumber: { in: allSerials } },
+              select: { serialNumber: true },
+            })
+          ).map((s) => s.serialNumber),
+        )
+      : new Set<string>();
+    const seenSerials = new Set<string>();
+
+    type Plan = {
+      row: number;
+      product: (typeof products)[number];
+      storeId: string;
+      quantity: number;
+      cost: number | null;
+      batchNumber: string | null;
+      expiryDate: Date | null;
+      serials: string[];
+    };
+    const plans: Plan[] = [];
+    for (const { row, data: d } of rows) {
+      try {
+        const product = d.sku
+          ? bySku.get(d.sku)
+          : d.barcode
+            ? byBarcode.get(d.barcode)
+            : (() => {
+                const found = byName.get(d.name!.toLowerCase()) ?? [];
+                if (found.length > 1) throw new Error(`More than one product is called "${d.name}" — use its SKU`);
+                return found[0];
+              })();
+        if (!product) throw new Error(`No product with ${d.sku ? `SKU "${d.sku}"` : d.barcode ? `barcode "${d.barcode}"` : `the name "${d.name}"`}`);
+
+        const storeId = d.store ? storeByName.get(d.store.toLowerCase()) : defaultStore;
+        if (!storeId) {
+          throw new Error(d.store ? `No branch called "${d.store}"` : 'Say which branch (Store column), or pick one before importing');
+        }
+        if (!allowsFraction(product.unit) && !Number.isInteger(d.quantity)) {
+          throw new Error(`${product.name} is counted in whole ${product.unit}; quantity ${d.quantity} isn't`);
+        }
+        if (product.trackSerials) {
+          InventoryService.checkSerials(product, d.quantity, d.serials);
+          for (const n of d.serials) {
+            if (onFile.has(n)) throw new Error(`Serial "${n}" is already on file`);
+            if (seenSerials.has(n)) throw new Error(`Serial "${n}" appears twice in the file`);
+          }
+          d.serials.forEach((n) => seenSerials.add(n));
+        } else if (d.serials.length) {
+          throw new Error(`${product.name} isn't tracked by serial number — leave Serials blank`);
+        }
+        if (!product.trackBatches && d.batchNumber) {
+          throw new Error(`${product.name} isn't tracked by batch — leave Batch blank`);
+        }
+        plans.push({ row, product, storeId, quantity: d.quantity, cost: d.cost, batchNumber: d.batchNumber, expiryDate: d.expiryDate, serials: d.serials });
+      } catch (e) {
+        errors.push({ row, error: (e as Error).message });
+      }
+    }
+
+    const units = round3(plans.reduce((n, p) => n + p.quantity, 0));
+    if (opts.dryRun) {
+      errors.sort((a, b) => a.row - b.row);
+      return { dryRun: true, rows: plans.length, units, errors };
+    }
+
+    let imported = 0;
+    for (const p of plans) {
+      try {
+        await this.prisma.$transaction(async (tx) => {
+          await this.applyMovement(tx, {
+            businessId,
+            storeId: p.storeId,
+            productId: p.product.id,
+            type: StockMovementType.ADJUSTMENT,
+            quantity: p.quantity,
+            reason: AdjustmentReason.OTHER,
+            note: 'Opening stock (import)',
+            userId,
+          });
+          if (p.product.trackBatches) {
+            await tx.batch.create({
+              data: {
+                businessId,
+                storeId: p.storeId,
+                productId: p.product.id,
+                batchNumber: p.batchNumber,
+                expiryDate: p.expiryDate,
+                quantity: String(p.quantity),
+                costPrice: p.cost ?? undefined,
+              },
+            });
+          }
+          if (p.serials.length) {
+            await this.receiveSerials(tx, {
+              businessId,
+              storeId: p.storeId,
+              productId: p.product.id,
+              serials: p.serials,
+              note: 'Opening stock',
+            });
+          }
+          // A product with no cost on file takes the one in the sheet, so
+          // its profit isn't counted as the whole sale price; one without
+          // batches keeps an expiry date on the product itself.
+          const productUpdate = {
+            ...(p.cost != null && Number(p.product.costPrice) === 0 ? { costPrice: p.cost } : {}),
+            ...(!p.product.trackBatches && p.expiryDate ? { expiryDate: p.expiryDate } : {}),
+          };
+          if (Object.keys(productUpdate).length) {
+            await tx.product.update({ where: { id: p.product.id }, data: productUpdate });
+          }
+        }, TX_OPTS);
+        imported++;
+      } catch (e) {
+        errors.push({ row: p.row, error: (e as Error).message });
+      }
+    }
+    errors.sort((a, b) => a.row - b.row);
+    return { imported, units, errors };
   }
 
   async setReorderLevel(businessId: string, dto: SetReorderLevelDto) {
@@ -291,7 +532,7 @@ export class InventoryService {
         take: q.limit,
         include: {
           product: {
-            select: { id: true, name: true, sku: true, unit: true, reorderLevel: true },
+            select: { id: true, name: true, sku: true, unit: true, reorderLevel: true, trackSerials: true },
           },
           store: { select: { id: true, name: true } },
         },
@@ -394,13 +635,11 @@ export class InventoryService {
   // ---- Serial / IMEI tracking ----
   //
   // Serial rows say *which* units are on the shelf; StockItem still owns the
-  // count. The two are kept in step on every path that knows about specific
-  // units (receive, sell, both kinds of return, transfer).
-  //
-  // ponytail: a manual adjustment or a stock take moves the count without
-  // naming units, so those leave the serial list untouched and it can drift
-  // from the StockItem balance. Reconcile against this list if that turns
-  // into a real problem in the shop.
+  // count. The two are kept in step on every path that moves stock: receive,
+  // sell, both kinds of return, transfer, manual adjustment and stock take.
+  // The last two used to move the count without naming units, so a unit
+  // added by hand could never be sold (it had no serial on file) and one
+  // removed by hand stayed listed as in stock.
 
   /**
    * Validate the serials supplied for one line against its quantity and hand
@@ -438,15 +677,24 @@ export class InventoryService {
     return cleaned;
   }
 
-  /** Book received units into stock. Rejects a serial already on file. */
+  /**
+   * Book units into stock: received on a purchase, or added by hand (an
+   * adjustment or a unit found at a stock take). Rejects a serial already on
+   * file unless it is one that may come back: returned to the supplier (a
+   * repaired swap, a re-delivery) or -- for stock added by hand -- one
+   * written off as lost and since found.
+   */
   async receiveSerials(
     db: Db,
     input: {
       businessId: string;
       storeId: string;
       productId: string;
-      purchaseId: string;
+      purchaseId?: string | null;
       serials: string[];
+      note?: string | null;
+      /** Also bring back units marked LOST. Hand-added stock only. */
+      allowLost?: boolean;
     },
   ) {
     if (!input.serials.length) return;
@@ -455,14 +703,14 @@ export class InventoryService {
         businessId: input.businessId,
         serialNumber: { in: input.serials },
       },
-      select: { id: true, serialNumber: true, status: true },
+      select: { id: true, serialNumber: true, status: true, store: { select: { name: true } } },
     });
-    // A unit sent back to the supplier can legitimately come back (a repaired
-    // swap, a re-delivery); anything still in stock or sold is a mis-scan.
-    const live = known.find((k) => k.status !== SerialStatus.RETURNED_TO_SUPPLIER);
+    const mayReturn = (st: SerialStatus) =>
+      st === SerialStatus.RETURNED_TO_SUPPLIER || (!!input.allowLost && st === SerialStatus.LOST);
+    const live = known.find((k) => !mayReturn(k.status));
     if (live) {
       throw new BadRequestException(
-        `Serial number "${live.serialNumber}" is already on file`,
+        `Serial number "${live.serialNumber}" is already on file (${describeSerial(live)})`,
       );
     }
     if (known.length) {
@@ -472,9 +720,10 @@ export class InventoryService {
           status: SerialStatus.IN_STOCK,
           storeId: input.storeId,
           productId: input.productId,
-          purchaseId: input.purchaseId,
+          purchaseId: input.purchaseId ?? null,
           saleId: null,
           soldAt: null,
+          note: input.note ?? null,
         },
       });
     }
@@ -486,10 +735,105 @@ export class InventoryService {
         businessId: input.businessId,
         productId: input.productId,
         storeId: input.storeId,
-        purchaseId: input.purchaseId,
+        purchaseId: input.purchaseId ?? null,
         serialNumber,
+        note: input.note ?? null,
       })),
     });
+  }
+
+  /**
+   * Take named units off the shelf without a sale: DAMAGED (damage, expiry)
+   * or LOST (theft, a count correction, missing at a stock take). Each must
+   * be in stock at this store; the error names any that aren't.
+   */
+  async removeSerials(
+    db: Db,
+    input: {
+      businessId: string;
+      storeId: string;
+      productId: string;
+      serials: string[];
+      status: 'DAMAGED' | 'LOST';
+      note?: string | null;
+    },
+  ) {
+    if (!input.serials.length) return;
+    await this.assertInStockHere(db, input);
+    await db.serial.updateMany({
+      where: {
+        businessId: input.businessId,
+        productId: input.productId,
+        storeId: input.storeId,
+        serialNumber: { in: input.serials },
+        status: SerialStatus.IN_STOCK,
+      },
+      data: { status: input.status, note: input.note ?? null },
+    });
+  }
+
+  /**
+   * Throw, naming the first serial that isn't in stock at this store for this
+   * product, and saying where it is instead -- "sold on INV-000123", "at the
+   * Lalitpur branch", "not on file". Called when a bulk update came up short
+   * (or before one), so the cashier knows which scan to fix.
+   */
+  private async assertInStockHere(
+    db: Db,
+    input: { businessId: string; storeId: string; productId: string; serials: string[] },
+  ) {
+    const rows = await db.serial.findMany({
+      where: { businessId: input.businessId, serialNumber: { in: input.serials } },
+      select: {
+        serialNumber: true,
+        status: true,
+        productId: true,
+        storeId: true,
+        store: { select: { name: true } },
+        sale: { select: { receiptNo: true } },
+        product: { select: { name: true } },
+      },
+    });
+    const byNumber = new Map(rows.map((r) => [r.serialNumber, r]));
+    for (const n of input.serials) {
+      const r = byNumber.get(n);
+      if (!r) throw new BadRequestException(`Serial number "${n}" is not on file`);
+      if (r.productId !== input.productId) {
+        throw new BadRequestException(`Serial number "${n}" belongs to ${r.product.name}`);
+      }
+      if (r.status !== SerialStatus.IN_STOCK || r.storeId !== input.storeId) {
+        throw new BadRequestException(`Serial number "${n}" is not in stock here (${describeSerial(r)})`);
+      }
+    }
+  }
+
+  /** The in-stock serial numbers of one product at one store, oldest first. */
+  async inStockSerials(businessId: string, storeId: string, productId: string) {
+    const rows = await this.prisma.serial.findMany({
+      where: { businessId, storeId, productId, status: SerialStatus.IN_STOCK },
+      select: { serialNumber: true },
+      orderBy: { createdAt: 'asc' },
+      take: 1000,
+    });
+    return rows.map((r) => r.serialNumber);
+  }
+
+  /** One serial number, wherever it is: for scanning an IMEI at the till. */
+  async lookupSerial(businessId: string, serialNumber: string) {
+    const r = await this.prisma.serial.findUnique({
+      where: { businessId_serialNumber: { businessId, serialNumber: serialNumber.trim() } },
+      select: {
+        serialNumber: true,
+        status: true,
+        productId: true,
+        storeId: true,
+        store: { select: { id: true, name: true } },
+        sale: { select: { id: true, receiptNo: true } },
+        product: { select: { id: true, name: true } },
+      },
+    });
+    if (!r) throw new NotFoundException('No unit with that serial number');
+    return { ...r, where: describeSerial(r) };
   }
 
   /**
@@ -522,9 +866,8 @@ export class InventoryService {
       },
     });
     if (res.count !== input.serials.length) {
-      throw new BadRequestException(
-        'One or more serial numbers are not in stock at this store',
-      );
+      await this.assertInStockHere(db, input);
+      throw new BadRequestException('One or more serial numbers are not in stock at this store');
     }
   }
 
@@ -609,6 +952,8 @@ export class InventoryService {
       businessId: string;
       productId: string;
       purchaseId: string;
+      /** The purchase's store: the count goes down there, so the units must be there. */
+      storeId: string;
       quantity: number;
       serials?: string[];
     },
@@ -618,6 +963,7 @@ export class InventoryService {
       productId: input.productId,
       status: SerialStatus.IN_STOCK,
       purchaseId: input.purchaseId,
+      storeId: input.storeId,
       quantity: input.quantity,
       serials: input.serials,
     });
@@ -628,7 +974,10 @@ export class InventoryService {
     });
   }
 
-  /** Follow a store transfer with the units themselves. */
+  /**
+   * Follow a store transfer with the units themselves: the ones named (the
+   * handsets actually put in the box), or the oldest on file when none are.
+   */
   async moveSerials(
     db: Db,
     input: {
@@ -637,8 +986,34 @@ export class InventoryService {
       fromStoreId: string;
       toStoreId: string;
       quantity: number;
+      serials?: string[];
     },
   ) {
+    const named = (input.serials ?? []).map((v) => v.trim()).filter(Boolean);
+    if (named.length) {
+      if (named.length !== input.quantity || new Set(named).size !== named.length) {
+        throw new BadRequestException(
+          `Transferring ${input.quantity} unit(s) needs ${input.quantity} different serial number(s), got ${named.length}`,
+        );
+      }
+      await this.assertInStockHere(db, {
+        businessId: input.businessId,
+        storeId: input.fromStoreId,
+        productId: input.productId,
+        serials: named,
+      });
+      await db.serial.updateMany({
+        where: {
+          businessId: input.businessId,
+          productId: input.productId,
+          storeId: input.fromStoreId,
+          status: SerialStatus.IN_STOCK,
+          serialNumber: { in: named },
+        },
+        data: { storeId: input.toStoreId },
+      });
+      return;
+    }
     const units = await db.serial.findMany({
       where: {
         businessId: input.businessId,
@@ -673,6 +1048,7 @@ export class InventoryService {
       status: SerialStatus;
       saleId?: string;
       purchaseId?: string;
+      storeId?: string;
       quantity: number;
       serials?: string[];
     },
@@ -683,6 +1059,7 @@ export class InventoryService {
       status: input.status,
       ...(input.saleId ? { saleId: input.saleId } : {}),
       ...(input.purchaseId ? { purchaseId: input.purchaseId } : {}),
+      ...(input.storeId ? { storeId: input.storeId } : {}),
     };
     const named = (input.serials ?? []).map((v) => v.trim()).filter(Boolean);
     if (named.length) {
@@ -751,23 +1128,127 @@ export class InventoryService {
     return paginate(data, total, q.page, q.limit);
   }
 
+  /**
+   * Stock that has expired or expires within `days`, soonest first: batches
+   * that still hold stock, and stock of products whose own expiry date (set
+   * on the product, no batches) falls in the window. Product-level rows get a
+   * stable synthetic id, `product:<storeId>:<productId>`, so alerts can
+   * dedupe on it like a batch id.
+   */
   async expiringBatches(businessId: string, q: ExpiringDto) {
-    // Caller passes the cutoff via days; compared against now at query time.
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() + q.days);
-    return this.prisma.batch.findMany({
-      where: {
-        businessId,
-        ...(q.storeId ? { storeId: q.storeId } : {}),
-        quantity: { gt: 0 },
-        expiryDate: { not: null, lte: cutoff },
-      },
-      include: {
-        product: { select: { id: true, name: true, sku: true } },
-        store: { select: { id: true, name: true } },
-      },
-      orderBy: { expiryDate: 'asc' },
-    });
+    const now = new Date();
+    const cutoff = soonCutoff(now, q.days);
+    const [batches, productStock] = await Promise.all([
+      this.prisma.batch.findMany({
+        where: {
+          businessId,
+          ...(q.storeId ? { storeId: q.storeId } : {}),
+          quantity: { gt: 0 },
+          expiryDate: { not: null, lte: cutoff },
+        },
+        include: {
+          product: { select: { id: true, name: true, sku: true } },
+          store: { select: { id: true, name: true } },
+        },
+        orderBy: { expiryDate: 'asc' },
+      }),
+      this.prisma.stockItem.findMany({
+        where: {
+          businessId,
+          ...(q.storeId ? { storeId: q.storeId } : {}),
+          quantity: { gt: 0 },
+          product: { isActive: true, expiryDate: { not: null, lte: cutoff } },
+        },
+        select: {
+          storeId: true,
+          productId: true,
+          quantity: true,
+          product: { select: { id: true, name: true, sku: true, expiryDate: true } },
+          store: { select: { id: true, name: true } },
+        },
+      }),
+    ]);
+    const rows = [
+      ...batches.map((b) => ({
+        ...b,
+        source: 'batch' as const,
+        expired: isExpired(b.expiryDate, now),
+      })),
+      ...productStock.map(({ product: { expiryDate, ...product }, ...s }) => ({
+        id: `product:${s.storeId}:${s.productId}`,
+        source: 'product' as const,
+        storeId: s.storeId,
+        productId: s.productId,
+        batchNumber: null,
+        expiryDate,
+        quantity: s.quantity,
+        product,
+        store: s.store,
+        expired: isExpired(expiryDate, now),
+      })),
+    ];
+    return rows.sort((a, b) => a.expiryDate!.getTime() - b.expiryDate!.getTime());
+  }
+
+  /**
+   * Take expired stock off the shelf in one step: an EXPIRED adjustment for
+   * what's left, and -- for a batch -- the batch emptied too. A plain
+   * adjustment leaves the batch holding its quantity, so it stayed on the
+   * Expiring list and kept being counted as expired stock.
+   *
+   * Only stock that really has expired: a date still ahead is refused, so
+   * this can't be used to write off good stock by mistake.
+   */
+  async writeOffExpired(businessId: string, userId: string, dto: WriteOffExpiredDto) {
+    await this.assertStoreAndProduct(businessId, dto.storeId, dto.productId);
+    return this.prisma.$transaction(async (tx) => {
+      const item = await tx.stockItem.findUnique({
+        where: { storeId_productId: { storeId: dto.storeId, productId: dto.productId } },
+        select: { quantity: true },
+      });
+      const onHand = Number(item?.quantity ?? 0);
+      let qty: number;
+      let note: string;
+      if (dto.batchId) {
+        const batch = await tx.batch.findFirst({
+          where: { id: dto.batchId, businessId, storeId: dto.storeId, productId: dto.productId },
+        });
+        if (!batch) throw new NotFoundException('Batch not found');
+        if (!isExpired(batch.expiryDate)) throw new BadRequestException('This batch has not expired yet');
+        // Never more than the shelf holds, even if the batch books drifted.
+        qty = round3(Math.min(Number(batch.quantity), onHand));
+        await tx.batch.update({ where: { id: batch.id }, data: { quantity: 0 } });
+        note = `Expired batch${batch.batchNumber ? ` ${batch.batchNumber}` : ''} written off`;
+      } else {
+        const product = await tx.product.findUnique({
+          where: { id: dto.productId },
+          select: { expiryDate: true, trackSerials: true },
+        });
+        if (!isExpired(product?.expiryDate)) throw new BadRequestException('This product has not expired yet');
+        qty = round3(onHand);
+        note = 'Expired stock written off';
+        // Every unit here is going: take them off the serial list as well.
+        if (product?.trackSerials) {
+          await tx.serial.updateMany({
+            where: { businessId, storeId: dto.storeId, productId: dto.productId, status: SerialStatus.IN_STOCK },
+            data: { status: SerialStatus.DAMAGED, note },
+          });
+        }
+      }
+      if (qty > 0) {
+        await this.applyMovement(tx, {
+          businessId,
+          storeId: dto.storeId,
+          productId: dto.productId,
+          type: StockMovementType.ADJUSTMENT,
+          quantity: -qty,
+          reason: AdjustmentReason.EXPIRED,
+          note,
+          userId,
+        });
+      }
+      return { writtenOff: qty };
+    }, TX_OPTS);
   }
 
   async movements(businessId: string, q: QueryMovementsDto) {
@@ -865,6 +1346,7 @@ export class InventoryService {
           fromStoreId: dto.fromStoreId,
           toStoreId: dto.toStoreId,
           quantity: i.quantity,
+          serials: i.serials,
         });
       }
       const batchLines = dto.items.filter((i) => tracked.has(i.productId));
@@ -901,7 +1383,7 @@ export class InventoryService {
       this.prisma.store.findFirst({ where: { id: dto.storeId, businessId } }),
       this.prisma.product.findMany({
         where: { id: { in: productIds }, businessId },
-        select: { id: true, name: true, sku: true, unit: true },
+        select: { id: true, name: true, sku: true, unit: true, trackSerials: true },
       }),
     ]);
     if (!store) throw new NotFoundException('Store not found');
@@ -909,6 +1391,21 @@ export class InventoryService {
       throw new BadRequestException('One or more products are invalid');
     }
     const productMap = new Map(products.map((p) => [p.id, p]));
+
+    // Serialised products are counted by serial: the list of units found is
+    // the count. Validated up front so a bad list never half-posts.
+    const serialsCounted = new Map<string, string[]>();
+    for (const c of dto.counts) {
+      const p = productMap.get(c.productId)!;
+      if (c.serials === undefined) continue;
+      const list = InventoryService.checkSerials(p, c.serials.length, c.serials);
+      if (list.length !== c.counted) {
+        throw new BadRequestException(
+          `"${p.name}": counted ${c.counted}, but ${list.length} serial number(s) listed`,
+        );
+      }
+      serialsCounted.set(c.productId, list);
+    }
 
     const variances = async (db: Db) => {
       const current = await db.stockItem.findMany({
@@ -919,6 +1416,7 @@ export class InventoryService {
       return dto.counts.map((c) => {
         const system = have.get(c.productId) ?? 0;
         const p = productMap.get(c.productId)!;
+        const variance = round3(c.counted - system);
         return {
           productId: c.productId,
           name: p.name,
@@ -926,7 +1424,10 @@ export class InventoryService {
           unit: p.unit,
           system,
           counted: c.counted,
-          variance: round3(c.counted - system),
+          variance,
+          // A serialised product whose count changed has to say which units:
+          // the review screen asks for them before it can be posted.
+          needsSerials: p.trackSerials && variance !== 0 && !serialsCounted.has(c.productId),
         };
       });
     };
@@ -949,6 +1450,12 @@ export class InventoryService {
       // mid-count keeps its own deduction (an adjustment is a delta, not an
       // overwrite) -- the count is simply as of the moment it was taken.
       const lines = await variances(tx);
+      const unnamed = lines.find((l) => l.needsSerials);
+      if (unnamed) {
+        throw new BadRequestException(
+          `"${unnamed.name}" is tracked by serial number — tick the units you counted before posting`,
+        );
+      }
       const changed = lines.filter((l) => l.variance !== 0);
       if (changed.length) {
         await this.applyMovementsBatch(
@@ -966,6 +1473,29 @@ export class InventoryService {
           })),
           { allowNegative: true }, // the physical count wins, whatever it says
         );
+      }
+      // Bring the serial list to exactly the units counted: missing ones are
+      // LOST, found ones (not on file, or lost and since found) go in stock.
+      for (const [productId, counted] of serialsCounted) {
+        const onFile = await tx.serial.findMany({
+          where: { businessId, storeId: dto.storeId, productId, status: SerialStatus.IN_STOCK },
+          select: { serialNumber: true },
+        });
+        const have = new Set(onFile.map((r) => r.serialNumber));
+        const seen = new Set(counted);
+        const unit = { businessId, storeId: dto.storeId, productId };
+        await this.removeSerials(tx, {
+          ...unit,
+          serials: [...have].filter((n) => !seen.has(n)),
+          status: 'LOST',
+          note: dto.note ?? 'Missing at stock take',
+        });
+        await this.receiveSerials(tx, {
+          ...unit,
+          serials: counted.filter((n) => !have.has(n)),
+          note: dto.note ?? 'Found at stock take',
+          allowLost: true,
+        });
       }
       return {
         storeId: dto.storeId,
@@ -994,10 +1524,29 @@ export class InventoryService {
         name: true,
         sku: true,
         unit: true,
+        trackSerials: true,
         stockItems: { where: { storeId }, select: { quantity: true } },
       },
       orderBy: { name: 'asc' },
     });
+    // Serialised products are counted by ticking units, so each carries the
+    // serials on file here. One query for the whole store.
+    const units = await this.prisma.serial.findMany({
+      where: {
+        businessId,
+        storeId,
+        status: SerialStatus.IN_STOCK,
+        productId: { in: products.filter((p) => p.trackSerials).map((p) => p.id) },
+      },
+      select: { productId: true, serialNumber: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const unitsByProduct = new Map<string, string[]>();
+    for (const u of units) {
+      const list = unitsByProduct.get(u.productId) ?? [];
+      list.push(u.serialNumber);
+      unitsByProduct.set(u.productId, list);
+    }
     return products.map((p) => ({
       productId: p.id,
       sku: p.sku ?? '',
@@ -1005,6 +1554,8 @@ export class InventoryService {
       unit: p.unit,
       system: Number(p.stockItems[0]?.quantity ?? 0),
       counted: '', // filled in by hand, then posted to /inventory/stock-take
+      trackSerials: p.trackSerials,
+      ...(p.trackSerials ? { serials: unitsByProduct.get(p.id) ?? [] } : {}),
     }));
   }
 

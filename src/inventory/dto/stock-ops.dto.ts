@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
   ArrayMinSize,
   IsArray,
   IsBoolean,
@@ -23,6 +24,14 @@ export class TransferItemDto {
   @IsNumber({ maxDecimalPlaces: 3 })
   @IsPositive()
   quantity: number;
+
+  @ApiPropertyOptional({ type: [String], description: 'Serialised products: the units being moved. Omitted, the oldest on file go.' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  serials?: string[];
 }
 
 /** Move stock from one store to another. Both legs share one reference. */
@@ -61,6 +70,14 @@ export class StockCountDto {
   @IsNumber({ maxDecimalPlaces: 3 })
   @Min(0)
   counted: number;
+
+  @ApiPropertyOptional({ type: [String], description: 'Serialised products: every unit found. Its length is the count.' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  serials?: string[];
 }
 
 /** A physical stock take: one posted adjustment per counted variance. */

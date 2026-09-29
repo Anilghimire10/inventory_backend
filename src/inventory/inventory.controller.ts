@@ -1,7 +1,7 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { InventoryService } from './inventory.service';
-import { AdjustStockDto, SetReorderLevelDto } from './dto/adjust-stock.dto';
+import { AdjustStockDto, ImportStockDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
 import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
   ExpiringDto,
@@ -49,6 +49,24 @@ export class InventoryController {
     return this.inventory.listSerials(u.businessId, q);
   }
 
+  /** The in-stock serials of one product at one store: the pickers' checklist. */
+  @Get('serials/in-stock')
+  inStockSerials(
+    @CurrentUser() u: AuthUser,
+    @Query('storeId') storeId: string,
+    @Query('productId') productId: string,
+  ) {
+    const store = scopeToStore(u, storeId);
+    if (!store || !productId) throw new BadRequestException('storeId and productId are required');
+    return this.inventory.inStockSerials(u.businessId, store, productId);
+  }
+
+  /** Where one serial is: scanning an IMEI at the till finds its product. */
+  @Get('serials/lookup/:serial')
+  lookupSerial(@CurrentUser() u: AuthUser, @Param('serial') serial: string) {
+    return this.inventory.lookupSerial(u.businessId, serial);
+  }
+
   @Get('movements')
   movements(@CurrentUser() u: AuthUser, @Query() q: QueryMovementsDto) {
     // Assigned in place rather than spread: these query DTOs carry prototype
@@ -61,6 +79,23 @@ export class InventoryController {
   @Post('adjust')
   adjust(@CurrentUser() u: AuthUser, @Body() dto: AdjustStockDto) {
     return this.inventory.adjust(u.businessId, u.userId, dto);
+  }
+
+  /** Opening stock from a spreadsheet; `dryRun` checks it without saving. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
+  @Post('import-stock')
+  importStock(@CurrentUser() u: AuthUser, @Body() dto: ImportStockDto) {
+    return this.inventory.importStock(u.businessId, u.userId, dto.items, {
+      dryRun: dto.dryRun,
+      storeId: scopeToStore(u, dto.storeId),
+    });
+  }
+
+  /** Take expired stock off the shelf: an EXPIRED adjustment, batch emptied. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
+  @Post('expiring/write-off')
+  writeOffExpired(@CurrentUser() u: AuthUser, @Body() dto: WriteOffExpiredDto) {
+    return this.inventory.writeOffExpired(u.businessId, u.userId, dto);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)

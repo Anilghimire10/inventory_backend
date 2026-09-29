@@ -162,8 +162,8 @@ export class NotificationsService {
       desired.push({
         type: NotificationType.EXPIRING,
         dedupeKey: `exp:${b.id}`,
-        title: `Expiring soon: ${b.product.name}`,
-        body: `${b.quantity} · expires ${when}`,
+        title: `${b.expired ? 'Expired' : 'Expiring soon'}: ${b.product.name}`,
+        body: `${b.quantity} · ${b.expired ? 'expired' : 'expires'} ${when}`,
         link: '/inventory',
       });
     }

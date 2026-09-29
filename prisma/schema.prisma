@@ -60,6 +60,7 @@ enum SerialStatus {
   SOLD
   RETURNED_TO_SUPPLIER
   DAMAGED // came back from a customer unfit to sell; written off, never sold again
+  LOST // gone from the shelf without a sale: stolen, missing at a count, or removed by hand
 }
 
 enum PurchaseStatus {

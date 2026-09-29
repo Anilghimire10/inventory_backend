@@ -6,6 +6,7 @@ import {
 import { randomUUID } from 'crypto';
 import {
   AdjustmentReason,
+  BusinessType,
   PaymentMethod,
   PaymentType,
   Prisma,
@@ -27,6 +28,7 @@ import { TX_OPTS } from '../common/prisma-tx';
 import { splitTax } from '../common/tax';
 import { lineRefund, returnRefund } from '../common/refund';
 import { assertOwnStore } from '../common/store-scope';
+import { expiredCutoff, isExpired } from '../common/expiry';
 
 /** Fields `create()` and `hold()` share to price out a cart. */
 interface SaleLinesInput {
@@ -109,11 +111,17 @@ export class SalesService {
     // two branches could ring up a sale at one and have it stamped onto the
     // other branch's drawer. Both Z reports were then wrong, and neither had
     // anything in it to show why.
-    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive }, shiftId] =
+    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive, businessType }, shiftId] =
       await Promise.all([
         this.buildLines(businessId, storeId, dto),
         this.shifts.resolveShiftId(user, storeId, dto.shiftId),
       ]);
+
+    // A pharmacy can't sell expired stock. Other shops get a warning at the
+    // till and may go ahead; this is the one place that refuses outright.
+    if (businessType === BusinessType.PHARMACY) {
+      await this.assertInDate(storeId, lines);
+    }
 
     // Serialised goods: one scanned serial per unit, checked before the
     // transaction so a bad scan never half-writes a sale.
@@ -893,6 +901,11 @@ export class SalesService {
    * for every batch-tracked line in one shot: one read for all products'
    * batches, then a single bulk write for every batch touched, instead of
    * a read + N updates per line.
+   *
+   * Batches already past their date go last. Taken strictly by date they
+   * went first, so selling one unit of a product with an expired batch on
+   * the shelf recorded the expired unit as the one sold -- and the good
+   * stock as what was left.
    */
   private async consumeBatchesFEFOBatch(
     tx: Prisma.TransactionClient,
@@ -905,6 +918,13 @@ export class SalesService {
       where: { storeId, productId: { in: productIds }, quantity: { gt: 0 } },
       orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
     });
+    // Stable sort: in-date (and undated) batches keep their order, expired
+    // ones move behind them.
+    const cutoff = expiredCutoff();
+    batches.sort(
+      (a, b) =>
+        Number(!!a.expiryDate && a.expiryDate <= cutoff) - Number(!!b.expiryDate && b.expiryDate <= cutoff),
+    );
     const batchesByProduct = new Map<string, typeof batches>();
     for (const b of batches) {
       const arr = batchesByProduct.get(b.productId);
@@ -973,7 +993,7 @@ export class SalesService {
         : Promise.resolve(),
       this.prisma.business.findUnique({
         where: { id: businessId },
-        select: { taxEnabled: true, taxInclusive: true },
+        select: { taxEnabled: true, taxInclusive: true, type: true },
       }),
       this.prisma.product.findMany({
         where: { id: { in: productIds }, businessId, isActive: true },
@@ -1023,6 +1043,7 @@ export class SalesService {
         trackBatches: product.trackBatches,
         trackSerials: product.trackSerials,
         serials: i.serials,
+        expiryDate: product.expiryDate,
       };
     });
 
@@ -1032,6 +1053,59 @@ export class SalesService {
     const total = round2(subtotal + tax - billDiscount);
     if (total < 0) throw new BadRequestException('Discount exceeds sale total');
 
-    return { lines, subtotal, tax, billDiscount, total, taxInclusive };
+    return { lines, subtotal, tax, billDiscount, total, taxInclusive, businessType: business?.type };
+  }
+
+  /**
+   * Refuse a sale that would hand over expired stock: a product whose own
+   * expiry date has passed, or more units of a batch-tracked product than
+   * its in-date batches hold. Pharmacies only (see `create`).
+   */
+  private async assertInDate(
+    storeId: string,
+    lines: { productId: string; name: string; quantity: number; trackBatches: boolean; expiryDate: Date | null }[],
+  ) {
+    const now = new Date();
+    for (const l of lines) {
+      if (isExpired(l.expiryDate, now)) {
+        throw new BadRequestException(
+          `${l.name} expired on ${l.expiryDate!.toISOString().slice(0, 10)} and can't be sold. ` +
+            'Write it off from Stock → Expiring.',
+        );
+      }
+    }
+    // One product can be on more than one line.
+    const wanted = new Map<string, { name: string; qty: number }>();
+    for (const l of lines.filter((l) => l.trackBatches)) {
+      const w = wanted.get(l.productId) ?? { name: l.name, qty: 0 };
+      w.qty = round3(w.qty + l.quantity);
+      wanted.set(l.productId, w);
+    }
+    if (!wanted.size) return;
+    const ids = [...wanted.keys()];
+    const [stock, expired] = await Promise.all([
+      this.prisma.stockItem.findMany({
+        where: { storeId, productId: { in: ids } },
+        select: { productId: true, quantity: true },
+      }),
+      this.prisma.batch.groupBy({
+        by: ['productId'],
+        where: { storeId, productId: { in: ids }, quantity: { gt: 0 }, expiryDate: { lte: expiredCutoff(now) } },
+        _sum: { quantity: true },
+      }),
+    ]);
+    const onHand = new Map(stock.map((s) => [s.productId, Number(s.quantity)]));
+    for (const e of expired) {
+      const expiredQty = Number(e._sum.quantity ?? 0);
+      if (expiredQty <= 0) continue;
+      const w = wanted.get(e.productId)!;
+      const inDate = Math.max(round3((onHand.get(e.productId) ?? 0) - expiredQty), 0);
+      if (w.qty > inDate) {
+        throw new BadRequestException(
+          `Only ${inDate} of ${w.name} ${inDate === 1 ? 'is' : 'are'} in date; ${expiredQty} ` +
+            `${expiredQty === 1 ? 'has' : 'have'} expired and can't be sold.`,
+        );
+      }
+    }
   }
 }

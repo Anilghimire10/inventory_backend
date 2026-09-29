@@ -1,6 +1,9 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AdjustmentReason } from '@prisma/client';
 import {
+  ArrayMaxSize,
+  IsArray,
+  IsBoolean,
   IsEnum,
   IsInt,
   IsNumber,
@@ -9,6 +12,43 @@ import {
   MaxLength,
   NotEquals,
 } from 'class-validator';
+
+/** Opening stock rows from a spreadsheet. */
+export class ImportStockDto {
+  @ApiProperty({ type: [Object], description: 'Rows parsed from a CSV file' })
+  @IsArray()
+  items: Record<string, unknown>[];
+
+  @ApiPropertyOptional({ description: 'The branch for rows that name none' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  storeId?: string;
+
+  @ApiPropertyOptional({ description: 'Check the file and say what would happen, without saving anything' })
+  @IsOptional()
+  @IsBoolean()
+  dryRun?: boolean;
+}
+
+/** Write off expired stock: one batch, or (no batchId) a product's own expiry. */
+export class WriteOffExpiredDto {
+  @ApiProperty()
+  @IsString()
+  @MaxLength(64)
+  storeId: string;
+
+  @ApiProperty()
+  @IsString()
+  @MaxLength(64)
+  productId: string;
+
+  @ApiPropertyOptional({ description: 'The expired batch; omit for a product-level expiry date' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  batchId?: string;
+}
 
 export class AdjustStockDto {
   @ApiProperty()
@@ -38,6 +78,18 @@ export class AdjustStockDto {
   @IsString()
   @MaxLength(1000)
   note?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Serialised products: one serial per unit -- the units added, or the in-stock units removed',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  serials?: string[];
 }
 
 export class SetReorderLevelDto {
