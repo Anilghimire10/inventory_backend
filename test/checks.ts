@@ -39,6 +39,8 @@ import { ReportsService } from '../src/reports/reports.service';
 import { TaxesService } from '../src/taxes/taxes.service';
 import { LogRetentionCron } from '../src/settings/log-retention.cron';
 import { SupportService } from '../src/support/support.service';
+import { SubscriptionService } from '../src/subscription/subscription.service';
+import { readAmount, readProductRow } from '../src/products/product-import';
 import { QueryTicketsDto } from '../src/support/dto/support.dto';
 import { platformRoleAllows } from '../src/platform/platform-auth.guard';
 import { platformJwtSecret, validateEnv } from '../src/common/env.validation';
@@ -693,8 +695,19 @@ async function serialRulesGuardEveryUnit() {
           ? where.serialNumber.in.filter((n: string) => !sold.has(n)).length
           : where.id.in.length,
       }),
-      findMany: async ({ take }: any) =>
-        [{ id: 'x1' }, { id: 'x2' }, { id: 'x3' }].slice(0, take),
+      findMany: async ({ where, take }: any) =>
+        where.serialNumber
+          ? // The "which one, and where is it" lookup behind the error message.
+            where.serialNumber.in.map((n: string) => ({
+              serialNumber: n,
+              status: sold.has(n) ? 'SOLD' : 'IN_STOCK',
+              productId: 'p1',
+              storeId: 's1',
+              store: { name: 'Main' },
+              sale: sold.has(n) ? { receiptNo: 'INV-000009' } : null,
+              product: { name: 'Phone' },
+            }))
+          : [{ id: 'x1' }, { id: 'x2' }, { id: 'x3' }].slice(0, take),
     },
   });
   const inventory = new InventoryService(prisma);
@@ -707,8 +720,8 @@ async function serialRulesGuardEveryUnit() {
   await inventory.sellSerials(prisma as any, { ...args, serials: ['A1'] });
   await assert.rejects(
     inventory.sellSerials(prisma as any, { ...args, serials: ['A1', 'A2'] }),
-    /not in stock/,
-    'a unit sold on another ticket cannot be sold again',
+    /"A2" is not in stock here \(sold on INV-000009\)/,
+    'a unit sold on another ticket cannot be sold again -- and the error says which, and where it went',
   );
 
   // A return with no serials given falls back to the oldest units sold.
@@ -2797,6 +2810,296 @@ async function supportTicketsGetAnOwner() {
   assert.strictEqual(assignedTo, null, 'unassign');
 }
 
+/**
+ * Support round trip: a ticket keeps the category the shop picked (OTHER from
+ * an older app), a shop's follow-up emails the support inbox, and the reply
+ * notice goes to the person who asked -- linked to their ticket -- not to
+ * the whole shop. The bell only shows a person their own and shared notices.
+ */
+async function supportRepliesReachTheRightPerson() {
+  const created: any[] = [];
+  const notices: any[] = [];
+  const inboxMail: string[] = [];
+  const ticket = {
+    id: 't1', businessId: 'b1', userId: 'cashier', subject: 'Printer', userEmail: 'c@x.com', userName: 'C',
+    status: 'CLOSED', category: 'PROBLEM', assignedAdmin: { id: 'me', name: 'A' }, messages: [],
+  };
+  const db: any = {
+    user: { findUnique: async () => ({ name: 'C', email: 'c@x.com', business: { name: 'Shop' } }) },
+    supportTicket: {
+      create: async ({ data }: any) => {
+        created.push(data);
+        return data;
+      },
+      findFirst: async () => ticket,
+      findUnique: async () => ticket,
+      update: async () => ticket,
+    },
+    supportMessage: { create: async () => ({}) },
+    notification: {
+      create: async ({ data }: any) => {
+        notices.push(data);
+        return data;
+      },
+    },
+    platformAdmin: { findUnique: async () => ({ name: 'A' }) },
+  };
+  db.$transaction = async (ops: unknown[]) => Promise.all(ops);
+  const service = new SupportService(
+    stub<PrismaService>(db),
+    stub<MailService>({
+      sendSupportNew: async () => {},
+      sendSupportReply: async () => {},
+      sendSupportFollowUp: async (to: string) => {
+        inboxMail.push(to);
+      },
+    }),
+    stub<PlatformAuditService>({ record: async () => {} }),
+  );
+  const cashier = { userId: 'cashier', businessId: 'b1', role: UserRole.CASHIER } as any;
+
+  const before = process.env.SUPPORT_EMAIL;
+  process.env.SUPPORT_EMAIL = 'help@platform.com';
+  try {
+    await service.create(cashier, { subject: 'Old app', body: 'Hi' });
+    await service.create(cashier, { subject: 'Bill', body: 'Hi', category: 'BILLING' as any });
+    assert.deepStrictEqual(created.map((c) => c.category), ['OTHER', 'BILLING'], 'no category means OTHER');
+
+    await service.replyFromShop(cashier, 't1', 'Still broken');
+    await new Promise((r) => setImmediate(r));
+    assert.deepStrictEqual(inboxMail, ['help@platform.com'], "a shop's follow-up emails the inbox");
+  } finally {
+    if (before === undefined) delete process.env.SUPPORT_EMAIL;
+    else process.env.SUPPORT_EMAIL = before;
+  }
+
+  await service.replyFromAdmin({ adminId: 'me', email: 'me@x.com' }, 't1', 'Fixed');
+  assert.strictEqual(notices[0].userId, 'cashier', 'the reply notice is for the asker only');
+  assert.strictEqual(notices[0].link, '/support?ticket=t1', 'and opens their ticket');
+
+  let where: any;
+  const bell = new NotificationsService(
+    stub<PrismaService>({
+      notification: {
+        findMany: async (args: any) => {
+          where = args.where;
+          return [];
+        },
+      },
+    }),
+    stub<InventoryService>({}),
+  );
+  await bell.list('b1', 'owner');
+  assert.deepStrictEqual(
+    where.OR,
+    [{ userId: null }, { userId: 'owner' }],
+    "the owner's bell skips a notice addressed to the cashier",
+  );
+}
+
+/**
+ * The shop's Subscription page: a paying shop sees its period and payments
+ * with receipt numbers, a trial counts from signup, and a receipt is only
+ * ever the asking shop's own.
+ */
+async function aShopSeesItsOwnSubscription() {
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const payments: any[] = [
+    {
+      id: 'p2', receiptNo: 42, createdAt: new Date(now - 5 * day), amount: new Prisma.Decimal('1500'),
+      currency: 'NPR', method: 'ESEWA', reference: 'E-1', periodFrom: new Date(now - 5 * day), periodTo: new Date(now + 25 * day),
+    },
+  ];
+  let receiptWhere: any;
+  const db: any = {
+    business: {
+      findUnique: async ({ where }: any) =>
+        where.id === 'paid'
+          ? { isSubscribed: true, subscribedTo: new Date(now + 25 * day), createdAt: new Date(now - 90 * day) }
+          : { isSubscribed: true, subscribedTo: new Date(now + 9 * day), createdAt: new Date(now - 5 * day) },
+    },
+    subscriptionPayment: {
+      findMany: async ({ where }: any) => (where.businessId === 'paid' ? payments : []),
+      findFirst: async ({ where }: any) => {
+        receiptWhere = where;
+        return where.businessId === 'paid' && where.id === 'p2'
+          ? { ...payments[0], business: { id: 'paid', name: 'Shop', taxId: null } }
+          : null;
+      },
+    },
+  };
+  const settings = stub<SettingsService>({
+    get: async () => ({ billingName: 'Platform', billingTaxId: null, billingAddress: null, billingPhone: null, billingEmail: null }),
+  } as any);
+  const service = new SubscriptionService(stub<PrismaService>(db), settings);
+
+  const paid = await service.overview('paid');
+  assert.strictEqual(paid.status, 'active', 'paid with 25 days left is active');
+  assert.strictEqual(paid.daysLeft, 25);
+  assert.strictEqual(paid.trial, false);
+  assert.strictEqual(paid.periodStart, payments[0].periodFrom.toISOString(), 'the period starts at the latest payment');
+  assert.deepStrictEqual(
+    paid.payments.map((p) => [p.receiptNo, p.amount, p.method]),
+    [['SUB-000042', 1500, 'eSewa']],
+  );
+
+  const trial = await service.overview('trial');
+  assert.strictEqual(trial.status, 'trial');
+  assert.strictEqual(trial.trial, true);
+  assert.strictEqual(trial.daysLeft, 9);
+
+  const r = await service.receipt('paid', 'p2');
+  assert.strictEqual(r.receiptNo, 'SUB-000042');
+  assert.deepStrictEqual(receiptWhere, { id: 'p2', businessId: 'paid' }, 'the lookup is scoped to the shop');
+  await assert.rejects(service.receipt('trial', 'p2'), /Payment not found/, "another shop's receipt is a 404");
+}
+
+/**
+ * Expired stock: a sale uses in-date batches before expired ones, a pharmacy
+ * can't sell what has expired (but can sell the in-date part), and a
+ * write-off empties the batch as well as the shelf -- and refuses stock that
+ * hasn't expired yet.
+ */
+async function expiredStockIsHandled() {
+  const day = 24 * 60 * 60 * 1000;
+  const past = new Date(Date.now() - 10 * day);
+  const future = new Date(Date.now() + 60 * day);
+
+  // In-date batches first: the expired batch (earlier date) is left alone.
+  let written: { ids: string[]; qtys: string[] } | undefined;
+  const tx: any = {
+    batch: {
+      findMany: async () => [
+        { id: 'old', productId: 'p1', expiryDate: past, createdAt: new Date(0), quantity: new Prisma.Decimal(5) },
+        { id: 'good', productId: 'p1', expiryDate: future, createdAt: new Date(0), quantity: new Prisma.Decimal(5) },
+      ],
+    },
+    $executeRaw: async (_strings: TemplateStringsArray, ids: string[], qtys: string[]) => {
+      written = { ids, qtys };
+    },
+  };
+  const sales = new SalesService(
+    stub<PrismaService>({
+      stockItem: { findMany: async () => [{ productId: 'p1', quantity: new Prisma.Decimal(10) }] },
+      batch: { groupBy: async () => [{ productId: 'p1', _sum: { quantity: new Prisma.Decimal(5) } }] },
+    }),
+    stub<InventoryService>({}),
+    stub<MailService>({}),
+    stub<ShiftsService>({}),
+    stub<PaymentsService>({}),
+  );
+  await (sales as any).consumeBatchesFEFOBatch(tx, 's1', [{ productId: 'p1', quantity: 3 }]);
+  assert.deepStrictEqual(written, { ids: ['good'], qtys: ['2'] }, 'the in-date batch is used, not the expired one');
+
+  // Pharmacy: 5 of the 10 on hand are expired.
+  const line = (quantity: number, extra: object = {}) => ({
+    productId: 'p1', name: 'Paracetamol', quantity, trackBatches: true, expiryDate: null, ...extra,
+  });
+  await (sales as any).assertInDate('s1', [line(5)]);
+  await assert.rejects((sales as any).assertInDate('s1', [line(6)]), /Only 5 of Paracetamol are in date/);
+  await assert.rejects(
+    (sales as any).assertInDate('s1', [line(3), line(3)]),
+    /Only 5/,
+    'two lines of the same product add up',
+  );
+  await assert.rejects(
+    (sales as any).assertInDate('s1', [line(1, { trackBatches: false, expiryDate: past })]),
+    /expired on .* can't be sold/,
+    'a product past its own date is refused',
+  );
+
+  // Write-off: the batch is emptied and the shelf goes down by what it held.
+  const moves: any[] = [];
+  let batchQty: number | undefined;
+  const db: any = {
+    store: { findFirst: async () => ({ id: 's1' }) },
+    product: {
+      findFirst: async () => ({ id: 'p1', unit: 'pcs' }),
+      findUnique: async () => ({ expiryDate: future }),
+      findMany: async () => [{ id: 'p1', unit: 'pcs' }],
+    },
+    stockItem: { findUnique: async () => ({ quantity: new Prisma.Decimal(10) }) },
+    batch: {
+      findFirst: async ({ where }: any) =>
+        where.id === 'old'
+          ? { id: 'old', batchNumber: 'B7', expiryDate: past, quantity: new Prisma.Decimal(5) }
+          : where.id === 'good'
+            ? { id: 'good', batchNumber: 'B8', expiryDate: future, quantity: new Prisma.Decimal(5) }
+            : null,
+      update: async ({ data }: any) => {
+        batchQty = data.quantity;
+      },
+    },
+  };
+  db.$transaction = async (fn: any) => fn(db);
+  const inventory = new InventoryService(stub<PrismaService>(db));
+  (inventory as any).assertStoreAndProduct = async () => undefined;
+  (inventory as any).applyMovement = async (_tx: any, m: any) => {
+    moves.push(m);
+  };
+  const res = await inventory.writeOffExpired('b1', 'u1', { storeId: 's1', productId: 'p1', batchId: 'old' });
+  assert.strictEqual(res.writtenOff, 5);
+  assert.strictEqual(batchQty, 0, 'the batch is emptied');
+  assert.strictEqual(moves[0].quantity, -5);
+  assert.strictEqual(moves[0].reason, 'EXPIRED');
+  await assert.rejects(
+    inventory.writeOffExpired('b1', 'u1', { storeId: 's1', productId: 'p1', batchId: 'good' }),
+    /has not expired yet/,
+    'good stock is never written off as expired',
+  );
+  await assert.rejects(
+    inventory.writeOffExpired('b1', 'u1', { storeId: 's1', productId: 'p1' }),
+    /has not expired yet/,
+  );
+}
+
+/**
+ * Reading an imported product row the way a person writes it: amounts with
+ * commas and currency, blank cells that mean "leave it", loose column names,
+ * and a refusal -- naming the column -- for anything that can't be read.
+ */
+function productImportReadsRowsSafely() {
+  const r = readProductRow({
+    'Product Name': ' चामल ',
+    SKU: 'RICE-1',
+    'Selling Price': '"1,200"'.replace(/"/g, ''),
+    cost: 'Rs 950.50',
+    'Tax rate': '13',
+    Unit: 'Kilograms',
+    Category: 'Staples | Rice',
+    Taxable: 'Yes',
+    'Expiry date': '2027-01-31',
+    brand: '',
+  });
+  assert.strictEqual(r.fields.name, 'चामल');
+  assert.strictEqual(r.sku, 'RICE-1');
+  assert.strictEqual(r.fields.sellingPrice, 1200, '"1,200" is twelve hundred, not 0');
+  assert.strictEqual(r.fields.costPrice, 950.5, 'a currency prefix is fine');
+  assert.strictEqual(r.fields.unit, 'kg');
+  assert.deepStrictEqual(r.categories, ['Staples', 'Rice']);
+  assert.strictEqual(r.fields.isTaxable, true);
+  assert.strictEqual(r.fields.expiryDate?.toISOString().slice(0, 10), '2027-01-31');
+  assert.ok(!('brand' in r.fields), 'a blank cell is left out, not set to empty');
+
+  const blank = readProductRow({ sku: 'RICE-1', costPrice: '', sellingPrice: '  ' });
+  assert.deepStrictEqual(blank.fields, {}, 'blank prices change nothing -- they used to become 0');
+  assert.strictEqual(blank.categories, undefined);
+
+  assert.throws(() => readProductRow({ name: 'X', sellingPrice: 'abc' }), /Selling price "abc" is not a number/);
+  assert.throws(() => readProductRow({ name: 'X', costPrice: '-5' }), /not a number/);
+  assert.throws(() => readProductRow({ name: 'X', unit: 'sack' }), /Unit "sack" isn't one the app knows/);
+  assert.throws(() => readProductRow({ name: 'X', taxable: 'maybe' }), /yes or no/);
+  assert.throws(() => readProductRow({ name: 'X', expiry: '31/01/2027' }), /date like 2026-12-31/);
+  assert.throws(() => readProductRow({ name: 'X', expiry: '2027-02-31' }), /date like/);
+  assert.throws(() => readProductRow({ name: 'X', trackBatches: 'yes', trackSerials: 'yes' }), /not both/);
+  assert.strictEqual(readAmount('NPR 1,50,000', 'price'), 150000, 'Indian grouping reads too');
+
+  // A cell an export neutralised against formulas comes back as written.
+  assert.strictEqual(readProductRow({ name: "'=Deal", sku: "'-001" }).fields.name, '=Deal');
+  assert.strictEqual(readProductRow({ name: 'X', sku: "'-001" }).sku, '-001');
+}
+
 /** Log date filters: either end optional, and nothing at all when neither is set. */
 function logDateRange() {
   assert.deepStrictEqual(createdBetween({}), {}, 'no range, no filter');
@@ -3505,6 +3808,10 @@ async function main() {
   await onboardingFlagsTheStuckShops();
   await announcementsScheduleAndTarget();
   await supportTicketsGetAnOwner();
+  await supportRepliesReachTheRightPerson();
+  await aShopSeesItsOwnSubscription();
+  await expiredStockIsHandled();
+  productImportReadsRowsSafely();
   logDateRange();
   devicesAreRecognisable();
   await shiftReportBalancesTheDrawer();
