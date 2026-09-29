@@ -729,11 +729,11 @@ export class SalesService {
    * sales.controller.ts). Defaults true so internal callers keep the figures;
    * the HTTP route passes the caller's role explicitly.
    */
-  async findAll(
-    businessId: string,
-    q: QuerySaleDto,
-    includeFinancials = true,
-  ) {
+  /**
+   * The sales a list filter matches -- shared by the Sales page and its
+   * export, so the file holds exactly the bills the screen was showing.
+   */
+  private listWhere(businessId: string, q: QuerySaleDto): Prisma.SaleWhereInput {
     const RETURNS = [SaleStatus.RETURNED, SaleStatus.PARTIALLY_RETURNED];
     const NOT_RETURNED_HELD = { notIn: [...RETURNS, SaleStatus.HELD] };
     const statusWhere =
@@ -751,8 +751,7 @@ export class SalesService {
                     paymentMethod: { notIn: [PaymentMethod.CREDIT, PaymentMethod.MIXED] },
                   }
                 : {};
-
-    const where: Prisma.SaleWhereInput = {
+    return {
       businessId,
       ...(q.storeId ? { storeId: q.storeId } : {}),
       ...(q.customerId ? { customerId: q.customerId } : {}),
@@ -768,6 +767,105 @@ export class SalesService {
       ...(q.search ? { receiptNo: { contains: q.search, mode: 'insensitive' } } : {}),
       ...statusWhere,
     };
+  }
+
+  /**
+   * Every bill the filter matches, one row each, for the accountant: when,
+   * receipt, branch, who rang it, customer, what was on it, and the money
+   * -- before and after discounts, tax, refunds, what was paid and what is
+   * still owed. Held carts only when asked for. Times are the shop's own.
+   * Capped at 50,000 rows; `truncated` says when the filter matched more.
+   */
+  async exportRows(businessId: string, q: QuerySaleDto) {
+    const CAP = 50_000;
+    // A held cart isn't a sale: left out unless the filter asks for them.
+    const base = this.listWhere(businessId, q);
+    const where: Prisma.SaleWhereInput =
+      q.status === 'held' ? base : { AND: [base, { status: { not: SaleStatus.HELD } }] };
+    const [business, total, sales] = await Promise.all([
+      this.prisma.business.findUnique({ where: { id: businessId }, select: { timezone: true } }),
+      this.prisma.sale.count({ where }),
+      this.prisma.sale.findMany({
+        where,
+        orderBy: { createdAt: 'asc' },
+        take: CAP,
+        select: {
+          receiptNo: true,
+          createdAt: true,
+          status: true,
+          paymentMethod: true,
+          subtotal: true,
+          discount: true,
+          tax: true,
+          total: true,
+          refundedTotal: true,
+          amountPaid: true,
+          prescriptionRef: true,
+          store: { select: { name: true } },
+          user: { select: { name: true } },
+          customer: { select: { name: true, phone: true } },
+          items: { select: { name: true, quantity: true, discount: true } },
+        },
+      }),
+    ]);
+    const when = new Intl.DateTimeFormat('en-CA', {
+      timeZone: business?.timezone || 'Asia/Kathmandu',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    });
+    const STATUS: Record<SaleStatus, string> = {
+      COMPLETED: 'Completed',
+      HELD: 'On hold',
+      RETURNED: 'Returned',
+      PARTIALLY_RETURNED: 'Part returned',
+    };
+    const METHOD: Record<PaymentMethod, string> = {
+      CASH: 'Cash',
+      CARD: 'Card',
+      MOBILE: 'QR / Mobile',
+      CREDIT: 'On credit',
+      MIXED: 'Part paid',
+    };
+    const rows = sales.map((s) => {
+      const total = Number(s.total);
+      const refunded = Number(s.refundedTotal);
+      const paid = Number(s.amountPaid);
+      const lineDiscounts = s.items.reduce((n, i) => n + Number(i.discount), 0);
+      return {
+        date: when.format(s.createdAt).replace(',', ''),
+        receiptNo: s.receiptNo,
+        store: s.store.name,
+        cashier: s.user?.name ?? '',
+        customer: s.customer?.name ?? 'Walk-in',
+        customerPhone: s.customer?.phone ?? '',
+        items: s.items.map((i) => `${i.name} x ${Number(i.quantity)}`).join('; '),
+        units: round3(s.items.reduce((n, i) => n + Number(i.quantity), 0)),
+        subtotal: Number(s.subtotal),
+        discount: round2(Number(s.discount) + lineDiscounts),
+        tax: Number(s.tax),
+        total,
+        refunded,
+        netTotal: round2(total - refunded),
+        paid,
+        due: round2(Math.max(total - refunded - paid, 0)),
+        paymentMethod: METHOD[s.paymentMethod],
+        status: STATUS[s.status],
+        prescriptionRef: s.prescriptionRef ?? '',
+      };
+    });
+    return { rows, total, truncated: total > CAP };
+  }
+
+  async findAll(
+    businessId: string,
+    q: QuerySaleDto,
+    includeFinancials = true,
+  ) {
+    const where = this.listWhere(businessId, q);
     // Revenue is a fixed KPI, independent of whatever status filter the list
     // is currently showing -- always exclude returns/holds so it can't
     // include a returned sale's total just because the user filtered by

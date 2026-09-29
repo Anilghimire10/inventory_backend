@@ -98,6 +98,14 @@ export class SalesController {
     return this.sales.returnItems(u, id, dto);
   }
 
+  /** Every bill the filter matches, one row each, for the accountant. Management only. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Get('export')
+  exportRows(@CurrentUser() u: AuthUser, @Query() q: QuerySaleDto) {
+    q.storeId = scopeToStore(u, q.storeId);
+    return this.sales.exportRows(u.businessId, q);
+  }
+
   @Get()
   findAll(@CurrentUser() u: AuthUser, @Query() q: QuerySaleDto) {
     // Assigned in place rather than spread: QuerySaleDto carries prototype
