@@ -48,7 +48,12 @@ export function supportContact(): { email?: string; phone?: string } {
  * bouncing to login, with the date and who to call.
  */
 export class SubscriptionInactiveException extends UnauthorizedException {
-  constructor(business: { isSubscribed: boolean; subscribedTo: Date | null }) {
+  /**
+   * `billingToken`: for an owner or manager, a short-lived pass that opens
+   * only the @AllowLocked routes -- how to pay, and "I've paid" -- so a
+   * locked shop can still pay and say so.
+   */
+  constructor(business: { isSubscribed: boolean; subscribedTo: Date | null }, billingToken?: string) {
     const expired = business.isSubscribed && !!business.subscribedTo;
     super({
       statusCode: 401,
@@ -58,9 +63,16 @@ export class SubscriptionInactiveException extends UnauthorizedException {
       reason: expired ? 'expired' : 'inactive',
       endedAt: expired ? business.subscribedTo!.toISOString() : null,
       contact: supportContact(),
+      ...(billingToken ? { billingToken } : {}),
     });
   }
 }
+
+/** How long a billing-only pass lasts: enough to pay and report it. */
+export const BILLING_PASS_TTL = '1h';
+
+/** Whether a role may hold a billing pass: the people who pay. */
+export const canHoldBillingPass = (role: string) => role === 'OWNER' || role === 'MANAGER';
 
 /**
  * What the shop app shows its owner about the subscription. Only states that
@@ -162,6 +174,42 @@ export function paymentPeriod(opts: {
   }
   const newEnd = currentEnd && currentEnd > to ? currentEnd : to;
   return { from, to, newEnd };
+}
+
+/**
+ * A plan's price per month in rupees, from its shortest length: the
+ * undiscounted rate. Null for a plan with no price.
+ */
+export function monthlyRate(plan: { prices: { months: number; amount: number }[] }): number | null {
+  const p = [...plan.prices].sort((a, b) => a.months - b.months)[0];
+  return p && p.amount > 0 ? p.amount / p.months : null;
+}
+
+/**
+ * The end date to renew from when a shop pays for a different plan with time
+ * still left. The shop moves onto the new plan at once, so the days it still
+ * has on the old one are converted at the two plans' monthly rates: 11 months
+ * of a NPR 2,000 plan are worth NPR 22,000, which is 4.4 months of a NPR 5,000
+ * one. Without this an upgrade would be free until the old end date, and a
+ * downgrade would throw days away.
+ *
+ * Unchanged when there is nothing to convert: the same plan, no time left, or
+ * either plan unknown (a trial, or a plan since removed) -- then the days are
+ * kept as they are.
+ */
+export function convertedEnd(opts: {
+  now: Date;
+  currentEnd: Date | null;
+  fromPlan: { id: string; prices: { months: number; amount: number }[] } | null;
+  toPlan: { id: string; prices: { months: number; amount: number }[] } | null;
+}): Date | null {
+  const { now, currentEnd, fromPlan, toPlan } = opts;
+  if (!currentEnd || currentEnd <= now || !fromPlan || !toPlan || fromPlan.id === toPlan.id) return currentEnd;
+  const from = monthlyRate(fromPlan);
+  const to = monthlyRate(toPlan);
+  if (!from || !to) return currentEnd;
+  const left = currentEnd.getTime() - now.getTime();
+  return new Date(now.getTime() + Math.round((left * from) / to));
 }
 
 /**

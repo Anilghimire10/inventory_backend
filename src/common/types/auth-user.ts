@@ -16,4 +16,9 @@ export interface AuthUser {
    * ImpersonationReadOnlyGuard.
    */
   impersonatedBy?: { adminId: string; email: string; expiresAt: string };
+  /**
+   * Signed in with a billing-only pass: the shop's subscription has lapsed,
+   * and only @AllowLocked routes may be used (JwtAuthGuard enforces it).
+   */
+  billingOnly?: boolean;
 }

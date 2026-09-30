@@ -15,6 +15,8 @@ import { SettingsService } from '../settings/settings.service';
 import { MailService } from '../mail/mail.service';
 import { AuditService } from '../audit/audit.service';
 import {
+  BILLING_PASS_TTL,
+  canHoldBillingPass,
   isSubscriptionActive,
   SubscriptionInactiveException,
   subscriptionSummary,
@@ -227,7 +229,17 @@ export class AuthService {
       throw new UnauthorizedException(suspendedMessage(user.business.suspendedReason));
     }
     if (!isSubscriptionActive(user.business)) {
-      throw new SubscriptionInactiveException(user.business);
+      // The password was right: an owner or manager gets a billing-only pass
+      // with the refusal, so the lock screen can show how to pay.
+      throw new SubscriptionInactiveException(
+        user.business,
+        canHoldBillingPass(user.role)
+          ? this.jwt.sign(
+              { sub: user.id, businessId: user.businessId, tv: user.tokenVersion, scope: 'billing' },
+              { expiresIn: BILLING_PASS_TTL },
+            )
+          : undefined,
+      );
     }
 
     void this.audit.record({

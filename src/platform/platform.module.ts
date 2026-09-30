@@ -23,6 +23,11 @@ import { PlatformSettingsController } from './platform-settings.controller';
 import { PlatformBillingController } from './platform-billing.controller';
 import { PlatformBillingService } from './platform-billing.service';
 import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
+import { ProductImageStorage } from '../products/product-image.storage';
+import { PlatformClaimsController } from './platform-claims.controller';
+import { PlatformClaimsService } from './platform-claims.service';
+import { PlatformDigestService } from './platform-digest.service';
+import { PaymentGateways } from '../subscription/payment-gateways';
 
 @Module({
   imports: [
@@ -43,6 +48,7 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     }),
   ],
   controllers: [
+    PlatformClaimsController,
     PlatformAuthController,
     PlatformController,
     PlatformUsersController,
@@ -53,6 +59,12 @@ import { PlatformJwtStrategy } from './strategies/platform-jwt.strategy';
     PlatformBillingController,
   ],
   providers: [
+    PlatformDigestService,
+    // Which of eSewa / Khalti / connectIPS are set up, for Settings.
+    PaymentGateways,
+    PlatformClaimsService,
+    // Stores payment QR codes the way product images are stored.
+    ProductImageStorage,
     PlatformAuthService,
     PlatformService,
     PlatformUsersService,

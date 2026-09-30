@@ -17,7 +17,9 @@ export type EmailType =
   | 'announcement'
   | 'support-reply'
   | 'support-new'
-  | 'support-followup';
+  | 'support-followup'
+  | 'payment-claim'
+  | 'admin-digest';
 
 interface SendArgs {
   to: string;
@@ -40,6 +42,18 @@ export interface SubscriptionReceipt {
   reference: string | null;
   periodFrom: Date;
   periodTo: Date;
+}
+
+/** What the admins' daily summary carries, ready to print. */
+export interface AdminDigest {
+  day: string;
+  pendingClaims: { count: number; items: { business: string; amount: string; method: string; since: string }[] };
+  endingSoon: { count: number; items: { business: string; endsOn: string; kind: 'trial' | 'paid'; lastAmount: string | null }[] };
+  lockedYesterday: { count: number; items: { business: string; endedOn: string }[] };
+  ticketsWaiting: number;
+  newSignups: number;
+  /** eSewa / Khalti / connectIPS payments in the last day: nothing to do, good to know. */
+  paidOnline: { count: number; total: string | null };
 }
 
 /** Escape user-supplied text before it goes into an email's HTML. */
@@ -138,11 +152,27 @@ export class MailService {
     }
   }
 
-  private async deliver({ to, subject, html }: SendArgs): Promise<EmailStatus> {
+  /**
+   * Development only: every email goes to this one address instead, with the
+   * real recipient in the subject. Resend's test sender delivers only to the
+   * account owner's own address, so this is how a signup code, a receipt or
+   * an admin alert for any test account can still be read. validateEnv()
+   * refuses it in production.
+   */
+  private redirectTo() {
+    return this.config.get<string>('MAIL_REDIRECT_TO')?.trim() || null;
+  }
+
+  private async deliver(args: SendArgs): Promise<EmailStatus> {
     if (this.transport() === 'log') {
-      this.logger.log(`[mail:log] to=${to} subject="${subject}" (not sent)`);
+      this.logger.log(`[mail:log] to=${args.to} subject="${args.subject}" (not sent)`);
       return EmailStatus.LOGGED;
     }
+    const redirect = this.redirectTo();
+    const to = redirect ?? args.to;
+    const subject = redirect ? `[to: ${args.to}] ${args.subject}` : args.subject;
+    const { html } = args;
+    if (redirect) this.logger.log(`[mail:redirect] ${args.to} -> ${redirect} "${args.subject}"`);
     const { apiKey, from, fromName, url } = this.cfg();
 
     const res = await fetch(url, {
@@ -461,6 +491,113 @@ export class MailService {
         <p style="margin:0 0 16px;color:#475569">${esc(category)} · from ${esc(from)} at <strong>${esc(businessName)}</strong></p>
         <p style="margin:0 0 16px;white-space:pre-line">${esc(body)}</p>
         <p style="margin:0;color:#94a3b8;font-size:12px">Answer it from the admin panel's Support page.</p>
+      </div>`,
+    });
+  }
+
+  /**
+   * The admins' morning summary. `panelUrl` (ADMIN_PANEL_URL) turns each
+   * section's heading into a link to its page.
+   */
+  sendAdminDigest(to: string, name: string, d: AdminDigest, panelUrl: string | null) {
+    const link = (path: string, text: string) =>
+      panelUrl ? `<a href="${esc(panelUrl.replace(/\/$/, '') + path)}" style="color:#4f46e5">${esc(text)}</a>` : esc(text);
+    const section = (title: string, path: string, count: number, rows: string[], more: number, empty: string) => `
+        <h3 style="margin:20px 0 6px;font-size:15px">${link(path, `${title} (${count})`)}</h3>
+        ${
+          count
+            ? `<ul style="margin:0;padding-left:18px;color:#0f172a">${rows.map((r) => `<li style="margin:2px 0">${r}</li>`).join('')}</ul>${
+                more > 0 ? `<p style="margin:4px 0 0;color:#475569;font-size:13px">and ${more} more</p>` : ''
+              }`
+            : `<p style="margin:0;color:#94a3b8;font-size:13px">${empty}</p>`
+        }`;
+    const lines: string[] = [];
+    if (d.pendingClaims.count) lines.push(`${d.pendingClaims.count} payment${d.pendingClaims.count === 1 ? '' : 's'} to confirm`);
+    if (d.endingSoon.count) lines.push(`${d.endingSoon.count} ending this week`);
+    if (d.lockedYesterday.count) lines.push(`${d.lockedYesterday.count} locked`);
+    if (d.ticketsWaiting) lines.push(`${d.ticketsWaiting} ticket${d.ticketsWaiting === 1 ? '' : 's'} waiting`);
+    return this.send({
+      type: 'admin-digest',
+      to,
+      subject: lines.length ? `Today: ${lines.join(', ')}` : 'Today: nothing needs you',
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 4px">Good morning, ${esc(name)}</h2>
+        <p style="margin:0;color:#475569">What needs you today, ${esc(d.day)}.</p>
+        ${section(
+          'Payments to confirm',
+          '/payment-claims',
+          d.pendingClaims.count,
+          d.pendingClaims.items.map(
+            (c) => `<b>${esc(c.business)}</b>: ${esc(c.amount)} by ${esc(c.method)}, waiting since ${esc(c.since)}`,
+          ),
+          d.pendingClaims.count - d.pendingClaims.items.length,
+          'None waiting.',
+        )}
+        ${section(
+          'Ending in the next 7 days',
+          '/renewals',
+          d.endingSoon.count,
+          d.endingSoon.items.map(
+            (b) =>
+              `<b>${esc(b.business)}</b>: ${b.kind === 'trial' ? 'trial ends' : 'ends'} ${esc(b.endsOn)}${
+                b.lastAmount ? `, last paid ${esc(b.lastAmount)}` : ''
+              }`,
+          ),
+          d.endingSoon.count - d.endingSoon.items.length,
+          'Nothing ends this week.',
+        )}
+        ${section(
+          'Locked since yesterday',
+          '/renewals',
+          d.lockedYesterday.count,
+          d.lockedYesterday.items.map((b) => `<b>${esc(b.business)}</b>: ended ${esc(b.endedOn)}, now locked`),
+          d.lockedYesterday.count - d.lockedYesterday.items.length,
+          'No shop was locked.',
+        )}
+        <h3 style="margin:20px 0 6px;font-size:15px">${link('/support', `Support tickets waiting (${d.ticketsWaiting})`)}</h3>
+        <p style="margin:0;color:#475569;font-size:13px">${d.newSignups} new shop${d.newSignups === 1 ? '' : 's'} signed up in the last day.${
+          d.paidOnline.count ? ` ${d.paidOnline.count} paid online (${esc(d.paidOnline.total ?? '')}), already recorded.` : ''
+        }</p>
+        <p style="margin:24px 0 0;color:#94a3b8;font-size:12px">Sent every morning at 08:00 Nepal time when there is something to do. Turn it off in the admin panel, on the Admins page.</p>
+      </div>`,
+    });
+  }
+
+  /** A shop says it has paid: tell an admin what to look for, and where. */
+  sendPaymentClaim(
+    to: string,
+    name: string,
+    claim: {
+      businessName: string;
+      submittedBy: string;
+      amount: string;
+      method: string;
+      reference: string | null;
+      months: number | null;
+      note?: string | null;
+    },
+  ) {
+    const row = (label: string, value: string) =>
+      `<tr><td style="padding:4px 12px 4px 0;color:#475569">${label}</td><td style="padding:4px 0">${esc(value)}</td></tr>`;
+    return this.send({
+      type: 'payment-claim',
+      to,
+      subject: `Payment to confirm: ${claim.businessName}, ${claim.amount}`,
+      html: `
+      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0f172a">
+        <h2 style="margin:0 0 16px">A shop says it has paid</h2>
+        <p style="margin:0 0 12px">Hi ${esc(name)},</p>
+        <table style="border-collapse:collapse;margin:0 0 16px">
+          ${row('Shop', claim.businessName)}
+          ${row('Reported by', claim.submittedBy)}
+          ${row('Amount', claim.amount)}
+          ${row('Paid by', claim.method)}
+          ${claim.reference ? row('Reference', claim.reference) : ''}
+          ${claim.months ? row('For', `${claim.months} month${claim.months === 1 ? '' : 's'}`) : ''}
+          ${claim.note ? row('Note', claim.note) : ''}
+        </table>
+        <p style="margin:0;color:#94a3b8;font-size:12px">Check it against your statement, then confirm or reject it on the admin panel's Payments to confirm page.</p>
       </div>`,
     });
   }

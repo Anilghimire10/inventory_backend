@@ -2,9 +2,12 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
+import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuthUser } from '../../common/types/auth-user';
 import {
+  BILLING_PASS_TTL,
+  canHoldBillingPass,
   isSubscriptionActive,
   SubscriptionInactiveException,
 } from '../../common/subscription';
@@ -18,6 +21,8 @@ export interface JwtPayload {
   tv?: number;
   /** A platform admin viewing as this user (read-only). See issueImpersonationToken. */
   imp?: { adminId: string; email: string };
+  /** 'billing': a pass for a locked shop's @AllowLocked routes only. */
+  scope?: 'billing';
   exp?: number;
 }
 
@@ -27,6 +32,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     config: ConfigService,
     private prisma: PrismaService,
     private cache: PrincipalCache,
+    private jwt: JwtService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -39,6 +45,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   /** Whatever this returns becomes req.user (typed as AuthUser). */
   async validate(payload: JwtPayload): Promise<AuthUser> {
     const principal = await this.principal(payload);
+    // A billing pass stays a billing pass even if the subscription has come
+    // back (or a cached principal says it's fine): it never opens the shop.
+    // The flag goes on the returned principal, never into the cache.
+    if (payload.scope === 'billing') return { ...principal, billingOnly: true };
     if (!payload.imp) return principal;
 
     // "View as owner": still only while the admin who opened it is active. The
@@ -98,9 +108,6 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (user.business.isSuspended) {
       throw new UnauthorizedException(suspendedMessage(user.business.suspendedReason));
     }
-    if (!isSubscriptionActive(user.business)) {
-      throw new SubscriptionInactiveException(user.business);
-    }
     const principal: AuthUser = {
       userId: user.id,
       businessId: user.businessId,
@@ -108,6 +115,21 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       role: user.role,
       email: user.email,
     };
+    if (!isSubscriptionActive(user.business)) {
+      // Locked. A billing pass gets through (not cached: it must be checked
+      // again next time); anyone else is refused -- an owner or manager with
+      // a fresh pass in the refusal, so the lock screen can offer to pay.
+      if (payload.scope === 'billing' && canHoldBillingPass(user.role)) return principal;
+      throw new SubscriptionInactiveException(
+        user.business,
+        canHoldBillingPass(user.role) && !payload.imp
+          ? this.jwt.sign(
+              { sub: user.id, businessId: user.businessId, tv: user.tokenVersion, scope: 'billing' },
+              { expiresIn: BILLING_PASS_TTL },
+            )
+          : undefined,
+      );
+    }
     this.cache.set(payload.sub, principal, user.tokenVersion);
     return principal;
   }

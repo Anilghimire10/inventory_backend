@@ -2,12 +2,14 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   BusinessType,
+  PaymentClaimStatus,
   PlatformRole,
   SalesModel,
   SubscriptionPaymentMethod,
 } from '@prisma/client';
 import {
   ArrayMaxSize,
+  ArrayMinSize,
   IsArray,
   IsBoolean,
   IsDateString,
@@ -20,11 +22,13 @@ import {
   IsPositive,
   IsString,
   Length,
+  Matches,
   Max,
   MaxLength,
   Min,
   MinLength,
   ValidateIf,
+  ValidateNested,
 } from 'class-validator';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 
@@ -303,6 +307,13 @@ export class UpdateBusinessDto {
   @IsString()
   @MaxLength(50)
   taxId?: string;
+
+  @ApiPropertyOptional({ nullable: true, description: "The shop's plan, by id; null takes it off any plan (no branch limit)" })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(40)
+  planId?: string | null;
 }
 
 export class SuspendDto {
@@ -383,6 +394,12 @@ export class RecordPaymentDto {
   @IsOptional()
   @IsBoolean()
   emailReceipt?: boolean;
+
+  @ApiPropertyOptional({ description: 'The plan it pays for, by id; the shop moves onto it' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  planId?: string;
 }
 
 // ---- Shop users (support) ----
@@ -493,6 +510,103 @@ export class SendAnnouncementDto {
   scheduledFor?: string;
 }
 
+/** One way shops can pay: shown on their Subscription page. */
+export class PaymentMethodDto {
+  @ApiProperty({ example: 'eSewa' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(60)
+  label: string;
+
+  @ApiProperty({ example: 'eSewa ID 98XXXXXXXX (Inventory Pvt. Ltd.)' })
+  @IsString()
+  @MaxLength(500)
+  details: string;
+
+  @ApiPropertyOptional({ nullable: true, description: 'QR image, from POST /admin/settings/payment-qr' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(500)
+  // Only an uploaded image or an https link: this is put in an <img> on
+  // every owner's screen.
+  @Matches(/^(\/api\/uploads\/|https:\/\/)/, { message: 'qrUrl must be an uploaded image' })
+  qrUrl?: string | null;
+}
+
+/** One price of a plan: 1, 3 or 12 months of subscription, in NPR. */
+export class PlanPriceDto {
+  @ApiProperty({ enum: [1, 3, 12], example: 1 })
+  @Type(() => Number)
+  @IsIn([1, 3, 12])
+  months: number;
+
+  @ApiProperty({ example: 1500, description: 'NPR. Khalti takes nothing under NPR 10.' })
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(10)
+  @Max(1_000_000)
+  amount: number;
+
+  @ApiPropertyOptional({ nullable: true, example: 15, description: 'USD, for shops outside Nepal; left out, they see NPR' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(1)
+  @Max(100_000)
+  amountUsd?: number | null;
+}
+
+/**
+ * A subscription plan. Without an id it is new and gets one; with one it
+ * keeps it, so the shops on it stay on it through a rename or a price change.
+ */
+export class SubscriptionPlanDto {
+  @ApiPropertyOptional({ description: 'Leave out for a new plan' })
+  @IsOptional()
+  @IsString()
+  @Matches(/^[a-z0-9-]{1,40}$/)
+  id?: string;
+
+  @ApiProperty({ example: 'Business' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(40)
+  name: string;
+
+  @ApiPropertyOptional({ example: 'For shops with a few branches' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  description?: string | null;
+
+  @ApiPropertyOptional({ type: [String], description: "What's included, up to 8 short lines" })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(8)
+  @IsString({ each: true })
+  @MaxLength(100, { each: true })
+  features?: string[];
+
+  @ApiPropertyOptional({ nullable: true, description: 'Branches allowed; null or left out is unlimited', example: 3 })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(1000)
+  maxStores?: number | null;
+
+  @ApiProperty({ type: [PlanPriceDto], description: '1 to 3 prices, one per length' })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => PlanPriceDto)
+  prices: PlanPriceDto[];
+}
+
 /** Admin panel → Settings. A field left out is unchanged; null clears it. */
 export class UpdatePlatformSettingsDto {
   @ApiPropertyOptional({ nullable: true, description: 'Trial days for new signups; null uses env TRIAL_DAYS' })
@@ -564,6 +678,47 @@ export class UpdatePlatformSettingsDto {
   @IsOptional()
   @IsBoolean()
   requireAdminTwoFactor?: boolean;
+
+  @ApiPropertyOptional({ nullable: true, description: 'What a subscription costs, as shops should read it' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(200)
+  subscriptionPrice?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, description: 'What to do when paying, e.g. what to write in the remarks' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsString()
+  @MaxLength(1000)
+  paymentInstructions?: string | null;
+
+  @ApiPropertyOptional({ description: "Send full admins the daily summary email" })
+  @IsOptional()
+  @IsBoolean()
+  adminDigestEnabled?: boolean;
+
+  @ApiPropertyOptional({ type: [PaymentMethodDto], nullable: true, description: 'Up to six; null or [] removes them' })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsArray()
+  @ArrayMaxSize(6)
+  @ValidateNested({ each: true })
+  @Type(() => PaymentMethodDto)
+  paymentMethods?: PaymentMethodDto[] | null;
+
+  @ApiPropertyOptional({
+    type: () => [SubscriptionPlanDto],
+    nullable: true,
+    description: 'Up to six, in the order owners see them; null or [] offers none',
+  })
+  @IsOptional()
+  @ValidateIf((_o, v) => v !== null)
+  @IsArray()
+  @ArrayMaxSize(6)
+  @ValidateNested({ each: true })
+  @Type(() => SubscriptionPlanDto)
+  plans?: SubscriptionPlanDto[] | null;
 }
 
 // ---- Renewals ----
@@ -598,4 +753,54 @@ export class QueryOnboardingDto {
   @IsOptional()
   @IsIn(['trial', 'recent', 'all'])
   scope: 'trial' | 'recent' | 'all' = 'trial';
+}
+
+// ---- Payment reports ("I've paid") ----
+
+export class QueryPaymentClaimsDto extends PaginationDto {
+  @ApiPropertyOptional({ enum: PaymentClaimStatus, default: PaymentClaimStatus.PENDING })
+  @IsOptional()
+  @IsEnum(PaymentClaimStatus)
+  status?: PaymentClaimStatus;
+}
+
+/** Confirm a report: records the payment. Months default to what the shop said, else 1. */
+export class ConfirmPaymentClaimDto {
+  @ApiPropertyOptional({ description: 'Months it pays for. Give this or periodTo, not both.' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(36)
+  months?: number;
+
+  @ApiPropertyOptional({ description: 'Or an exact end date for the period' })
+  @IsOptional()
+  @IsDateString()
+  periodTo?: string;
+
+  @ApiPropertyOptional({ description: 'The plan it pays for, if not the one the shop reported' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  planId?: string;
+
+  @ApiPropertyOptional({ description: 'The amount actually received, if not what the shop reported' })
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @IsPositive()
+  amount?: number;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  emailReceipt?: boolean;
+}
+
+export class RejectPaymentClaimDto {
+  @ApiProperty({ example: 'No eSewa payment with that transaction ID' })
+  @IsString()
+  @MinLength(3)
+  @MaxLength(300)
+  reason: string;
 }

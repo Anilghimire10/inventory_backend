@@ -9,7 +9,7 @@ import { BusinessType, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { SettingsService } from '../settings/settings.service';
+import { SettingsService, pricingCurrency } from '../settings/settings.service';
 import { MailService } from '../mail/mail.service';
 import { PaginationDto, paginate } from '../common/dto/pagination.dto';
 import { normalizeEmail } from '../common/email';
@@ -17,7 +17,6 @@ import { TX_OPTS } from '../common/prisma-tx';
 import {
   DAY_MS,
   daysUntil,
-  paymentPeriod,
   subscriptionStatus,
   trialEndsAt,
 } from '../common/subscription';
@@ -25,6 +24,7 @@ import { Actor, PlatformAuditService } from './platform-audit.service';
 import { BusinessService } from '../business/business.service';
 import { AuthService } from '../auth/auth.service';
 import { isSubscriptionActive } from '../common/subscription';
+import { lockedRenewal } from '../common/subscription-renewal';
 import { SubscriptionRemindersService } from './subscription-reminders.service';
 import { PlatformBillingService } from './platform-billing.service';
 import {
@@ -296,9 +296,19 @@ export class PlatformService {
       },
     });
 
-    const lastActive = await this.lastActive([id]);
+    const [lastActive, setup] = await Promise.all([
+      this.lastActive([id]),
+      // The same first steps the shop sees on its Dashboard.
+      this.business.setup(id),
+    ]);
+    const plan = await this.settings.plan(business.planId);
     return {
       ...business,
+      setup,
+      // The plan by name and limit (null: none, or since removed), and the
+      // branches it's counted against.
+      plan: plan ? { id: plan.id, name: plan.name, maxStores: plan.maxStores } : null,
+      activeStores: business.stores.filter((s) => s.isActive).length,
       lastActiveAt: lastActive.get(id) ?? null,
       subscriptionStatus: subscriptionStatus(business, business._count.subscriptionPayments),
       totalSalesValue: round2(Number(salesAgg._sum.total ?? 0)),
@@ -374,6 +384,9 @@ export class PlatformService {
 
   async updateBusiness(actor: Actor, id: string, dto: UpdateBusinessDto) {
     const before = await this.getBusinessOrThrow(id);
+    // An admin may put a shop on any plan, even one smaller than its open
+    // branches: those stay open, it just can't open more.
+    if (dto.planId && !(await this.settings.plan(dto.planId))) throw new BadRequestException('No such plan');
     const updated = await this.prisma.business.update({
       where: { id },
       data: {
@@ -460,34 +473,42 @@ export class PlatformService {
   /** Record money received and extend the subscription, atomically. */
   async recordPayment(actor: Actor, businessId: string, dto: RecordPaymentDto) {
     const business = await this.getBusinessOrThrow(businessId);
-    const { from, to, newEnd } = paymentPeriod({
-      now: new Date(),
-      currentEnd: business.isSubscribed ? business.subscribedTo : null,
-      months: dto.months,
-      periodFrom: dto.periodFrom ? new Date(dto.periodFrom) : undefined,
-      periodTo: dto.periodTo ? new Date(dto.periodTo) : undefined,
-    });
+    const plans = await this.settings.plans();
+    const plan = dto.planId ? (plans.find((p) => p.id === dto.planId) ?? null) : null;
+    if (dto.planId && !plan) throw new BadRequestException('No such plan');
 
-    const [payment, updated] = await this.prisma.$transaction([
-      this.prisma.subscriptionPayment.create({
+    const { payment, updated, from, to, previousEnd, convertedFrom } = await this.prisma.$transaction(async (tx) => {
+      const r = await lockedRenewal(tx, {
+        businessId,
+        plans,
+        planId: plan?.id ?? null,
+        now: new Date(),
+        months: dto.months,
+        periodFrom: dto.periodFrom ? new Date(dto.periodFrom) : undefined,
+        periodTo: dto.periodTo ? new Date(dto.periodTo) : undefined,
+      });
+      const payment = await tx.subscriptionPayment.create({
         data: {
           businessId,
           amount: dto.amount,
-          currency: (dto.currency ?? business.currency).toUpperCase(),
+          // Plans are priced in NPR, or USD for shops outside Nepal.
+          currency: (dto.currency ?? pricingCurrency(business.currency)).toUpperCase(),
           method: dto.method,
           reference: dto.reference,
-          periodFrom: from,
-          periodTo: to,
+          periodFrom: r.from,
+          periodTo: r.to,
+          planName: plan?.name ?? null,
           note: dto.note,
           recordedByAdminId: actor.adminId,
         },
-      }),
-      this.prisma.business.update({
+      });
+      const updated = await tx.business.update({
         where: { id: businessId },
-        data: { isSubscribed: true, subscribedTo: newEnd },
+        data: { isSubscribed: true, subscribedTo: r.newEnd, ...(plan ? { planId: plan.id } : {}) },
         select: { id: true, name: true, isSubscribed: true, subscribedTo: true },
-      }),
-    ]);
+      });
+      return { payment, updated, ...r };
+    }, TX_OPTS);
 
     await this.audit.record(actor, 'payment.record', {
       businessId,
@@ -496,9 +517,12 @@ export class PlatformService {
         amount: dto.amount,
         currency: payment.currency,
         method: dto.method,
+        plan: plan?.name ?? null,
         periodFrom: from.toISOString(),
         periodTo: to.toISOString(),
-        previousEnd: business.subscribedTo?.toISOString() ?? null,
+        previousEnd: previousEnd?.toISOString() ?? null,
+        // Days left on the old plan, converted for the new one.
+        ...(convertedFrom ? { convertedFrom: convertedFrom.toISOString() } : {}),
       },
     });
 

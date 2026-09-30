@@ -81,6 +81,8 @@ enum PaymentMethod {
   CASH
   CARD
   MOBILE
+  KHALTI
+  CONNECTIPS // NCHL connectIPS: straight from the customer's bank account
   CREDIT
   MIXED
 }
@@ -104,7 +106,21 @@ enum SubscriptionPaymentMethod {
   BANK
   ESEWA
   KHALTI
+  CONNECTIPS // NCHL connectIPS: straight from a bank account
   OTHER
+}
+
+enum PaymentClaimStatus {
+  PENDING // reported by the shop, waiting for an admin
+  CONFIRMED // an admin checked it and recorded the payment
+  REJECTED // an admin couldn't find it; the shop is told why
+  CANCELLED // the shop withdrew it
+}
+
+enum OnlinePaymentStatus {
+  STARTED // sent to eSewa / Khalti; not paid yet as far as we know
+  COMPLETED // the gateway says it's paid, and the payment is recorded
+  FAILED // cancelled, expired, or never completed
 }
 
 // One-time email codes: account verification and password reset.
@@ -152,34 +168,42 @@ model PlatformAdmin {
   supportMessages  SupportMessage[]
   assignedTickets  SupportTicket[]
   sessions         AdminSession[]
+  reviewedClaims   PaymentClaim[]
 }
 
 model Business {
-  id                    String       @id @default(cuid())
+  id                    String          @id @default(cuid())
   name                  String
-  type                  BusinessType @default(OTHER)
-  salesModel            SalesModel   @default(RETAIL)
-  currency              String       @default("USD")
+  type                  BusinessType    @default(OTHER)
+  salesModel            SalesModel      @default(RETAIL)
+  currency              String          @default("USD")
   /// IANA zone the shop's day is cut on -- reports, day buckets and the
   /// hour-of-day chart all key off this, not off the server's UTC clock.
-  timezone              String       @default("Asia/Kathmandu")
+  timezone              String          @default("Asia/Kathmandu")
   taxId                 String? // PAN/VAT registration number
-  showTaxIdOnBill       Boolean      @default(false) // when on, the PAN/VAT number prints on bills
-  taxInclusive          Boolean      @default(false) // selling prices include tax (backed out at sale time)
-  taxEnabled            Boolean      @default(true) // master switch: when off, no sale charges tax
+  showTaxIdOnBill       Boolean         @default(false) // when on, the PAN/VAT number prints on bills
+  taxInclusive          Boolean         @default(false) // selling prices include tax (backed out at sale time)
+  taxEnabled            Boolean         @default(true) // master switch: when off, no sale charges tax
   /// Cashiers count the drawer without being shown what it should hold, and
   /// never see the variance. Owners and managers always see both.
-  shiftBlindClose       Boolean      @default(false)
+  shiftBlindClose       Boolean         @default(false)
   /// A drawer off by more than this can't be closed without a note saying
   /// why. Null: a note is never required.
-  shiftVarianceNoteOver Decimal?     @db.Decimal(12, 2)
-  isSuspended           Boolean      @default(false) // suspended by a platform admin
+  shiftVarianceNoteOver Decimal?        @db.Decimal(12, 2)
+  /// The tenders this shop takes, chosen by the owner in Settings: the POS,
+  /// khata, supplier and refund pickers offer only these. Cash is always in.
+  acceptedTenders       PaymentMethod[] @default([CASH, CARD, MOBILE])
+  /// The subscription plan the shop is on (an id from PlatformSettings.plans):
+  /// set when a payment for it goes through, or by an admin. Its branch limit
+  /// is enforced; null (a trial, or a plan since deleted) has no limit.
+  planId                String?
+  isSuspended           Boolean         @default(false) // suspended by a platform admin
   suspendedReason       String? // shown to the business's users when sign-in is refused
   suspendedAt           DateTime?
-  isSubscribed          Boolean      @default(true) // paid/active subscription (Fonepay later)
+  isSubscribed          Boolean         @default(true) // paid/active subscription (Fonepay later)
   subscribedTo          DateTime? // subscription end date; null = no expiry
-  createdAt             DateTime     @default(now())
-  updatedAt             DateTime     @updatedAt
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
 
   subscriptionPayments SubscriptionPayment[]
   platformAuditLogs    PlatformAuditLog[]
@@ -205,6 +229,8 @@ model Business {
   cashMovements  CashMovement[]
   payments       Payment[]
   serials        Serial[]
+  paymentClaims  PaymentClaim[]
+  onlinePayments OnlinePayment[]
 }
 
 model Store {
@@ -263,6 +289,9 @@ model User {
   cashMovements        CashMovement[]
   notificationReceipts NotificationReceipt[]
   notifications        Notification[]
+
+  paymentClaims  PaymentClaim[]
+  onlinePayments OnlinePayment[]
 
   @@index([businessId])
 }
@@ -882,6 +911,46 @@ model AuditLog {
 
 // A subscription payment recorded by a platform admin. Recording one extends
 // Business.subscribedTo; a business with no rows here is on its trial.
+/// "I've paid": a shop telling us it paid, with what an admin needs to find
+/// the money -- method, transaction reference, a screenshot. Confirming it
+/// records a SubscriptionPayment the usual way and extends the subscription.
+/// One pending report per shop at a time.
+model PaymentClaim {
+  id                String                    @id @default(cuid())
+  businessId        String
+  business          Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  /// Who reported it. SET NULL with a snapshot, so the report outlives the user.
+  submittedById     String?
+  submittedBy       User?                     @relation(fields: [submittedById], references: [id], onDelete: SetNull)
+  submittedByName   String
+  amount            Decimal                   @db.Decimal(12, 2)
+  currency          String
+  method            SubscriptionPaymentMethod
+  /// Transaction ID, bank reference or receipt number: what to look for.
+  reference         String?
+  /// Months the shop says it paid for; the admin can change it on confirming.
+  months            Int?
+  /// The plan the shop says it paid for, and its name then.
+  planId            String?
+  planName          String?
+  note              String?
+  /// A screenshot of the payment, uploaded like a product image.
+  proofUrl          String?
+  status            PaymentClaimStatus        @default(PENDING)
+  rejectReason      String?
+  reviewedByAdminId String?
+  reviewedBy        PlatformAdmin?            @relation(fields: [reviewedByAdminId], references: [id], onDelete: SetNull)
+  reviewedAt        DateTime?
+  /// The payment recorded when it was confirmed.
+  paymentId         String?                   @unique
+  payment           SubscriptionPayment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([businessId, createdAt])
+}
+
 model SubscriptionPayment {
   id                String                    @id @default(cuid())
   businessId        String
@@ -895,11 +964,50 @@ model SubscriptionPayment {
   receiptNo         Int                       @unique @default(autoincrement())
   periodFrom        DateTime
   periodTo          DateTime
+  /// The plan it paid for, by name as it was then (plans can be renamed).
+  planName          String?
   note              String?
   recordedByAdminId String?
   recordedByAdmin   PlatformAdmin?            @relation(fields: [recordedByAdminId], references: [id], onDelete: SetNull)
   createdAt         DateTime                  @default(now())
 
+  claim         PaymentClaim?
+  onlinePayment OnlinePayment?
+
+  @@index([businessId, createdAt])
+}
+
+/// A subscription payment made through eSewa or Khalti from the shop app.
+/// Created when the owner is sent to the gateway; completed only once the
+/// gateway's own status API says it is paid (never on the browser's word).
+model OnlinePayment {
+  id            String                    @id @default(cuid())
+  businessId    String
+  business      Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  startedById   String?
+  startedBy     User?                     @relation(fields: [startedById], references: [id], onDelete: SetNull)
+  gateway       SubscriptionPaymentMethod // ESEWA, KHALTI or CONNECTIPS
+  months        Int
+  /// The plan being paid for; the shop moves onto it when this completes.
+  planId        String?
+  planName      String?
+  amount        Decimal                   @db.Decimal(12, 2)
+  currency      String
+  status        OnlinePaymentStatus       @default(STARTED)
+  /// Khalti's pidx, or the TXNID sent to connectIPS (it takes 20 characters
+  /// at most, so not our id). eSewa is sent our own id as its transaction_uuid.
+  gatewayRef    String?                   @unique
+  /// The gateway's transaction id once paid: eSewa ref_id, Khalti transaction_id.
+  transactionId String?
+  failReason    String?
+  /// The payment recorded when it completed.
+  paymentId     String?                   @unique
+  payment       SubscriptionPayment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  createdAt     DateTime                  @default(now())
+  completedAt   DateTime?
+  updatedAt     DateTime                  @updatedAt
+
+  @@index([status, createdAt])
   @@index([businessId, createdAt])
 }
 
@@ -1081,6 +1189,25 @@ model PlatformSettings {
   /// When on, an admin without two-factor can only reach their Account page
   /// (to set it up) until they do.
   requireAdminTwoFactor Boolean  @default(false)
+  /// How shops pay, shown on the shop app's Subscription page: a price line
+  /// ("NPR 1,500 a month · NPR 15,000 a year"), instructions, and up to six
+  /// payment methods -- [{ label, details, qrUrl? }] -- e.g. eSewa with its
+  /// QR code, or a bank account.
+  subscriptionPrice     String?
+  paymentInstructions   String?
+  paymentMethods        Json?
+  /// Replaced by `plans`; its prices became the "Standard" plan. Unused.
+  onlinePlans           Json?
+  /// The subscription plans shops choose from (admin panel -> Settings):
+  /// [{ id, name, description, features[], maxStores (null: unlimited),
+  ///    prices: [{ months, amount }] }], amounts in NPR.
+  plans                 Json?
+  /// A morning email to every full admin: payments to confirm, subscriptions
+  /// ending this week, shops locked since yesterday, tickets waiting.
+  adminDigestEnabled    Boolean  @default(true)
+  /// The day (Nepal time, YYYY-MM-DD) it last went out. Claimed with a
+  /// guarded update, so two servers can't both send it.
+  adminDigestSentOn     String?
   updatedAt             DateTime @updatedAt
   updatedBy             String? // admin email snapshot
 }

@@ -6,6 +6,7 @@ export const METHOD_LABEL: Record<SubscriptionPaymentMethod, string> = {
   BANK: 'Bank transfer',
   ESEWA: 'eSewa',
   KHALTI: 'Khalti',
+  CONNECTIPS: 'connectIPS',
   OTHER: 'Other',
 };
 

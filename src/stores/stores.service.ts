@@ -1,15 +1,20 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { SettingsService, planFull } from '../settings/settings.service';
 import { CreateStoreDto, UpdateStoreDto } from './dto/store.dto';
 import { TX_OPTS } from '../common/prisma-tx';
 
 @Injectable()
 export class StoresService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private settings: SettingsService,
+  ) {}
 
   /**
    * Open a new branch carrying the business's existing catalog at zero
@@ -24,6 +29,7 @@ export class StoresService {
    * transfer or adjustment.
    */
   async create(businessId: string, dto: CreateStoreDto) {
+    await this.assertRoomForBranch(businessId);
     // One transaction: a half-applied create leaves a branch that exists but
     // carries nothing, and the only repair is re-adding every product by hand
     // through setStores. The seed is part of opening the branch, not a
@@ -71,6 +77,8 @@ export class StoresService {
     if (dto.isActive === false && store.isActive) {
       await this.assertAnotherActive(businessId, id);
     }
+    // Reopening a branch counts against the plan like opening a new one.
+    if (dto.isActive === true && !store.isActive) await this.assertRoomForBranch(businessId);
     return this.prisma.store.update({ where: { id }, data: dto });
   }
 
@@ -81,6 +89,21 @@ export class StoresService {
       where: { id },
       data: { isActive: false },
     });
+  }
+
+  /**
+   * The shop's plan limits how many branches it has open. No plan (a trial,
+   * or one since removed) or an unlimited one: no limit. PLAN_LIMIT lets the
+   * app point the owner at the Subscription page.
+   */
+  private async assertRoomForBranch(businessId: string) {
+    const business = await this.prisma.business.findUnique({ where: { id: businessId }, select: { planId: true } });
+    const plan = await this.settings.plan(business?.planId);
+    if (!plan || plan.maxStores === null) return;
+    const open = await this.prisma.store.count({ where: { businessId, isActive: true } });
+    if (open >= plan.maxStores) {
+      throw new ForbiddenException({ statusCode: 403, error: 'Forbidden', code: 'PLAN_LIMIT', message: planFull(plan) });
+    }
   }
 
   /**

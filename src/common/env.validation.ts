@@ -112,6 +112,10 @@ export function validateEnv(config: Record<string, unknown>) {
   if (transport && !['resend', 'log'].includes(transport)) {
     errors.push(`MAIL_TRANSPORT must be "resend" or "log" (got "${transport}").`);
   }
+  // Every email to one developer's inbox: fine locally, a disaster live.
+  if (isProd && get('MAIL_REDIRECT_TO')) {
+    errors.push('MAIL_REDIRECT_TO sends every email to one address and cannot be used in production — remove it.');
+  }
   if (isProd && transport === 'log') {
     errors.push(
       'MAIL_TRANSPORT=log discards all email and cannot be used in production — ' +

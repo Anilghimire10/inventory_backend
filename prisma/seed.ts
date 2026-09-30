@@ -65,7 +65,7 @@ async function main() {
   if (!business) {
     const passwordHash = await argon2.hash('password123');
     business = await prisma.business.create({
-      data: { name: 'Demo Store', type: BusinessType.RETAIL, currency: 'USD', taxEnabled: true },
+      data: { name: 'Demo Store', type: BusinessType.RETAIL, currency: 'NPR', taxEnabled: true },
     });
     const store = await prisma.store.create({
       data: { businessId: business.id, name: 'Main Store', phone: '555-0100' },
@@ -144,28 +144,28 @@ async function main() {
   // one ('tray', 'strip', 'bottle') fails the whole seed partway through.
   // Pick the nearest canonical unit and put the packaging in the name.
   const productDefs: Array<[string, string, string, string, string, number, number, number, Partial<{ rx: boolean; batch: boolean; taxable: boolean; brand: string; desc: string }>]> = [
-    ['Coca-Cola 500ml', 'Beverages', 'BEV-001', '8901030812345', 'pcs', 0.45, 1.0, 40, { brand: 'Coca-Cola' }],
-    ['Pepsi 500ml', 'Beverages', 'BEV-002', '8901030812346', 'pcs', 0.4, 0.9, 40, { brand: 'Pepsi' }],
-    ['Mineral Water 1L', 'Beverages', 'BEV-003', '8901030812347', 'pcs', 0.2, 0.5, 60, { brand: 'Aquafina' }],
-    ['Orange Juice 1L', 'Beverages', 'BEV-004', '8901030812348', 'pcs', 1.2, 2.4, 25, { brand: 'Real' }],
-    ['Potato Chips 100g', 'Snacks', 'SNK-001', '8901030812349', 'pcs', 0.6, 1.2, 50, { brand: 'Lay\'s' }],
-    ['Chocolate Bar 60g', 'Snacks', 'SNK-002', '8901030812350', 'pcs', 0.8, 1.5, 45, { brand: 'Cadbury' }],
-    ['Biscuits Family Pack', 'Snacks', 'SNK-003', '8901030812351', 'pcs', 1.1, 2.0, 35, { brand: 'Parle' }],
-    ['Whole Milk 1L', 'Dairy & Eggs', 'DRY-001', '8901030812352', 'pcs', 0.7, 1.3, 30, { batch: true, brand: 'Dairyland' }],
-    ['Cheddar Cheese 200g', 'Dairy & Eggs', 'DRY-002', '8901030812353', 'pcs', 2.5, 4.5, 20, { batch: true, brand: 'Kraft' }],
-    ['Eggs (12)', 'Dairy & Eggs', 'DRY-003', '8901030812354', 'dozen', 1.8, 3.0, 30, { batch: true }],
-    ['White Bread 400g', 'Bakery', 'BKY-001', '8901030812355', 'pcs', 0.5, 1.0, 25, { batch: true }],
-    ['Croissant (2-pack)', 'Bakery', 'BKY-002', '8901030812356', 'pcs', 1.0, 2.0, 20, { batch: true }],
-    ['Dish Soap 500ml', 'Cleaning & Home', 'CLN-001', '8901030812357', 'pcs', 1.3, 2.5, 15, { brand: 'Vim' }],
-    ['Laundry Detergent 2kg', 'Cleaning & Home', 'CLN-002', '8901030812358', 'pcs', 4.0, 7.5, 10, { brand: 'Ariel' }],
-    ['Paracetamol 500mg', 'Health & Pharmacy', 'PHM-001', '8901030812359', 'pkt', 0.5, 1.2, 50, { rx: false, batch: true, brand: 'GSK' }],
-    ['Amoxicillin 250mg', 'Health & Pharmacy', 'PHM-002', '8901030812360', 'pkt', 1.5, 3.5, 30, { rx: true, batch: true, brand: 'Cipla' }],
-    ['Multivitamin Tablets', 'Health & Pharmacy', 'PHM-003', '8901030812361', 'pcs', 3.0, 6.0, 20, { rx: false, batch: true, brand: 'Centrum' }],
-    ['Toothpaste 100g', 'Personal Care', 'PRS-001', '8901030812362', 'pcs', 1.0, 2.2, 25, { brand: 'Colgate' }],
-    ['Shampoo 200ml', 'Personal Care', 'PRS-002', '8901030812363', 'pcs', 2.2, 4.0, 15, { brand: 'Pantene' }],
-    ['Hand Sanitizer 250ml', 'Personal Care', 'PRS-003', '8901030812364', 'pcs', 1.1, 2.0, 20, { brand: 'Dettol' }],
-    ['Universal Charger 20W', 'General', 'GEN-001', '8901030812365', 'pcs', 3.5, 8.0, 8, { brand: 'Anker' }],
-    ['LED Bulb 9W', 'General', 'GEN-002', '8901030812366', 'pcs', 1.5, 3.5, 20, { brand: 'Philips' }],
+    ['Coca-Cola 500ml', 'Beverages', 'BEV-001', '8901030812345', 'pcs', 45, 60, 40, { brand: 'Coca-Cola' }],
+    ['Pepsi 500ml', 'Beverages', 'BEV-002', '8901030812346', 'pcs', 42, 55, 40, { brand: 'Pepsi' }],
+    ['Mineral Water 1L', 'Beverages', 'BEV-003', '8901030812347', 'pcs', 15, 25, 60, { brand: 'Aquafina' }],
+    ['Orange Juice 1L', 'Beverages', 'BEV-004', '8901030812348', 'pcs', 200, 250, 25, { brand: 'Real' }],
+    ['Potato Chips 100g', 'Snacks', 'SNK-001', '8901030812349', 'pcs', 70, 100, 50, { brand: 'Lay\'s' }],
+    ['Chocolate Bar 60g', 'Snacks', 'SNK-002', '8901030812350', 'pcs', 80, 110, 45, { brand: 'Cadbury' }],
+    ['Biscuits Family Pack', 'Snacks', 'SNK-003', '8901030812351', 'pcs', 90, 120, 35, { brand: 'Parle' }],
+    ['Whole Milk 1L', 'Dairy & Eggs', 'DRY-001', '8901030812352', 'pcs', 90, 110, 30, { batch: true, brand: 'Dairyland' }],
+    ['Cheddar Cheese 200g', 'Dairy & Eggs', 'DRY-002', '8901030812353', 'pcs', 450, 600, 20, { batch: true, brand: 'Kraft' }],
+    ['Eggs (12)', 'Dairy & Eggs', 'DRY-003', '8901030812354', 'dozen', 190, 230, 30, { batch: true }],
+    ['White Bread 400g', 'Bakery', 'BKY-001', '8901030812355', 'pcs', 65, 85, 25, { batch: true }],
+    ['Croissant (2-pack)', 'Bakery', 'BKY-002', '8901030812356', 'pcs', 100, 150, 20, { batch: true }],
+    ['Dish Soap 500ml', 'Cleaning & Home', 'CLN-001', '8901030812357', 'pcs', 160, 210, 15, { brand: 'Vim' }],
+    ['Laundry Detergent 2kg', 'Cleaning & Home', 'CLN-002', '8901030812358', 'pcs', 700, 900, 10, { brand: 'Ariel' }],
+    ['Paracetamol 500mg', 'Health & Pharmacy', 'PHM-001', '8901030812359', 'pkt', 15, 25, 50, { rx: false, batch: true, brand: 'GSK' }],
+    ['Amoxicillin 250mg', 'Health & Pharmacy', 'PHM-002', '8901030812360', 'pkt', 60, 90, 30, { rx: true, batch: true, brand: 'Cipla' }],
+    ['Multivitamin Tablets', 'Health & Pharmacy', 'PHM-003', '8901030812361', 'pcs', 900, 1200, 20, { rx: false, batch: true, brand: 'Centrum' }],
+    ['Toothpaste 100g', 'Personal Care', 'PRS-001', '8901030812362', 'pcs', 110, 145, 25, { brand: 'Colgate' }],
+    ['Shampoo 200ml', 'Personal Care', 'PRS-002', '8901030812363', 'pcs', 320, 420, 15, { brand: 'Pantene' }],
+    ['Hand Sanitizer 250ml', 'Personal Care', 'PRS-003', '8901030812364', 'pcs', 180, 250, 20, { brand: 'Dettol' }],
+    ['Universal Charger 20W', 'General', 'GEN-001', '8901030812365', 'pcs', 1500, 2200, 8, { brand: 'Anker' }],
+    ['LED Bulb 9W', 'General', 'GEN-002', '8901030812366', 'pcs', 150, 220, 20, { brand: 'Philips' }],
   ];
 
   const products: Record<string, string> = {};
@@ -300,10 +300,10 @@ async function main() {
       'PO-24001',
       20,
       [
-        ['BEV-001', 100, 0.4],
-        ['BEV-002', 100, 0.35],
-        ['BEV-003', 150, 0.18],
-        ['BEV-004', 60, 1.1],
+        ['BEV-001', 100, 40],
+        ['BEV-002', 100, 38],
+        ['BEV-003', 150, 13],
+        ['BEV-004', 60, 185],
       ],
     ],
     [
@@ -311,11 +311,11 @@ async function main() {
       'PO-24002',
       15,
       [
-        ['DRY-001', 80, 0.6],
-        ['DRY-002', 50, 2.2],
-        ['DRY-003', 120, 1.6],
-        ['BKY-001', 60, 0.45],
-        ['BKY-002', 40, 0.9],
+        ['DRY-001', 80, 85],
+        ['DRY-002', 50, 420],
+        ['DRY-003', 120, 175],
+        ['BKY-001', 60, 60],
+        ['BKY-002', 40, 90],
       ],
     ],
     [
@@ -323,11 +323,11 @@ async function main() {
       'PO-24003',
       10,
       [
-        ['SNK-001', 100, 0.5],
-        ['SNK-002', 80, 0.7],
-        ['SNK-003', 60, 1.0],
-        ['CLN-001', 50, 1.2],
-        ['CLN-002', 30, 3.8],
+        ['SNK-001', 100, 65],
+        ['SNK-002', 80, 72],
+        ['SNK-003', 60, 82],
+        ['CLN-001', 50, 150],
+        ['CLN-002', 30, 660],
       ],
     ],
     [
@@ -335,9 +335,9 @@ async function main() {
       'PO-24004',
       8,
       [
-        ['PHM-001', 200, 0.4],
-        ['PHM-002', 80, 1.3],
-        ['PHM-003', 60, 2.8],
+        ['PHM-001', 200, 13],
+        ['PHM-002', 80, 55],
+        ['PHM-003', 60, 850],
       ],
     ],
     [
@@ -345,11 +345,11 @@ async function main() {
       'PO-24005',
       5,
       [
-        ['PRS-001', 60, 0.9],
-        ['PRS-002', 40, 2.0],
-        ['PRS-003', 70, 1.0],
-        ['GEN-001', 25, 3.2],
-        ['GEN-002', 40, 1.4],
+        ['PRS-001', 60, 100],
+        ['PRS-002', 40, 300],
+        ['PRS-003', 70, 165],
+        ['GEN-001', 25, 1400],
+        ['GEN-002', 40, 140],
       ],
     ],
   ];
@@ -547,7 +547,7 @@ async function main() {
       const qty = 1 + Math.floor(rand() * 4);
       const unitPrice = Number(product.sellingPrice);
       const unitCost = Number(product.costPrice);
-      const discount = status === SaleStatus.COMPLETED && rand() < 0.2 ? 0.5 : 0;
+      const discount = status === SaleStatus.COMPLETED && rand() < 0.2 ? 5 : 0;
       const lineTotal = qty * unitPrice - discount;
       subtotal += lineTotal;
       saleItems.push({

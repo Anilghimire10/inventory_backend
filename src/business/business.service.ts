@@ -1,6 +1,18 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { PaymentMethod, SaleStatus } from '@prisma/client';
+import { SETTLE_METHODS } from '../payments/payments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UpdateBusinessDto } from './business.controller';
+
+/** What every shop starts with (the column default). */
+const DEFAULT_TENDERS: PaymentMethod[] = [PaymentMethod.CASH, PaymentMethod.CARD, PaymentMethod.MOBILE];
+
+/**
+ * The tenders as stored: always cash -- it is the counter default, and what a
+ * part-paid sale falls back to -- and in the pickers' order, not the click order.
+ */
+export const acceptedTenders = (picked: PaymentMethod[]) =>
+  SETTLE_METHODS.filter((m) => m === PaymentMethod.CASH || picked.includes(m));
 
 @Injectable()
 export class BusinessService {
@@ -14,6 +26,31 @@ export class BusinessService {
     return business;
   }
 
+  /**
+   * A new shop's first steps, each true once done: something to sell, stock
+   * of it, someone to help, a sale through the till, and a look at how
+   * customers can pay (any change from the tenders every shop starts with).
+   * One indexed row lookup each, so the Dashboard can ask on every visit.
+   */
+  async setup(businessId: string) {
+    const [business, product, stock, staff, sale] = await Promise.all([
+      this.prisma.business.findUnique({ where: { id: businessId }, select: { acceptedTenders: true } }),
+      this.prisma.product.findFirst({ where: { businessId }, select: { id: true } }),
+      this.prisma.stockItem.findFirst({ where: { businessId, quantity: { gt: 0 } }, select: { id: true } }),
+      this.prisma.user.count({ where: { businessId } }),
+      this.prisma.sale.findFirst({ where: { businessId, status: { not: SaleStatus.HELD } }, select: { id: true } }),
+    ]);
+    if (!business) throw new NotFoundException('Business not found');
+    const tenders = business.acceptedTenders;
+    return {
+      products: !!product,
+      stock: !!stock,
+      paymentMethods: !(tenders.length === 3 && DEFAULT_TENDERS.every((m) => tenders.includes(m))),
+      staff: staff > 1,
+      sale: !!sale,
+    };
+  }
+
   async update(businessId: string, dto: UpdateBusinessDto) {
     await this.get(businessId);
     return this.prisma.business.update({
@@ -21,6 +58,7 @@ export class BusinessService {
       data: {
         ...dto,
         ...(dto.currency ? { currency: dto.currency.toUpperCase() } : {}),
+        ...(dto.acceptedTenders ? { acceptedTenders: acceptedTenders(dto.acceptedTenders) } : {}),
       },
     });
   }

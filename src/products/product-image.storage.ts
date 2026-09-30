@@ -158,6 +158,18 @@ export class ProductImageStorage {
     return data.publicUrl;
   }
 
+  /**
+   * Whether `url` is one `save` could have returned: a name it generates, on
+   * disk or in this bucket. For a URL a client sends back to be shown to
+   * someone else, so it can't point at an image hosted anywhere.
+   */
+  isOwnUrl(url: string): boolean {
+    const name = url.slice(url.lastIndexOf('/') + 1);
+    if (!/^[0-9a-f]{32}\.(png|jpg|gif|webp)$/.test(name)) return false;
+    if (url === `${PRODUCT_PUBLIC_PREFIX}/${name}`) return true;
+    return !!this.client && url === this.client.storage.from(this.bucket).getPublicUrl(name).data.publicUrl;
+  }
+
   private async saveToDisk(name: string, buffer: Buffer): Promise<string> {
     if (!existsSync(PRODUCT_UPLOAD_DIR)) {
       mkdirSync(PRODUCT_UPLOAD_DIR, { recursive: true });

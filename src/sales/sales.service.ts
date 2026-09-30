@@ -827,6 +827,8 @@ export class SalesService {
       CASH: 'Cash',
       CARD: 'Card',
       MOBILE: 'QR / Mobile',
+      KHALTI: 'Khalti',
+      CONNECTIPS: 'connectIPS',
       CREDIT: 'On credit',
       MIXED: 'Part paid',
     };

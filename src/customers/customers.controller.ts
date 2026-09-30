@@ -72,7 +72,7 @@ export class PayCreditDto {
     default: PaymentMethod.CASH,
     description:
       'How they paid. Cash counts towards the till drawer at shift close; ' +
-      'card and QR move the balance without touching it.',
+      'card, QR, Khalti and connectIPS move the balance without touching it.',
   })
   @IsOptional()
   @IsIn(SETTLE_METHODS)

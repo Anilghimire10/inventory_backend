@@ -1,10 +1,13 @@
 import { Body, Controller, ForbiddenException, Get, Patch, Res } from "@nestjs/common";
 import { ApiBearerAuth, ApiPropertyOptional, ApiTags } from "@nestjs/swagger";
-import { SalesModel } from "@prisma/client";
+import { PaymentMethod, SalesModel } from "@prisma/client";
 import type { Response } from "express";
 import { once } from "node:events";
 import {
+  ArrayUnique,
+  IsArray,
   IsBoolean,
+  IsIn,
   IsEnum,
   IsNumber,
   IsOptional,
@@ -18,6 +21,7 @@ import {
   type ValidatorConstraintInterface,
 } from "class-validator";
 import { isValidTimezone } from "../common/timezone";
+import { SETTLE_METHODS } from "../payments/payments.service";
 import { UserRole } from "@prisma/client";
 import { BusinessService } from "./business.service";
 import { Roles } from "../common/decorators/roles.decorator";
@@ -117,6 +121,20 @@ export class UpdateBusinessDto {
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
   shiftVarianceNoteOver?: number | null;
+
+  @ApiPropertyOptional({
+    description:
+      "The tenders this shop takes; the POS and payment pickers offer only " +
+      "these. Cash is always kept, whether sent or not.",
+    enum: SETTLE_METHODS,
+    isArray: true,
+    example: ["CASH", "MOBILE", "KHALTI", "CONNECTIPS"],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsIn(SETTLE_METHODS, { each: true })
+  acceptedTenders?: PaymentMethod[];
 }
 
 @ApiTags("business")
@@ -130,6 +148,13 @@ export class BusinessController {
   @Get()
   get(@CurrentUser() u: AuthUser) {
     return this.business.get(u.businessId);
+  }
+
+  /** Which first steps a new shop has taken, for the Dashboard's Getting started card. */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Get("setup")
+  setup(@CurrentUser() u: AuthUser) {
+    return this.business.setup(u.businessId);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER)

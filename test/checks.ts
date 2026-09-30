@@ -7,7 +7,7 @@
  * an integration suite.
  */
 import assert from 'assert';
-import { createHash } from 'crypto';
+import { createHash, createVerify, generateKeyPairSync } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
 import { PaymentMethod, PlatformRole, Prisma, SaleStatus, UserRole } from '@prisma/client';
 import { ShiftsService } from '../src/shifts/shifts.service';
@@ -19,6 +19,8 @@ import { PlatformAnnouncementsService, audienceWhere } from '../src/platform/pla
 import { SalesService } from '../src/sales/sales.service';
 import { CustomersService } from '../src/customers/customers.service';
 import { PaymentsService } from '../src/payments/payments.service';
+import { acceptedTenders } from '../src/business/business.service';
+import { pricedFor, pricingCurrency } from '../src/settings/settings.service';
 import { CategoriesService } from '../src/categories/categories.service';
 import { MailService } from '../src/mail/mail.service';
 import { AuthService } from '../src/auth/auth.service';
@@ -40,6 +42,10 @@ import { TaxesService } from '../src/taxes/taxes.service';
 import { LogRetentionCron } from '../src/settings/log-retention.cron';
 import { SupportService } from '../src/support/support.service';
 import { SubscriptionService } from '../src/subscription/subscription.service';
+import { ProductImageStorage } from '../src/products/product-image.storage';
+import { PlatformDigestService } from '../src/platform/platform-digest.service';
+import { OnlinePaymentsService, returnOrigin } from '../src/subscription/online-payments.service';
+import { PaymentGateways, connectIpsToken, esewaSignature } from '../src/subscription/payment-gateways';
 import { readAmount, readProductRow } from '../src/products/product-import';
 import { QueryTicketsDto } from '../src/support/dto/support.dto';
 import { platformRoleAllows } from '../src/platform/platform-auth.guard';
@@ -59,6 +65,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   DAY_MS,
   addMonths,
+  convertedEnd,
   daysUntil,
   isSubscriptionActive,
   paymentPeriod,
@@ -1375,6 +1382,14 @@ async function aPartPaymentKeepsItsTender() {
   assert.strictEqual(card.payment.method, PaymentMethod.CARD, 'the money reads card');
   assert.strictEqual(card.payment.amount, 150);
 
+  // Khalti and connectIPS are tenders like card: the money reads what it was
+  // paid on, so it never lands in the drawer's expected cash.
+  for (const method of [PaymentMethod.KHALTI, PaymentMethod.CONNECTIPS]) {
+    const wallet = await checkout(method, 200);
+    assert.strictEqual(wallet.sale.paymentMethod, PaymentMethod.MIXED);
+    assert.strictEqual(wallet.payment.method, method);
+  }
+
   // A client that names no tender for the part paid gets the counter default.
   const credit = await checkout(PaymentMethod.CREDIT, 100);
   assert.strictEqual(credit.payment.method, PaymentMethod.CASH);
@@ -1384,6 +1399,35 @@ async function aPartPaymentKeepsItsTender() {
  * A customer with a balance or any history can't be deleted. The database
  * never refuses (the links are ON DELETE SET NULL), so the service has to.
  */
+/** A shop's tenders keep cash, whatever the owner unticks, and keep the pickers' order. */
+function aShopAlwaysTakesCash() {
+  assert.deepStrictEqual(acceptedTenders([PaymentMethod.CONNECTIPS, PaymentMethod.KHALTI]), [
+    PaymentMethod.CASH,
+    PaymentMethod.KHALTI,
+    PaymentMethod.CONNECTIPS,
+  ]);
+  assert.deepStrictEqual(acceptedTenders([]), [PaymentMethod.CASH]);
+}
+
+/** Getting started: a new shop has done nothing; each step ticks from real data. */
+async function aNewShopsFirstSteps() {
+  const shop = (o: { tenders?: PaymentMethod[]; product?: boolean; stock?: boolean; users?: number; sale?: boolean }) =>
+    new BusinessService(
+      stub<PrismaService>({
+        business: { findUnique: async () => ({ acceptedTenders: o.tenders ?? [PaymentMethod.CASH, PaymentMethod.CARD, PaymentMethod.MOBILE] }) },
+        product: { findFirst: async () => (o.product ? { id: 'p1' } : null) },
+        stockItem: { findFirst: async () => (o.stock ? { id: 's1' } : null) },
+        user: { count: async () => o.users ?? 1 },
+        sale: { findFirst: async () => (o.sale ? { id: 'sa1' } : null) },
+      }),
+    ).setup('b1');
+  assert.deepStrictEqual(await shop({}), { products: false, stock: false, paymentMethods: false, staff: false, sale: false });
+  assert.deepStrictEqual(
+    await shop({ tenders: [PaymentMethod.CASH, PaymentMethod.KHALTI], product: true, stock: true, users: 2, sale: true }),
+    { products: true, stock: true, paymentMethods: true, staff: true, sale: true },
+  );
+}
+
 async function aCustomerWithHistoryIsKept() {
   const build = (customer: { creditBalance: number }, sales: number, payments: number) => {
     let deleted = false;
@@ -1786,7 +1830,7 @@ async function principalCacheCannotResurrectARetiredToken() {
     },
   });
   const config = stub<ConfigService>({ getOrThrow: () => 'x'.repeat(48) });
-  const strategy = new JwtStrategy(config, prisma, cache);
+  const strategy = new JwtStrategy(config, prisma, cache, stub<JwtService>({}));
 
   // First call reads through and caches at version 1.
   await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 1 });
@@ -2195,6 +2239,7 @@ async function aNewStoreOpensCarryingTheCatalog() {
   let created: any = null;
   const svc = new StoresService(
     stub<PrismaService>({
+      business: { findUnique: async () => ({ planId: null }) },
       // create() opens a store and seeds its catalog in one transaction, so
       // the delegates live on the tx handed to the callback.
       $transaction: async (fn: any) =>
@@ -2211,6 +2256,7 @@ async function aNewStoreOpensCarryingTheCatalog() {
           },
         }),
     }),
+    stub<SettingsService>({ plan: async () => null }),
   );
 
   const store = await svc.create('b1', { name: 'Branch' } as any);
@@ -2229,6 +2275,7 @@ async function aNewStoreOpensCarryingTheCatalog() {
   let touched = false;
   const empty = new StoresService(
     stub<PrismaService>({
+      business: { findUnique: async () => ({ planId: null }) },
       $transaction: async (fn: any) =>
         fn({
           store: { create: async () => ({ id: 's3' }) },
@@ -2236,6 +2283,7 @@ async function aNewStoreOpensCarryingTheCatalog() {
           stockItem: { createMany: async () => { touched = true; return { count: 0 }; } },
         }),
     }),
+    stub<SettingsService>({ plan: async () => null }),
   );
   await empty.create('b1', { name: 'First' } as any);
   assert.strictEqual(touched, false, 'no products means no seeding call at all');
@@ -2510,6 +2558,16 @@ function subscriptionRules() {
   assert.throws(() => paymentPeriod({ now, currentEnd: null, months: 1, periodTo: inDays(9) }), /either months or periodTo/);
   assert.throws(() => paymentPeriod({ now, currentEnd: null, periodTo: inDays(-1) }), /must end after/);
 
+  // Switching plan converts the days left at the plans' monthly rates (the shortest length's price).
+  const basic = { id: 'basic', prices: [{ months: 1, amount: 2000 }, { months: 12, amount: 20000 }] };
+  const chain = { id: 'chain', prices: [{ months: 1, amount: 5000 }] };
+  assert.strictEqual(convertedEnd({ now, currentEnd: inDays(100), fromPlan: basic, toPlan: chain })!.getTime(), inDays(40).getTime(), 'upgrade: fewer days');
+  assert.strictEqual(convertedEnd({ now, currentEnd: inDays(40), fromPlan: chain, toPlan: basic })!.getTime(), inDays(100).getTime(), 'downgrade: more days');
+  assert.strictEqual(convertedEnd({ now, currentEnd: inDays(40), fromPlan: basic, toPlan: basic })!.getTime(), inDays(40).getTime(), 'same plan: unchanged');
+  assert.strictEqual(convertedEnd({ now, currentEnd: inDays(40), fromPlan: null, toPlan: chain })!.getTime(), inDays(40).getTime(), 'a trial keeps its days');
+  assert.strictEqual(convertedEnd({ now, currentEnd: inDays(-3), fromPlan: basic, toPlan: chain })!.getTime(), inDays(-3).getTime(), 'nothing left, nothing to convert');
+  assert.strictEqual(convertedEnd({ now, currentEnd: null, fromPlan: basic, toPlan: chain }), null);
+
   // Run once a day, every reminder threshold is hit exactly once.
   const end = new Date('2026-10-01T00:00:00Z');
   const seen = Array.from({ length: 10 }, (_, i) =>
@@ -2589,6 +2647,7 @@ async function aNotificationIsReadPerPerson() {
   writes.length = 0;
   await service.dismiss('other-shop', 'u2', 'n9');
   assert.strictEqual(writes.length, 0, "another shop's notification can't be touched");
+
 }
 
 /**
@@ -2916,9 +2975,10 @@ async function aShopSeesItsOwnSubscription() {
     business: {
       findUnique: async ({ where }: any) =>
         where.id === 'paid'
-          ? { isSubscribed: true, subscribedTo: new Date(now + 25 * day), createdAt: new Date(now - 90 * day) }
-          : { isSubscribed: true, subscribedTo: new Date(now + 9 * day), createdAt: new Date(now - 5 * day) },
+          ? { isSubscribed: true, subscribedTo: new Date(now + 25 * day), createdAt: new Date(now - 90 * day), planId: 'business' }
+          : { isSubscribed: true, subscribedTo: new Date(now + 9 * day), createdAt: new Date(now - 5 * day), planId: null },
     },
+    store: { count: async () => 2 },
     subscriptionPayment: {
       findMany: async ({ where }: any) => (where.businessId === 'paid' ? payments : []),
       findFirst: async ({ where }: any) => {
@@ -2929,13 +2989,24 @@ async function aShopSeesItsOwnSubscription() {
       },
     },
   };
+  const payment = { price: 'NPR 1,500 a month', instructions: 'Write your shop name', methods: [] };
   const settings = stub<SettingsService>({
     get: async () => ({ billingName: 'Platform', billingTaxId: null, billingAddress: null, billingPhone: null, billingEmail: null }),
+    paymentInfo: async () => payment,
+    plans: async () => [
+      { id: 'business', name: 'Business', description: null, features: [], maxStores: 3, prices: [{ months: 1, amount: 3000 }] },
+    ],
   } as any);
-  const service = new SubscriptionService(stub<PrismaService>(db), settings);
+  db.paymentClaim = { findMany: async () => [] };
+  const online = stub<OnlinePaymentsService>({ options: async () => ({ gateways: [], currency: 'NPR' }) });
+  const service = new SubscriptionService(stub<PrismaService>(db), settings, stub<MailService>({}), online);
 
   const paid = await service.overview('paid');
   assert.strictEqual(paid.status, 'active', 'paid with 25 days left is active');
+  assert.deepStrictEqual(paid.payment, payment, 'the page shows how to pay');
+  assert.strictEqual(paid.currentPlan?.name, 'Business', 'the plan the shop is on');
+  assert.strictEqual(paid.plans.length, 1, 'and every plan to choose from');
+  assert.strictEqual(paid.activeStores, 2);
   assert.strictEqual(paid.daysLeft, 25);
   assert.strictEqual(paid.trial, false);
   assert.strictEqual(paid.periodStart, payments[0].periodFrom.toISOString(), 'the period starts at the latest payment');
@@ -2948,6 +3019,7 @@ async function aShopSeesItsOwnSubscription() {
   assert.strictEqual(trial.status, 'trial');
   assert.strictEqual(trial.trial, true);
   assert.strictEqual(trial.daysLeft, 9);
+  assert.strictEqual(trial.currentPlan, null, 'a trial is on no plan yet');
 
   const r = await service.receipt('paid', 'p2');
   assert.strictEqual(r.receiptNo, 'SUB-000042');
@@ -3098,6 +3170,438 @@ function productImportReadsRowsSafely() {
   // A cell an export neutralised against formulas comes back as written.
   assert.strictEqual(readProductRow({ name: "'=Deal", sku: "'-001" }).fields.name, '=Deal');
   assert.strictEqual(readProductRow({ name: 'X', sku: "'-001" }).sku, '-001');
+}
+
+/**
+ * How shops pay, as stored by admins: the JSON is read defensively, so a
+ * malformed entry is dropped instead of reaching every owner's screen.
+ */
+async function paymentDetailsAreReadSafely() {
+  const settings = new SettingsService(
+    stub<PrismaService>({
+      platformSettings: {
+        upsert: async () => ({
+          subscriptionPrice: 'NPR 1,500 a month',
+          paymentInstructions: null,
+          paymentMethods: [
+            { label: 'eSewa', details: '98XXXXXXXX', qrUrl: '/api/uploads/products/qr.png' },
+            { label: 'Bank', details: 'Nabil A/C 0123' },
+            { details: 'no label' },
+            'junk',
+            null,
+          ],
+        }),
+      },
+    }),
+  );
+  const info = await settings.paymentInfo();
+  assert.strictEqual(info.price, 'NPR 1,500 a month');
+  assert.deepStrictEqual(info.methods, [
+    { label: 'eSewa', details: '98XXXXXXXX', qrUrl: '/api/uploads/products/qr.png' },
+    { label: 'Bank', details: 'Nabil A/C 0123', qrUrl: null },
+  ]);
+}
+
+/**
+ * A locked shop's billing pass: an owner or manager refused for a lapsed
+ * subscription gets one in the refusal, a cashier doesn't; the pass signs in
+ * as billing-only (and stays so even from the cache), and it is never cached
+ * as a full session.
+ */
+async function aLockedShopGetsABillingPassOnly() {
+  const lapsed = { isSuspended: false, suspendedReason: null, isSubscribed: true, subscribedTo: new Date(Date.now() - 30 * 86_400_000) };
+  let role = 'OWNER';
+  const prisma = stub<PrismaService>({
+    user: {
+      findUnique: async () => ({
+        id: 'u1', businessId: 'b1', storeId: null, role, email: 'o@x.com', isActive: true, tokenVersion: 0, business: lapsed,
+      }),
+    },
+  });
+  const cached: string[] = [];
+  const cache = stub<PrincipalCache>({ get: () => undefined, set: (id: string) => cached.push(id) });
+  const signed: any[] = [];
+  const jwt = stub<JwtService>({ sign: (payload: any) => (signed.push(payload), 'billing-pass') });
+  const strategy = new JwtStrategy(stub<ConfigService>({ getOrThrow: () => 'x'.repeat(48) }), prisma, cache, jwt);
+
+  const refused = await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 0 }).then(
+    () => null,
+    (e: any) => e.getResponse(),
+  );
+  assert.strictEqual(refused?.code, 'SUBSCRIPTION_INACTIVE');
+  assert.strictEqual(refused?.billingToken, 'billing-pass', 'a locked owner is offered a billing pass');
+  assert.strictEqual(signed[0].scope, 'billing');
+
+  const pass = await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 0, scope: 'billing' });
+  assert.strictEqual(pass.billingOnly, true, 'the pass signs in as billing-only');
+  assert.deepStrictEqual(cached, [], 'nothing is cached for a locked shop');
+
+  role = 'CASHIER';
+  const cashier = await strategy.validate({ sub: 'u1', businessId: 'b1', tv: 0 }).then(
+    () => null,
+    (e: any) => e.getResponse(),
+  );
+  assert.strictEqual(cashier?.billingToken, undefined, 'a cashier gets no pass');
+  await assert.rejects(
+    strategy.validate({ sub: 'u1', businessId: 'b1', tv: 0, scope: 'billing' }),
+    /inactive/,
+    "and a cashier can't use one",
+  );
+}
+
+/**
+ * The admins' daily summary goes to full admins only, once a day however
+ * many times the job runs, not at all when turned off, and not on a day with
+ * nothing in it.
+ */
+async function adminDigestGoesOutOncePerDay() {
+  let sentOn: string | null = null;
+  let enabled = true;
+  let empty = false;
+  const sent: string[] = [];
+  const count = async () => (empty ? 0 : 1);
+  const db: any = {
+    paymentClaim: { findMany: async () => [], count },
+    business: { findMany: async () => [], count },
+    $queryRaw: async () => [{ n: BigInt(empty ? 0 : 2) }],
+    onlinePayment: { aggregate: async () => ({ _count: 0, _sum: { amount: null } }) },
+    platformSettings: {
+      // The real query's guard: not yet sent, or last sent on another day.
+      updateMany: async ({ data }: any) => {
+        if (sentOn === data.adminDigestSentOn) return { count: 0 };
+        sentOn = data.adminDigestSentOn;
+        return { count: 1 };
+      },
+    },
+    platformAdmin: {
+      findMany: async ({ where }: any) => {
+        assert.strictEqual(where.role, 'ADMIN', 'full admins only');
+        return [{ email: 'a@x.com', name: 'A' }, { email: 'b@x.com', name: 'B' }];
+      },
+    },
+  };
+  const digest = new PlatformDigestService(
+    stub<PrismaService>(db),
+    stub<MailService>({ sendAdminDigest: async (to: string) => void sent.push(to) }),
+    stub<SettingsService>({ get: async () => ({ adminDigestEnabled: enabled }) } as any),
+  );
+  const morning = new Date('2026-10-01T02:20:00Z'); // 08:05 in Kathmandu
+
+  assert.match(await digest.runDaily(morning), /Sent to 2 of 2/);
+  assert.deepStrictEqual(sent, ['a@x.com', 'b@x.com']);
+  assert.match(await digest.runDaily(morning), /Already sent today/, 'a second server, or a second run, sends nothing');
+  assert.strictEqual(sent.length, 2);
+
+  sentOn = null;
+  enabled = false;
+  assert.match(await digest.runDaily(morning), /Turned off/);
+  enabled = true;
+  empty = true;
+  assert.match(await digest.runDaily(morning), /Nothing to report/);
+  assert.strictEqual(sent.length, 2, 'nothing sent on an empty day');
+}
+
+/**
+ * Online payments: the price comes from the plan, the payment is recorded
+ * only when the gateway says it's paid for that amount, and only once.
+ */
+async function onlinePaymentsAreRecordedOnlyOnceTheGatewaySaysPaid() {
+  // eSewa's own documented example.
+  assert.strictEqual(
+    esewaSignature('8gBm/:&EnhH.1/q', { total_amount: '110', transaction_uuid: '241028', product_code: 'EPAYTEST' }, [
+      'total_amount',
+      'transaction_uuid',
+      'product_code',
+    ]),
+    'i94zsd3oXF6ZsSr/kGqT4sSzYQzjj1W/waxjWyRwaME=',
+  );
+  const env = { ...process.env };
+  Object.assign(process.env, { ESEWA_MERCHANT_CODE: 'EPAYTEST', ESEWA_SECRET_KEY: '8gBm/:&EnhH.1/q', ESEWA_MODE: 'test' });
+  delete process.env.KHALTI_SECRET_KEY;
+  const form = new PaymentGateways().esewaForm({ id: 'op1', amount: 1500, successUrl: 'https://s/ok', failureUrl: 'https://s/no' });
+  assert.match(form.action, /rc-epay\.esewa\.com\.np/, 'test mode posts to the sandbox');
+  assert.strictEqual(form.fields.total_amount, '1500');
+  assert.strictEqual(
+    form.fields.signature,
+    esewaSignature('8gBm/:&EnhH.1/q', form.fields, ['total_amount', 'transaction_uuid', 'product_code']),
+  );
+  assert.deepStrictEqual(new PaymentGateways().available().map((g) => g.id), ['ESEWA'], 'Khalti without a key is not offered');
+
+  const now = new Date('2026-10-01T06:00:00Z');
+  const day = 86_400_000;
+  const ops = new Map<string, any>();
+  const business: any = { name: 'Shop', isSubscribed: true, subscribedTo: new Date(now.getTime() + 5 * day), planId: null };
+  const recorded: any[] = [];
+  const claims: any[] = [];
+  const mailed: any[] = [];
+  let locks = 0;
+  let gateway: any = { state: 'pending' };
+  const db: any = {
+    business: {
+      findUnique: async () => ({ name: 'Shop' }),
+      findUniqueOrThrow: async () => ({ ...business }),
+      update: async ({ data }: any) => Object.assign(business, data),
+    },
+    paymentClaim: {
+      create: async ({ data }: any) => {
+        const c = { id: `c${claims.length + 1}`, status: 'PENDING', ...data };
+        claims.push(c);
+        return c;
+      },
+    },
+    platformAdmin: { findMany: async () => [{ email: 'admin@x.com', name: 'Admin' }] },
+    $queryRaw: async () => {
+      locks++;
+      return [];
+    },
+    user: { findUnique: async () => ({ name: 'Owner', email: 'o@x.com' }), findMany: async () => [] },
+    // Two branches open: a one-branch plan is too small.
+    store: { count: async () => 2 },
+    onlinePayment: {
+      create: async ({ data }: any) => {
+        const op = { id: `op${ops.size + 1}`, status: 'STARTED', gatewayRef: null, createdAt: now, ...data };
+        ops.set(op.id, op);
+        return { id: op.id, gatewayRef: op.gatewayRef };
+      },
+      findFirst: async ({ where }: any) => {
+        const [{ id }, { gatewayRef }] = where.OR;
+        return ops.get(id) ?? [...ops.values()].find((o) => o.gatewayRef && o.gatewayRef === gatewayRef) ?? null;
+      },
+      findMany: async ({ where }: any) =>
+        [...ops.values()].filter((o) => o.status === where.status && o.createdAt < where.createdAt.lt),
+      findUniqueOrThrow: async ({ where }: any) => ({ ...ops.get(where.id), business }),
+      update: async ({ where, data }: any) => Object.assign(ops.get(where.id), data),
+      updateMany: async ({ where, data }: any) => {
+        const op = ops.get(where.id);
+        if (!op || op.status !== where.status) return { count: 0 };
+        Object.assign(op, data);
+        return { count: 1 };
+      },
+    },
+    subscriptionPayment: {
+      create: async ({ data }: any) => {
+        const p = { id: `p${recorded.length + 1}`, ...data };
+        recorded.push(p);
+        return p;
+      },
+      findUniqueOrThrow: async () => {
+        throw new Error('no receipt in this test');
+      },
+    },
+    $transaction: async (fn: any) => fn(db),
+  };
+  const plans = [
+    { id: 'standard', name: 'Standard', description: null, features: [], maxStores: null, prices: [{ months: 1, amount: 1500 }, { months: 12, amount: 15000 }] },
+    { id: 'solo', name: 'Solo', description: null, features: [], maxStores: 1, prices: [{ months: 1, amount: 900 }] },
+    { id: 'chain', name: 'Chain', description: null, features: [], maxStores: null, prices: [{ months: 1, amount: 3000 }] },
+  ];
+  const settings = stub<SettingsService>({
+    plans: async () => plans,
+    plan: async (id: string) => plans.find((p) => p.id === id) ?? null,
+  });
+  const gw = new PaymentGateways();
+  (gw as any).esewaStatus = async () => gateway;
+  const online = new OnlinePaymentsService(
+    stub<PrismaService>(db),
+    settings,
+    gw,
+    stub<MailService>({ sendPaymentClaim: async (to: string, _n: string, c: any) => void mailed.push({ to, ...c }) }),
+    stub<PlatformAuditService>({ record: async () => undefined }),
+  );
+  const owner = { userId: 'u1', businessId: 'b1', role: UserRole.OWNER } as AuthUser;
+
+  await assert.rejects(online.start(owner, { gateway: 'ESEWA', planId: 'standard', months: 3, returnOrigin: 'http://localhost:5173' }), /no longer offered/);
+  await assert.rejects(online.start(owner, { gateway: 'KHALTI', planId: 'standard', months: 1, returnOrigin: 'http://localhost:5173' }), /isn't available/);
+  const started = await online.start(owner, { gateway: 'ESEWA', planId: 'standard', months: 12, returnOrigin: 'http://localhost:5173/anything' });
+  assert.strictEqual(started.kind, 'form');
+  const op = ops.get(started.id);
+  assert.strictEqual(Number(op.amount), 15000, "the plan's price, not the request's");
+  assert.strictEqual((started as any).fields.success_url, 'http://localhost:5173/payment-return/');
+
+  assert.strictEqual((await online.check(started.id)).status, 'STARTED', 'not paid yet: still waiting');
+  gateway = { state: 'paid', transactionId: 'REF1', amount: 1500 };
+  assert.strictEqual((await online.check(started.id)).status, 'FAILED', 'paid the wrong amount: never extends');
+  assert.strictEqual(recorded.length, 0);
+  // ...but the money arrived, so it waits for an admin as a payment report, and they're emailed.
+  assert.strictEqual(claims.length, 1, 'a wrong amount is raised for an admin');
+  assert.strictEqual(Number(claims[0].amount), 1500, 'the amount actually paid');
+  assert.strictEqual(claims[0].reference, 'REF1');
+  assert.match(claims[0].note, /took 1500 but the plan costs 15000/);
+  assert.strictEqual(mailed.length, 1);
+  assert.match(mailed[0].note, /Not recorded automatically/);
+  assert.strictEqual((await online.check(started.id)).status, 'FAILED');
+  assert.strictEqual(claims.length, 1, 'raised once, however often it is checked');
+
+  const second = await online.start(owner, { gateway: 'ESEWA', planId: 'standard', months: 12, returnOrigin: 'http://localhost:5173' });
+  gateway = { state: 'paid', transactionId: 'REF2', amount: 15000 };
+  const endBefore = business.subscribedTo.getTime();
+  const [a, b] = await Promise.all([online.check(second.id), online.check(second.id)]);
+  assert.deepStrictEqual([a.status, b.status], ['COMPLETED', 'COMPLETED']);
+  assert.strictEqual(recorded.length, 1, 'the return page and the job together record it once');
+  assert.strictEqual(recorded[0].reference, 'REF2');
+  assert.strictEqual(recorded[0].method, 'ESEWA');
+  assert.strictEqual(recorded[0].planName, 'Standard', 'the receipt row says which plan');
+  assert.strictEqual((business as any).planId, 'standard', 'paying for a plan puts the shop on it');
+  await assert.rejects(
+    online.start(owner, { gateway: 'ESEWA', planId: 'solo', months: 1, returnOrigin: 'http://localhost:5173' }),
+    /allows 1 branch, and you have 2 branches open/,
+    'a plan smaller than the branches open is refused',
+  );
+  await assert.rejects(
+    online.start(owner, { gateway: 'ESEWA', planId: 'gone', months: 1, returnOrigin: 'http://localhost:5173' }),
+    /no longer offered/,
+  );
+  // A dollar shop shown a plan in USD pays by bank, not a rupee wallet.
+  (plans[0].prices[0] as any).amountUsd = 15;
+  db.business.findUnique = async () => ({ name: 'Shop', currency: 'USD' });
+  await assert.rejects(
+    online.start(owner, { gateway: 'ESEWA', planId: 'standard', months: 1, returnOrigin: 'http://localhost:5173' }),
+    /takes Nepali rupees only/,
+  );
+  db.business.findUnique = async () => ({ name: 'Shop' });
+  (plans[0].prices[0] as any).amountUsd = null;
+  assert.ok(business.subscribedTo.getTime() - endBefore > 360 * day, 'a year added after the current end');
+  assert.ok(locks > 0, "the business row is locked before its end date is read");
+
+  // Switching plan with time left: the days left are converted at the two
+  // monthly rates (Standard 1,500 -> Chain 3,000: half as many), then the month is added.
+  const up = await online.start(owner, { gateway: 'ESEWA', planId: 'chain', months: 1, returnOrigin: 'http://localhost:5173' });
+  gateway = { state: 'paid', transactionId: 'REF-UP', amount: 3000 };
+  const at = new Date(now.getTime() + 10 * 60_000);
+  const left = business.subscribedTo.getTime() - at.getTime();
+  await online.sweep(at);
+  assert.strictEqual(ops.get(up.id).status, 'COMPLETED');
+  assert.strictEqual(business.planId, 'chain');
+  assert.strictEqual(
+    business.subscribedTo.getTime(),
+    addMonths(new Date(at.getTime() + Math.round(left / 2)), 1).getTime(),
+    'an upgrade converts the days left instead of giving the bigger plan free until the old end',
+  );
+  business.planId = 'standard';
+
+  // Abandoned: the job gives up after a day.
+  const third = await online.start(owner, { gateway: 'ESEWA', planId: 'standard', months: 1, returnOrigin: 'http://localhost:5173' });
+  gateway = { state: 'unknown' };
+  await online.sweep(new Date(now.getTime() + 2 * day));
+  assert.strictEqual(ops.get(third.id).status, 'FAILED');
+  assert.strictEqual(claims.length, 1, 'an abandoned payment bothers no one');
+  // The gateway couldn't say either way for a day (eSewa's AMBIGUOUS): an admin checks.
+  const unsure = await online.start(owner, { gateway: 'ESEWA', planId: 'standard', months: 1, returnOrigin: 'http://localhost:5173' });
+  gateway = { state: 'pending', unsure: true };
+  await online.sweep(new Date(now.getTime() + 2 * day));
+  assert.strictEqual(ops.get(unsure.id).status, 'FAILED');
+  assert.strictEqual(claims.length, 2, 'raised for an admin');
+  assert.match(claims[1].note, /couldn't say whether this was paid/);
+
+  // connectIPS: a signed form NCHL can verify, and found again by its TXNID.
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  Object.assign(process.env, {
+    CONNECTIPS_MERCHANT_ID: '2222',
+    CONNECTIPS_APP_ID: 'MER-2222-APP-1',
+    CONNECTIPS_APP_NAME: 'Inventory',
+    CONNECTIPS_APP_PASSWORD: 'secret',
+    CONNECTIPS_PRIVATE_KEY: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString().replace(/\n/g, '\\n'),
+    CONNECTIPS_MODE: 'test',
+  });
+  gateway = { state: 'pending' };
+  (gw as any).connectIpsStatus = async () => gateway;
+  const cips = await online.start(owner, { gateway: 'CONNECTIPS', planId: 'standard', months: 1, returnOrigin: 'http://localhost:5173' });
+  const f = (cips as any).fields as Record<string, string>;
+  assert.match((cips as any).action, /uat\.connectips\.com/, 'test mode posts to the UAT site');
+  assert.ok(f.TXNID.length <= 20 && f.TXNID === ops.get(cips.id).gatewayRef, 'a TXNID of 20 characters at most, kept');
+  assert.strictEqual(f.TXNAMT, '150000', 'the amount in paisa');
+  assert.match(f.TXNDATE, /^\d{2}-\d{2}-\d{4}$/);
+  const signed = ['MERCHANTID', 'APPID', 'APPNAME', 'TXNID', 'TXNDATE', 'TXNCRNCY', 'TXNAMT', 'REFERENCEID', 'REMARKS', 'PARTICULARS']
+    .map((k) => `${k}=${f[k]}`)
+    .join(',') + ',TOKEN=TOKEN';
+  assert.ok(createVerify('RSA-SHA256').update(signed).verify(publicKey, f.TOKEN, 'base64'), 'the TOKEN verifies with the public key');
+  gateway = { state: 'paid', transactionId: f.TXNID, amount: 1500 };
+  const back = await online.check(f.TXNID);
+  assert.strictEqual(back.id, cips.id, 'found by the TXNID connectIPS brings back');
+  assert.strictEqual(back.status, 'COMPLETED');
+  assert.strictEqual(recorded.at(-1).method, 'CONNECTIPS');
+  assert.strictEqual(connectIpsToken(privateKey, 'x').length > 0, true);
+
+  // Production only sends the owner back to the shop app.
+  Object.assign(process.env, { NODE_ENV: 'production', SHOP_APP_URL: 'https://app.shop.test', CORS_ORIGIN: 'https://admin.shop.test' });
+  assert.strictEqual(returnOrigin('https://app.shop.test/subscription'), 'https://app.shop.test');
+  assert.strictEqual(returnOrigin('https://localhost'), 'https://localhost', 'the Android app');
+  assert.throws(() => returnOrigin('https://evil.test'), /shop app/);
+  assert.throws(() => returnOrigin('javascript:alert(1)'), /shop app/);
+  process.env = env;
+}
+
+/**
+ * Payments recorded by an admin (and "I've paid" confirmed through it) lock
+ * the business row before reading its end date, and convert the days left on
+ * a plan switch. A shop's own report is checked for one waiting under the same
+ * lock, and its screenshot must be one of our uploads.
+ */
+async function paymentsAreRecordedUnderALock() {
+  const day = 86_400_000;
+  const calls: string[] = [];
+  const business: any = { id: 'b1', name: 'Shop', currency: 'NPR', isSubscribed: true, subscribedTo: new Date(Date.now() + 100 * day), planId: 'basic' };
+  const db: any = {
+    business: {
+      findUnique: async () => ({ ...business }),
+      findUniqueOrThrow: async () => {
+        calls.push('read');
+        return { ...business };
+      },
+      update: async ({ data }: any) => Object.assign(business, data),
+    },
+    subscriptionPayment: { create: async ({ data }: any) => ({ id: 'p1', ...data }) },
+    paymentClaim: {
+      findFirst: async () => {
+        calls.push('pending?');
+        return pending;
+      },
+      create: async ({ data }: any) => ({ id: 'c1', ...data }),
+    },
+    platformAdmin: { findMany: async () => [] },
+    user: { findUnique: async () => ({ name: 'Owner' }) },
+    store: { count: async () => 1 },
+    $queryRaw: async () => {
+      calls.push('lock');
+      return [];
+    },
+    $transaction: async (fn: any) => fn(db),
+  };
+  let pending: any = null;
+  const plans = [
+    { id: 'basic', name: 'Basic', description: null, features: [], maxStores: null, prices: [{ months: 1, amount: 2000 }] },
+    { id: 'chain', name: 'Chain', description: null, features: [], maxStores: null, prices: [{ months: 1, amount: 5000 }] },
+  ];
+  const settings = stub<SettingsService>({ plans: async () => plans, plan: async (id: string) => plans.find((p) => p.id === id) ?? null } as any);
+  const platform = new PlatformService(
+    stub<PrismaService>(db),
+    stub<MailService>({}), stub<PlatformAuditService>({ record: async () => undefined }), stub<SubscriptionRemindersService>({}),
+    stub<PlatformBillingService>({}), stub<BusinessService>({}), stub<AuthService>({}), settings,
+  );
+  const before = Date.now();
+  const res = await platform.recordPayment({ adminId: 'a1', email: 'a@x.com' }, 'b1', {
+    amount: 5000, method: 'BANK' as any, months: 1, planId: 'chain',
+  } as any);
+  assert.deepStrictEqual(calls.slice(0, 2), ['lock', 'read'], 'locked before the end date is read');
+  assert.strictEqual(business.planId, 'chain');
+  // 100 days of Basic (2,000) are 40 days of Chain (5,000); then the month.
+  const expected = addMonths(new Date(before + 40 * day), 1).getTime();
+  assert.ok(Math.abs(res.business.subscribedTo!.getTime() - expected) < 5_000, 'an upgrade converts the days left');
+
+  calls.length = 0;
+  const subs = new SubscriptionService(stub<PrismaService>(db), settings, stub<MailService>({}), stub<OnlinePaymentsService>({}));
+  const owner = { userId: 'u1', businessId: 'b1', role: UserRole.OWNER, email: 'o@x.com' } as AuthUser;
+  await subs.createClaim(owner, { amount: 2000, method: 'CASH' as any });
+  assert.deepStrictEqual(calls, ['lock', 'pending?'], 'the one-waiting check runs under the lock');
+  pending = { id: 'c0' };
+  await assert.rejects(subs.createClaim(owner, { amount: 2000, method: 'CASH' as any }), /already waiting/);
+
+  const images = new ProductImageStorage();
+  const name = 'a'.repeat(32) + '.png';
+  assert.strictEqual(images.isOwnUrl(`/api/uploads/products/${name}`), true, 'one of our uploads');
+  assert.strictEqual(images.isOwnUrl(`https://evil.test/${name}`), false, 'the same name hosted elsewhere');
+  assert.strictEqual(images.isOwnUrl('/api/uploads/products/../../secret.png'), false);
+  assert.strictEqual(images.isOwnUrl('https://evil.test/pixel.gif'), false);
 }
 
 /** Log date filters: either end optional, and nothing at all when neither is set. */
@@ -3360,6 +3864,92 @@ async function aStatementCountsAReturnOnce() {
   assert.strictEqual(st.totals.closing, st.totals.stored, 'closing is the stored balance');
 }
 
+/** A dollar shop sees a plan's USD prices; without any, the NPR ones. Rupee shops always NPR. */
+function plansInTheShopsCurrency() {
+  const plan = {
+    id: 'basic', name: 'Basic', description: null, features: [], maxStores: 1,
+    prices: [
+      { months: 1, amount: 2000, amountUsd: 15 },
+      { months: 3, amount: 5700, amountUsd: null },
+      { months: 12, amount: 20000, amountUsd: 150 },
+    ],
+  };
+  assert.strictEqual(pricingCurrency('NPR'), 'NPR');
+  assert.strictEqual(pricingCurrency('usd'), 'USD');
+  assert.strictEqual(pricingCurrency('INR'), 'USD', 'any currency but rupees is charged in dollars');
+  const npr = pricedFor(plan, 'NPR');
+  assert.deepStrictEqual([npr.currency, npr.prices.map((p) => p.amount)], ['NPR', [2000, 5700, 20000]]);
+  const usd = pricedFor(plan, 'USD');
+  assert.deepStrictEqual([usd.currency, usd.prices], ['USD', [{ months: 1, amount: 15 }, { months: 12, amount: 150 }]], 'only lengths with a USD price');
+  const nprOnly = pricedFor({ ...plan, prices: plan.prices.map((p) => ({ ...p, amountUsd: null })) }, 'USD');
+  assert.strictEqual(nprOnly.currency, 'NPR', 'no USD prices: a dollar shop sees NPR');
+}
+
+/** MAIL_REDIRECT_TO: in development every email reaches one inbox, labelled with who it was for. */
+async function devMailGoesToOneInbox() {
+  const env: Record<string, string> = {
+    RESEND_API_KEY: 'k',
+    RESEND_FROM: 'onboarding@resend.dev',
+    MAIL_TRANSPORT: 'resend',
+    MAIL_REDIRECT_TO: 'me@example.com',
+  };
+  const logged: any[] = [];
+  const mail = new MailService(
+    stub<ConfigService>({ get: (k: string) => env[k] }),
+    stub<PrismaService>({ emailLog: { create: async ({ data }: any) => logged.push(data) }, user: { findUnique: async () => null } }),
+  );
+  const sent: any[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init: any) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true } as Response;
+  }) as typeof fetch;
+  try {
+    await mail.send({ type: 'verification', to: 'owner@shop.com', subject: 'Verify your email', html: '<p>1</p>', businessId: 'b1' });
+    assert.deepStrictEqual(sent[0].to, ['me@example.com'], 'goes to the developer');
+    assert.strictEqual(sent[0].subject, '[to: owner@shop.com] Verify your email', 'saying who it was for');
+    delete env.MAIL_REDIRECT_TO;
+    await mail.send({ type: 'verification', to: 'owner@shop.com', subject: 'Verify your email', html: '<p>1</p>', businessId: 'b1' });
+    assert.deepStrictEqual(sent[1].to, ['owner@shop.com'], 'without it, to the real recipient');
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(logged[0].to, 'owner@shop.com', 'the email log keeps the real recipient');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/** A plan's branch limit: no opening or reopening past it; no plan, no limit. */
+async function aPlanLimitsBranches() {
+  let open = 2;
+  let opened = 0;
+  const prisma = stub<PrismaService>({
+    business: { findUnique: async () => ({ planId: 'business' }) },
+    store: {
+      count: async () => open,
+      findFirst: async () => ({ id: 'st9', isActive: false }),
+      update: async () => ({}),
+    },
+    $transaction: async (fn: any) =>
+      fn({
+        store: { create: async () => { opened++; return { id: 'sN' }; } },
+        product: { findMany: async () => [] },
+        stockItem: { createMany: async () => ({ count: 0 }) },
+      }),
+  });
+  const plan = { id: 'business', name: 'Business', description: null, features: [], maxStores: 3, prices: [] };
+  const svc = new StoresService(prisma, stub<SettingsService>({ plan: async () => plan }));
+  await svc.create('b1', { name: 'Third' } as any);
+  assert.strictEqual(opened, 1, 'under the limit: opens');
+  open = 3;
+  await assert.rejects(svc.create('b1', { name: 'Fourth' } as any), (e: any) => e.response?.code === 'PLAN_LIMIT' && /allows 3 branches/.test(e.message));
+  await assert.rejects(svc.update('b1', 'st9', { isActive: true } as any), /allows 3 branches/, 'reopening counts too');
+  const unlimited = new StoresService(prisma, stub<SettingsService>({ plan: async () => ({ ...plan, maxStores: null }) }));
+  await unlimited.create('b1', { name: 'Many' } as any);
+  const noPlan = new StoresService(prisma, stub<SettingsService>({ plan: async () => null }));
+  await noPlan.create('b1', { name: 'Trial' } as any);
+  assert.strictEqual(opened, 3, 'unlimited and no plan: no limit');
+}
+
 /** The last active store cannot be closed through the API. */
 async function theLastActiveStoreStaysOpen() {
   let others = 0;
@@ -3374,7 +3964,7 @@ async function theLastActiveStoreStaysOpen() {
       },
     },
   });
-  const service = new StoresService(prisma);
+  const service = new StoresService(prisma, stub<SettingsService>({ plan: async () => null }));
 
   await assert.rejects(service.remove('b1', 'st1'), /only active store/, 'refused when it is the last');
   await assert.rejects(
@@ -3810,8 +4400,13 @@ async function main() {
   await supportTicketsGetAnOwner();
   await supportRepliesReachTheRightPerson();
   await aShopSeesItsOwnSubscription();
+  await paymentsAreRecordedUnderALock();
   await expiredStockIsHandled();
   productImportReadsRowsSafely();
+  await paymentDetailsAreReadSafely();
+  await aLockedShopGetsABillingPassOnly();
+  await adminDigestGoesOutOncePerDay();
+  await onlinePaymentsAreRecordedOnlyOnceTheGatewaySaysPaid();
   logDateRange();
   devicesAreRecognisable();
   await shiftReportBalancesTheDrawer();
@@ -3837,6 +4432,11 @@ async function main() {
   await aPinnedCashierReturnsOnlyAtTheirStore();
   await aProductChargesTheTaxItShows();
   await aPartPaymentKeepsItsTender();
+  aShopAlwaysTakesCash();
+  await aPlanLimitsBranches();
+  await devMailGoesToOneInbox();
+  plansInTheShopsCurrency();
+  await aNewShopsFirstSteps();
   await aCustomerWithHistoryIsKept();
   await creditAgeingCountsAReturnOnce();
   await aStaleReadCannotOverReturnALine();

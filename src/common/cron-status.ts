@@ -24,6 +24,8 @@ const JOBS: { name: string; schedule: string }[] = [
   { name: 'subscription-reminders', schedule: 'Daily at 09:00 shop time' },
   { name: 'log-retention', schedule: 'Daily at 03:30 server time' },
   { name: 'scheduled-announcements', schedule: 'Every minute' },
+  { name: 'admin-digest', schedule: 'Daily at 08:00 Nepal time' },
+  { name: 'online-payments', schedule: 'Every 10 minutes' },
 ];
 
 const runs = new Map<string, CronRun>();

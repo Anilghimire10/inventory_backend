@@ -26,6 +26,8 @@ export const SETTLE_METHODS: PaymentMethod[] = [
   PaymentMethod.CASH,
   PaymentMethod.CARD,
   PaymentMethod.MOBILE,
+  PaymentMethod.KHALTI,
+  PaymentMethod.CONNECTIPS,
 ];
 
 /** `+1` when the type brings money in, `-1` when it takes money out. */
