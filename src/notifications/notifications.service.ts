@@ -150,7 +150,7 @@ export class NotificationsService {
         type: NotificationType.LOW_STOCK,
         dedupeKey: `low:${it.storeId}:${it.productId}`,
         title: `Low stock: ${it.product.name}`,
-        body: `${it.quantity} left · reorder at ${reorder}${store}`,
+        body: `${it.quantity.toString()} left · reorder at ${reorder}${store}`,
         link: '/inventory',
       });
     }
@@ -163,7 +163,7 @@ export class NotificationsService {
         type: NotificationType.EXPIRING,
         dedupeKey: `exp:${b.id}`,
         title: `${b.expired ? 'Expired' : 'Expiring soon'}: ${b.product.name}`,
-        body: `${b.quantity} · ${b.expired ? 'expired' : 'expires'} ${when}`,
+        body: `${b.quantity.toString()} · ${b.expired ? 'expired' : 'expires'} ${when}`,
         link: '/inventory',
       });
     }
