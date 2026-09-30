@@ -103,6 +103,19 @@ export class NotificationsService {
     return { ok: true };
   }
 
+  /** Clear the caller's bell: dismiss everything they can see, for them only. */
+  async dismissAll(businessId: string, userId: string) {
+    const shown = await this.prisma.notification.findMany({
+      where: {
+        ...visibleTo(businessId, userId),
+        receipts: { none: { userId, dismissedAt: { not: null } } },
+      },
+      select: { id: true },
+    });
+    await this.stamp(userId, shown.map((n) => n.id), 'dismissedAt');
+    return { ok: true, dismissed: shown.length };
+  }
+
   /**
    * Set `field` on this user's receipts for these notifications, keeping the
    * first time it was set. Creates the receipts that don't exist yet and fills
@@ -151,7 +164,7 @@ export class NotificationsService {
         dedupeKey: `low:${it.storeId}:${it.productId}`,
         title: `Low stock: ${it.product.name}`,
         body: `${it.quantity.toString()} left · reorder at ${reorder}${store}`,
-        link: '/inventory',
+        link: '/inventory?tab=low',
       });
     }
 
@@ -164,7 +177,7 @@ export class NotificationsService {
         dedupeKey: `exp:${b.id}`,
         title: `${b.expired ? 'Expired' : 'Expiring soon'}: ${b.product.name}`,
         body: `${b.quantity.toString()} · ${b.expired ? 'expired' : 'expires'} ${when}`,
-        link: '/inventory',
+        link: '/inventory?tab=expiring',
       });
     }
 

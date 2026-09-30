@@ -38,6 +38,11 @@ export class NotificationsController {
     return this.notifications.markAllRead(u.businessId, u.userId);
   }
 
+  @Post('dismiss-all')
+  dismissAll(@CurrentUser() u: AuthUser) {
+    return this.notifications.dismissAll(u.businessId, u.userId);
+  }
+
   @Post(':id/read')
   markRead(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.notifications.markRead(u.businessId, u.userId, id);

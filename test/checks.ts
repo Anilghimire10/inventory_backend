@@ -2648,6 +2648,16 @@ async function aNotificationIsReadPerPerson() {
   await service.dismiss('other-shop', 'u2', 'n9');
   assert.strictEqual(writes.length, 0, "another shop's notification can't be touched");
 
+  // Clear all: dismissed for the caller only, like the one-at-a-time dismiss.
+  updates.length = 0;
+  const cleared = await service.dismissAll('b1', 'u2');
+  assert.deepStrictEqual(
+    (writes as any[]).map((w) => [w.notificationId, w.userId, w.dismissedAt instanceof Date]),
+    [['n1', 'u2', true], ['n2', 'u2', true]],
+    'clear all writes dismissals for the caller only',
+  );
+  assert.strictEqual(updates[0].dismissedAt, null, 'an existing dismissal time is kept, not moved');
+  assert.strictEqual(cleared.dismissed, 2);
 }
 
 /**
