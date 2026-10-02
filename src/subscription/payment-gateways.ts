@@ -298,9 +298,16 @@ export class PaymentGateways {
         body: JSON.stringify({ pidx }),
       });
     } catch (e) {
-      // Khalti answers 404 for a pidx it has dropped.
-      if (e instanceof GatewayHttpError && e.gatewayStatus === 404) return { state: 'unknown' };
-      throw e;
+      if (!(e instanceof GatewayHttpError)) throw e;
+      // An expired or cancelled payment comes back as a 400 that still says so.
+      if (e.body && typeof e.body === 'object' && typeof (e.body as Record<string, unknown>).status === 'string') {
+        body = e.body as Record<string, unknown>;
+      } else if (e.gatewayStatus === 404) {
+        // Khalti answers 404 for a pidx it has dropped.
+        return { state: 'unknown' };
+      } else {
+        throw e;
+      }
     }
     switch (str(body.status)) {
       case 'Completed':
@@ -338,7 +345,7 @@ export class PaymentGateways {
     }
     if (!res.ok) {
       this.logger.warn(`${name} ${res.status}: ${text.slice(0, 300)}`);
-      throw new GatewayHttpError(name, res.status, gatewayMessage(body));
+      throw new GatewayHttpError(name, res.status, gatewayMessage(body), body);
     }
     if (!body || typeof body !== 'object') {
       throw new BadGatewayException(`${name} sent an unexpected answer. Try again in a moment.`);
@@ -353,6 +360,8 @@ export class GatewayHttpError extends BadGatewayException {
     name: string,
     readonly gatewayStatus: number,
     detail: string | null,
+    /** The gateway's JSON, when it sent some. */
+    readonly body: unknown = null,
   ) {
     super(detail ? `${name}: ${detail}` : `${name} refused the request. Try again, or pay another way.`);
   }

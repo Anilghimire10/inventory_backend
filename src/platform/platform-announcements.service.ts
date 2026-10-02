@@ -7,6 +7,7 @@ import { trackCron } from '../common/cron-status';
 import { Actor, PlatformAuditService } from './platform-audit.service';
 import { SendAnnouncementDto } from './dto/platform.dto';
 import { subscriptionWhere } from './platform.service';
+import { RealtimeService } from '../realtime/realtime.service';
 
 const ACTION = 'announcement.send';
 
@@ -53,6 +54,7 @@ export class PlatformAnnouncementsService {
     private prisma: PrismaService,
     private mail: MailService,
     private audit: PlatformAuditService,
+    private realtime: RealtimeService,
   ) {}
 
   async send(actor: Actor, dto: SendAnnouncementDto) {
@@ -128,6 +130,8 @@ export class PlatformAnnouncementsService {
           announcementId: a.id,
         })),
       });
+      // Straight into the bells of whoever has the app open.
+      this.realtime.emitMany(targets.map((b) => b.id), ['notifications']);
     }
 
     let emailed = 0;

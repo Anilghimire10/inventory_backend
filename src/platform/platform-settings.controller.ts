@@ -158,6 +158,7 @@ export class PlatformSettingsController {
     const data = {
       ...(dto.trialDays !== undefined ? { trialDays: dto.trialDays } : {}),
       ...(dto.signupOpen !== undefined ? { signupOpen: dto.signupOpen } : {}),
+      ...(dto.maintenanceMode !== undefined ? { maintenanceMode: dto.maintenanceMode } : {}),
       ...(dto.maintenanceMessage !== undefined
         ? { maintenanceMessage: dto.maintenanceMessage?.trim() || null }
         : {}),

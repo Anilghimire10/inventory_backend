@@ -630,6 +630,11 @@ export class UpdatePlatformSettingsDto {
   @MaxLength(500)
   maintenanceMessage?: string | null;
 
+  @ApiPropertyOptional({ description: 'True closes the shop app (every shop request gets 503) until turned off' })
+  @IsOptional()
+  @IsBoolean()
+  maintenanceMode?: boolean;
+
   @ApiPropertyOptional({ nullable: true, description: 'Delete shop activity-log entries older than this; null keeps them' })
   @IsOptional()
   @ValidateIf((_o, v) => v !== null)

@@ -133,6 +133,7 @@ export class SettingsService {
         | 'trialDays'
         | 'signupOpen'
         | 'maintenanceMessage'
+        | 'maintenanceMode'
         | 'auditRetentionDays'
         | 'billingName'
         | 'billingTaxId'

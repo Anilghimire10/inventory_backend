@@ -12,6 +12,7 @@ import {
   ReplyTemplateDto,
   UpdateTicketDto,
 } from './dto/support.dto';
+import { RealtimeService } from '../realtime/realtime.service';
 
 /** How a category reads in the support inbox's email. */
 export const CATEGORY_LABEL: Record<SupportTicketCategory, string> = {
@@ -87,6 +88,7 @@ export class SupportService {
     private prisma: PrismaService,
     private mail: MailService,
     private audit: PlatformAuditService,
+    private realtime: RealtimeService,
   ) {}
 
   // ---- Shop side ----
@@ -310,6 +312,8 @@ export class SupportService {
         },
       }),
     ]);
+    this.realtime.emit({ businessId: ticket.businessId, topics: ['notifications', 'support'] });
+    this.realtime.emitAdmin(['support']);
     await this.audit.record(actor, 'support.reply', {
       businessId: ticket.businessId,
       details: { ticketId: id, subject: ticket.subject },

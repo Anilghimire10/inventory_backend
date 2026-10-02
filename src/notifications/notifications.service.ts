@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { NotificationType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { RealtimeService } from '../realtime/realtime.service';
 
 const EXPIRY_WINDOW_DAYS = 30;
 
@@ -26,6 +27,7 @@ export class NotificationsService {
   constructor(
     private prisma: PrismaService,
     private inventory: InventoryService,
+    private realtime: RealtimeService,
   ) {}
 
   /**
@@ -182,9 +184,15 @@ export class NotificationsService {
     }
 
     const keys = desired.map((d) => d.dedupeKey);
+    // What's there now, to tell whether this pass changes anyone's bell.
+    const before = await this.prisma.notification.findMany({
+      where: { businessId, type: { in: [NotificationType.LOW_STOCK, NotificationType.EXPIRING] } },
+      select: { dedupeKey: true },
+    });
+    const had = new Set(before.map((n) => n.dedupeKey));
 
     // Remove auto alerts whose condition no longer holds.
-    await this.prisma.notification.deleteMany({
+    const removed = await this.prisma.notification.deleteMany({
       where: {
         businessId,
         type: { in: [NotificationType.LOW_STOCK, NotificationType.EXPIRING] },
@@ -221,6 +229,11 @@ export class NotificationsService {
           }),
         ),
       );
+    }
+
+    // A new alert or a resolved one: open bells reload now, not at their next poll.
+    if (removed.count || keys.some((k) => !had.has(k))) {
+      this.realtime.emit({ businessId, topics: ['notifications'] });
     }
   }
 

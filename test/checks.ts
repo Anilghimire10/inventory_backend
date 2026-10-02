@@ -7,6 +7,8 @@
  * an integration suite.
  */
 import assert from 'assert';
+import type { ExecutionContext } from '@nestjs/common';
+import { lastValueFrom, of, throwError } from 'rxjs';
 import { createHash, createVerify, generateKeyPairSync } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
 import { PaymentMethod, PlatformRole, Prisma, SaleStatus, UserRole } from '@prisma/client';
@@ -38,6 +40,8 @@ import { allowsFraction, normalizeUnit } from '../src/common/units';
 import { splitTax } from '../src/common/tax';
 import { SettingsService } from '../src/settings/settings.service';
 import { ReportsService } from '../src/reports/reports.service';
+import { RealtimeService, type ShopEvent } from '../src/realtime/realtime.service';
+import { RealtimeInterceptor } from '../src/realtime/realtime.interceptor';
 import { TaxesService } from '../src/taxes/taxes.service';
 import { LogRetentionCron } from '../src/settings/log-retention.cron';
 import { SupportService } from '../src/support/support.service';
@@ -76,6 +80,7 @@ import {
 } from '../src/common/subscription';
 import { PlatformAdminsService } from '../src/platform/platform-admins.service';
 import { ImpersonationReadOnlyGuard } from '../src/common/guards/impersonation-read-only.guard';
+import { MaintenanceGuard } from '../src/common/guards/maintenance.guard';
 import { ForbiddenException } from '@nestjs/common';
 import {
   base32Decode,
@@ -2289,6 +2294,38 @@ async function aNewStoreOpensCarryingTheCatalog() {
   assert.strictEqual(touched, false, 'no products means no seeding call at all');
 }
 
+/** Maintenance mode closes the shop app, signing in too; the admin panel and status stay open. */
+async function maintenanceModeClosesTheShopApp() {
+  let settings = { maintenanceMode: false, maintenanceMessage: null as string | null };
+  const guard = new MaintenanceGuard(stub<SettingsService>({ get: async () => settings }));
+  const ctx = (path: string, user?: Partial<AuthUser>) =>
+    ({ getType: () => 'http', switchToHttp: () => ({ getRequest: () => ({ path, user }) }) }) as never;
+  const owner: Partial<AuthUser> = { userId: 'u1', businessId: 'b1', role: UserRole.OWNER };
+
+  assert.ok(await guard.canActivate(ctx('/api/sales', owner)), 'off: everything works');
+
+  settings = { maintenanceMode: true, maintenanceMessage: 'Back at 22:15' };
+  for (const path of ['/api/sales', '/api/auth/login', '/api/subscription', '/api/events']) {
+    await assert.rejects(
+      guard.canActivate(ctx(path, path.includes('auth') ? undefined : owner)),
+      (e: any) => e.getStatus() === 503 && e.getResponse().code === 'MAINTENANCE' && e.getResponse().message === 'Back at 22:15',
+      `${path} is refused with the banner's words`,
+    );
+  }
+  for (const path of ['/api/admin/settings', '/api/admin', '/api/status', '/api/health', '/api/subscription/online/op1/check']) {
+    assert.ok(await guard.canActivate(ctx(path)), `${path} stays open`);
+  }
+  const viewing = { ...owner, impersonatedBy: { adminId: 'a1', email: 'a@x.com', expiresAt: '' } };
+  assert.ok(await guard.canActivate(ctx('/api/sales', viewing)), 'an admin viewing as owner still gets in');
+  await assert.rejects(guard.canActivate(ctx('/api/administrator', owner)), /Back at 22:15/, 'only /admin itself is open');
+
+  settings = { maintenanceMode: true, maintenanceMessage: null };
+  await assert.rejects(guard.canActivate(ctx('/api/sales', owner)), /down for maintenance/, 'no banner: a default message');
+
+  settings = { maintenanceMode: false, maintenanceMessage: 'Back at 22:15' };
+  assert.ok(await guard.canActivate(ctx('/api/sales', owner)), 'turned off: open again, banner or not');
+}
+
 /** "View as owner" can read and cannot write -- enforced by the API itself. */
 async function viewAsOwnerIsReadOnly() {
   const guard = new ImpersonationReadOnlyGuard();
@@ -2634,7 +2671,7 @@ async function aNotificationIsReadPerPerson() {
     },
   };
   db.$transaction = async (ops: unknown[]) => ops;
-  const service = new NotificationsService(stub<PrismaService>(db), stub<InventoryService>({}));
+  const service = new NotificationsService(stub<PrismaService>(db), stub<InventoryService>({}), new RealtimeService());
 
   await service.markAllRead('b1', 'u2');
   assert.deepStrictEqual(
@@ -2807,6 +2844,7 @@ async function announcementsScheduleAndTarget() {
     stub<PrismaService>(db),
     stub<MailService>({}),
     stub<PlatformAuditService>({ record: async () => {} }),
+    new RealtimeService(),
   );
   const admin = { adminId: 'x', email: 'x@y.com' };
 
@@ -2864,6 +2902,7 @@ async function supportTicketsGetAnOwner() {
     stub<PrismaService>(db),
     stub<MailService>({ sendSupportReply: async () => {} }),
     stub<PlatformAuditService>({ record: async () => {} }),
+    new RealtimeService(),
   );
   const me = { adminId: 'me', email: 'me@x.com' };
 
@@ -2924,6 +2963,7 @@ async function supportRepliesReachTheRightPerson() {
       },
     }),
     stub<PlatformAuditService>({ record: async () => {} }),
+    new RealtimeService(),
   );
   const cashier = { userId: 'cashier', businessId: 'b1', role: UserRole.CASHIER } as any;
 
@@ -2957,6 +2997,7 @@ async function supportRepliesReachTheRightPerson() {
       },
     }),
     stub<InventoryService>({}),
+    new RealtimeService(),
   );
   await bell.list('b1', 'owner');
   assert.deepStrictEqual(
@@ -3337,7 +3378,9 @@ async function onlinePaymentsAreRecordedOnlyOnceTheGatewaySaysPaid() {
   );
   assert.deepStrictEqual(new PaymentGateways().available().map((g) => g.id), ['ESEWA'], 'Khalti without a key is not offered');
 
-  const now = new Date('2026-10-01T06:00:00Z');
+  // A minute ago, not a fixed date: `check()` reads the real clock, and a
+  // payment started more than a day before it is given up on.
+  const now = new Date(Date.now() - 60_000);
   const day = 86_400_000;
   const ops = new Map<string, any>();
   const business: any = { name: 'Shop', isSubscribed: true, subscribedTo: new Date(now.getTime() + 5 * day), planId: null };
@@ -3661,7 +3704,7 @@ async function reminderGoesOutOncePerThreshold() {
       emails.push(to);
     },
   });
-  const reminders = new SubscriptionRemindersService(prisma, mail);
+  const reminders = new SubscriptionRemindersService(prisma, mail, new RealtimeService());
   const shop = { id: 'b1', name: 'Shop', subscribedTo: new Date('2026-10-01T00:00:00Z') };
 
   assert.deepStrictEqual(await reminders.remind(shop, 3), { alreadySent: false, emailed: 1, failed: 0 });
@@ -3893,6 +3936,30 @@ function plansInTheShopsCurrency() {
   assert.deepStrictEqual([usd.currency, usd.prices], ['USD', [{ months: 1, amount: 15 }, { months: 12, amount: 150 }]], 'only lengths with a USD price');
   const nprOnly = pricedFor({ ...plan, prices: plan.prices.map((p) => ({ ...p, amountUsd: null })) }, 'USD');
   assert.strictEqual(nprOnly.currency, 'NPR', 'no USD prices: a dollar shop sees NPR');
+}
+
+/** Khalti answers an expired or cancelled lookup with a 400 that still carries the status. */
+async function khaltiLookupReadsItsErrorAnswers() {
+  const env = { ...process.env };
+  Object.assign(process.env, { KHALTI_SECRET_KEY: 'k', KHALTI_MODE: 'test' });
+  const realFetch = globalThis.fetch;
+  let reply: { status: number; body: unknown } = { status: 200, body: {} };
+  globalThis.fetch = (async () =>
+    ({ ok: reply.status < 300, status: reply.status, text: async () => JSON.stringify(reply.body) }) as Response) as typeof fetch;
+  try {
+    const gw = new PaymentGateways();
+    reply = { status: 400, body: { pidx: 'p', total_amount: 350000, status: 'Expired', transaction_id: null, error_key: 'khalti_error' } };
+    assert.deepStrictEqual(await gw.khaltiLookup('p'), { state: 'failed', reason: 'The Khalti payment expired' });
+    reply = { status: 400, body: { pidx: 'p', status: 'User canceled', error_key: 'khalti_error' } };
+    assert.deepStrictEqual(await gw.khaltiLookup('p'), { state: 'failed', reason: 'Cancelled on Khalti' });
+    reply = { status: 404, body: { detail: 'Not found.', error_key: 'validation_error' } };
+    assert.deepStrictEqual(await gw.khaltiLookup('p'), { state: 'unknown' }, 'a dropped pidx');
+    reply = { status: 401, body: { detail: 'Invalid token.', status_code: 401 } };
+    await assert.rejects(gw.khaltiLookup('p'), /Invalid token/, 'a bad key is still an error');
+  } finally {
+    globalThis.fetch = realFetch;
+    process.env = env;
+  }
 }
 
 /** MAIL_REDIRECT_TO: in development every email reaches one inbox, labelled with who it was for. */
@@ -4385,12 +4452,64 @@ async function staffSeeOnlyTheirOwnTickets() {
       count: async () => 0,
     },
   });
-  const service = new SupportService(prisma, stub<MailService>({}), stub<PlatformAuditService>({}));
+  const service = new SupportService(prisma, stub<MailService>({}), stub<PlatformAuditService>({}), new RealtimeService());
   const q = Object.assign(new QueryTicketsDto(), { page: 1, limit: 20 });
   await service.listForShop({ ...user, role: UserRole.CASHIER }, q);
   await service.listForShop({ ...user, role: UserRole.OWNER }, q);
   assert.deepStrictEqual(wheres[0], { businessId: 'b1', userId: 'u1' }, 'a cashier sees their own');
   assert.deepStrictEqual(wheres[1], { businessId: 'b1' }, 'an owner sees the whole business');
+}
+
+/**
+ * Live updates: a change tells the right tabs which screens to reload, a
+ * personal one (reading your own bell) reaches only that person, and nothing
+ * fires for reads or failures.
+ */
+async function liveUpdatesReachTheRightTabs() {
+  const realtime = new RealtimeService();
+  const owner: ShopEvent[] = [];
+  const cashier: ShopEvent[] = [];
+  const otherShop: ShopEvent[] = [];
+  const admin: string[][] = [];
+  const subs = [
+    realtime.forUser('b1', 'owner').subscribe((e) => owner.push(e)),
+    realtime.forUser('b1', 'cashier').subscribe((e) => cashier.push(e)),
+    realtime.forUser('b2', 'someone').subscribe((e) => otherShop.push(e)),
+    realtime.forAdmins().subscribe((t) => admin.push(t)),
+  ];
+  const interceptor = new RealtimeInterceptor(realtime);
+  const call = (method: string, path: string, opts: { fail?: boolean; userId?: string } = {}) => {
+    const req = {
+      method,
+      path,
+      user: { businessId: 'b1', userId: opts.userId ?? 'cashier' },
+      headers: { 'x-client-id': 'tab-1' },
+    };
+    const ctx = { switchToHttp: () => ({ getRequest: () => req }) } as unknown as ExecutionContext;
+    const next = { handle: () => (opts.fail ? throwError(() => new Error('refused')) : of({ ok: true })) };
+    return lastValueFrom(interceptor.intercept(ctx, next)).catch(() => undefined);
+  };
+
+  await call('POST', '/api/sales');
+  assert.deepStrictEqual(owner[0]?.topics, ['sales', 'stock', 'shifts', 'customers'], 'a sale moves stock, drawer and credit');
+  assert.strictEqual(owner[0]?.origin, 'tab-1', 'the tab that sold is named, so it can skip its own echo');
+  assert.strictEqual(otherShop.length, 0, 'another business hears nothing');
+
+  await call('GET', '/api/sales');
+  await call('POST', '/api/inventory/adjust', { fail: true });
+  assert.strictEqual(owner.length, 1, 'reads and failed changes send nothing');
+
+  await call('POST', '/api/notifications/read-all', { userId: 'owner' });
+  assert.deepStrictEqual(owner.at(-1)?.topics, ['notifications']);
+  assert.strictEqual(cashier.length, 1, "the owner reading their bell doesn't reload the cashier's");
+
+  await call('POST', '/api/support');
+  assert.deepStrictEqual(admin.at(-1), ['support'], 'a new ticket reaches the admin panel');
+
+  realtime.emitMany(['b1', 'b2', 'b1'], ['notifications']);
+  assert.strictEqual(otherShop.at(-1)?.topics[0], 'notifications', 'an announcement reaches each chosen shop');
+  assert.strictEqual(owner.filter((e) => e.topics[0] === 'notifications' && !e.userId).length, 1, 'once per shop');
+  subs.forEach((x) => x.unsubscribe());
 }
 
 async function main() {
@@ -4401,6 +4520,7 @@ async function main() {
   adminTotpMatchesTheRfc();
   await adminTotpLocksAfterRepeatedWrongCodes();
   await viewAsOwnerIsReadOnly();
+  await maintenanceModeClosesTheShopApp();
   await adminCannotLockOutThePanel();
   await reminderGoesOutOncePerThreshold();
   await aNotificationIsReadPerPerson();
@@ -4417,6 +4537,7 @@ async function main() {
   await aLockedShopGetsABillingPassOnly();
   await adminDigestGoesOutOncePerDay();
   await onlinePaymentsAreRecordedOnlyOnceTheGatewaySaysPaid();
+  await khaltiLookupReadsItsErrorAnswers();
   logDateRange();
   devicesAreRecognisable();
   await shiftReportBalancesTheDrawer();
@@ -4467,6 +4588,7 @@ async function main() {
   await signupFollowsThePlatformSettings();
   await logRetentionRemovesOnlyOldEntries();
   await staffSeeOnlyTheirOwnTickets();
+  await liveUpdatesReachTheRightTabs();
   console.log('checks passed');
 }
 

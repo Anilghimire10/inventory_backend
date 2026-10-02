@@ -6,6 +6,7 @@ import { MailService } from '../mail/mail.service';
 import { accessEndsAt, DAY_MS, daysUntil } from '../common/subscription';
 import { trackCron } from '../common/cron-status';
 import { isLocalSlot } from '../common/timezone';
+import { RealtimeService } from '../realtime/realtime.service';
 
 /** Every 15 minutes, on the quarter hour. See `isLocalSlot` for why not hourly. */
 export const REMINDER_SCHEDULE = '0 */15 * * * *';
@@ -33,6 +34,7 @@ export class SubscriptionRemindersService {
   constructor(
     private prisma: PrismaService,
     private mail: MailService,
+    private realtime: RealtimeService,
   ) {}
 
   /**
@@ -107,6 +109,7 @@ export class SubscriptionRemindersService {
       }
       throw e;
     }
+    this.realtime.emit({ businessId: b.id, topics: ['notifications'] });
 
     const owners = await this.prisma.user.findMany({
       where: { businessId: b.id, role: UserRole.OWNER, isActive: true },

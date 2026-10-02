@@ -1176,6 +1176,9 @@ model PlatformSettings {
   signupOpen            Boolean  @default(true)
   /// Shown as a banner across the shop app (and its sign-in page) while set.
   maintenanceMessage    String?
+  /// While on, the shop app is closed: every shop request (signing in too) is
+  /// refused with 503 MAINTENANCE. The admin panel keeps working.
+  maintenanceMode       Boolean  @default(false)
   /// Shop activity-log (AuditLog) entries older than this are deleted daily.
   /// Null keeps them forever.
   auditRetentionDays    Int?

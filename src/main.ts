@@ -9,7 +9,11 @@ import helmet from "helmet";
 import { AppModule } from "./app.module";
 
 async function bootstrap() {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // forceCloseConnections: shutting down waits for open connections, and the
+  // live-update streams (/api/events, /api/admin/events) never end on their
+  // own -- so a restart (every save under `nest start --watch`, every deploy)
+  // hung with the old process deaf on port 3000 and the new one never starting.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { forceCloseConnections: true });
   const config = app.get(ConfigService);
 
   // Without this, PrismaService.onModuleDestroy() never fires on SIGTERM/SIGINT

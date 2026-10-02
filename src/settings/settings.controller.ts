@@ -11,7 +11,8 @@ export class SettingsController {
 
   /**
    * What the shop app needs before anyone signs in: the maintenance banner,
-   * and whether the register form is open. Public, and nothing else from the
+   * whether the app is closed for maintenance, and whether the register form
+   * is open. Public, and nothing else from the
    * settings is included.
    */
   @Public()
@@ -19,6 +20,6 @@ export class SettingsController {
   @Get()
   async status() {
     const s = await this.settings.get();
-    return { maintenanceMessage: s.maintenanceMessage, signupOpen: s.signupOpen };
+    return { maintenanceMessage: s.maintenanceMessage, maintenanceMode: s.maintenanceMode, signupOpen: s.signupOpen };
   }
 }

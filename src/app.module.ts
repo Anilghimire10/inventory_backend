@@ -13,6 +13,8 @@ import { StoreScopeGuard } from './common/guards/store-scope.guard';
 
 import { AuditModule } from './audit/audit.module';
 import { AuditInterceptor } from './audit/audit.interceptor';
+import { RealtimeModule } from './realtime/realtime.module';
+import { RealtimeInterceptor } from './realtime/realtime.interceptor';
 import { MailModule } from './mail/mail.module';
 import { AuthModule } from './auth/auth.module';
 import { NotificationsModule } from './notifications/notifications.module';
@@ -35,6 +37,7 @@ import { SettingsModule } from './settings/settings.module';
 import { SupportModule } from './support/support.module';
 import { SubscriptionModule } from './subscription/subscription.module';
 import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-only.guard';
+import { MaintenanceGuard } from './common/guards/maintenance.guard';
 
 @Module({
   imports: [
@@ -83,6 +86,7 @@ import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-o
     SettingsModule,
     SupportModule,
     SubscriptionModule,
+    RealtimeModule,
   ],
   controllers: [HealthController],
   providers: [
@@ -90,6 +94,8 @@ import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-o
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     // Global auth: every route requires a valid JWT unless marked @Public()
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // Maintenance mode closes the shop app; the admin panel stays open.
+    { provide: APP_GUARD, useClass: MaintenanceGuard },
     // "View as owner" sessions from the admin panel are read-only.
     { provide: APP_GUARD, useClass: ImpersonationReadOnlyGuard },
     // Global role enforcement for routes that declare @Roles(...)
@@ -99,6 +105,8 @@ import { ImpersonationReadOnlyGuard } from './common/guards/impersonation-read-o
     { provide: APP_GUARD, useClass: StoreScopeGuard },
     // Records successful state-changing requests into the audit log.
     { provide: APP_INTERCEPTOR, useClass: AuditInterceptor },
+    // Tells a business's other open tabs what just changed (GET /api/events).
+    { provide: APP_INTERCEPTOR, useClass: RealtimeInterceptor },
   ],
 })
 export class AppModule {}

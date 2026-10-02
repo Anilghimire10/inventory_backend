@@ -6,6 +6,7 @@ import { paginate } from '../common/dto/pagination.dto';
 import { Actor, PlatformAuditService } from './platform-audit.service';
 import { PlatformService } from './platform.service';
 import { ConfirmPaymentClaimDto, QueryPaymentClaimsDto } from './dto/platform.dto';
+import { RealtimeService } from '../realtime/realtime.service';
 
 const dayOf = (d: Date) => d.toISOString().slice(0, 10);
 
@@ -22,6 +23,7 @@ export class PlatformClaimsService {
     private platform: PlatformService,
     private audit: PlatformAuditService,
     private settings: SettingsService,
+    private realtime: RealtimeService,
   ) {}
 
   async list(q: QueryPaymentClaimsDto) {
@@ -104,6 +106,8 @@ export class PlatformClaimsService {
         },
       }),
     ]);
+    this.realtime.emit({ businessId: claim.businessId, topics: ['notifications', 'subscription'] });
+    this.realtime.emitAdmin(['claims', 'businesses']);
     await this.audit.record(actor, 'payment.claim.confirm', {
       businessId: claim.businessId,
       details: { claimId: id, paymentId: recorded.payment.id, amount: Number(recorded.payment.amount) },
@@ -134,6 +138,8 @@ export class PlatformClaimsService {
         link: '/subscription',
       },
     });
+    this.realtime.emit({ businessId: claim.businessId, topics: ['notifications', 'subscription'] });
+    this.realtime.emitAdmin(['claims']);
     await this.audit.record(actor, 'payment.claim.reject', {
       businessId: claim.businessId,
       details: { claimId: id, reason: text },
