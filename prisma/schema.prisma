@@ -553,7 +553,8 @@ model PurchaseItem {
   product     Product   @relation(fields: [productId], references: [id])
   quantity    Decimal   @db.Decimal(12, 3)
   returnedQty Decimal   @default(0) @db.Decimal(12, 3) // sent back to the supplier
-  costPrice   Decimal   @db.Decimal(12, 2)
+  costPrice   Decimal   @db.Decimal(12, 2) // before VAT
+  taxRate     Decimal   @default(0) @db.Decimal(5, 2) // VAT the supplier charged on this line (input VAT)
   batchNumber String?
   expiryDate  DateTime?
 

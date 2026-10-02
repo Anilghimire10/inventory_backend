@@ -13,7 +13,7 @@ import {
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdjustStockDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
-import { isExpired, soonCutoff } from '../common/expiry';
+import { expiredCutoff, isExpired, soonCutoff } from '../common/expiry';
 import { readStockRow, type StockRow } from './stock-import';
 import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
@@ -276,24 +276,203 @@ export class InventoryService {
     });
   }
 
-  /** Manual stock adjustment (damage, count correction, etc.). */
   /**
-   * A manual stock change. For a serialised product the units must be named:
-   * added ones go on file as in stock, removed ones come off it -- DAMAGED
-   * for damage or expiry, LOST otherwise -- so the serial list and the count
-   * move together.
+   * Reduce batch quantities oldest-expiry-first (First-Expired-First-Out)
+   * for every batch-tracked line in one shot: one read for all products'
+   * batches, then a single bulk write for every batch touched, instead of
+   * a read + N updates per line.
+   *
+   * Batches already past their date go last. Taken strictly by date they
+   * went first, so selling one unit of a product with an expired batch on
+   * the shelf recorded the expired unit as the one sold -- and the good
+   * stock as what was left.
+   *
+   * Lives here rather than in SalesService because a sale is not the only
+   * way stock leaves the shelf: an adjustment or a stock take that removes
+   * stock has to draw the batches down too, or they drift above the shelf
+   * and the Expiring list counts stock that isn't there.
+   */
+  async consumeBatchesFEFO(
+    db: Db,
+    storeId: string,
+    items: { productId: string; quantity: number }[],
+  ) {
+    if (items.length === 0) return;
+    const productIds = items.map((i) => i.productId);
+    const batches = await db.batch.findMany({
+      where: { storeId, productId: { in: productIds }, quantity: { gt: 0 } },
+      orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
+    });
+    // Stable sort: in-date (and undated) batches keep their order, expired
+    // ones move behind them.
+    const cutoff = expiredCutoff();
+    batches.sort(
+      (a, b) =>
+        Number(!!a.expiryDate && a.expiryDate <= cutoff) - Number(!!b.expiryDate && b.expiryDate <= cutoff),
+    );
+    const batchesByProduct = new Map<string, typeof batches>();
+    for (const b of batches) {
+      const arr = batchesByProduct.get(b.productId);
+      if (arr) arr.push(b);
+      else batchesByProduct.set(b.productId, [b]);
+    }
+
+    // Final quantity per batch (not a delta) -- a product can appear on more
+    // than one line, so we keep consuming the same in-memory batch list
+    // across lines and only record each batch's *last* resulting quantity.
+    const finalQtyByBatchId = new Map<string, number>();
+    for (const item of items) {
+      let remaining = item.quantity;
+      const productBatches = batchesByProduct.get(item.productId) ?? [];
+      for (const batch of productBatches) {
+        if (remaining <= 0) break;
+        const available = Number(batch.quantity);
+        if (available <= 0) continue;
+        const take = round3(Math.min(available, remaining));
+        const left = round3(available - take);
+        batch.quantity = new Prisma.Decimal(left);
+        finalQtyByBatchId.set(batch.id, left);
+        remaining = round3(remaining - take);
+      }
+      // If batches don't cover it, StockItem remains the source of truth; we
+      // don't block the sale on batch bookkeeping.
+    }
+
+    if (finalQtyByBatchId.size === 0) return;
+    const updateIds = [...finalQtyByBatchId.keys()];
+    const updateQtys = updateIds.map((id) => String(finalQtyByBatchId.get(id)!));
+    await db.$executeRaw`
+      UPDATE "Batch" AS b
+      SET quantity = v.qty::numeric
+      FROM (SELECT * FROM UNNEST(${updateIds}::text[], ${updateQtys}::text[])) AS v(id, qty)
+      WHERE b.id = v.id
+    `;
+  }
+
+  /**
+   * Put stock into a batch, merging into the one with the same natural key
+   * (store, product, batch number, expiry) rather than forking a duplicate.
+   * Undated stock goes into an undated batch: it still has to be in *a*
+   * batch, or the batches stop adding up to the shelf.
+   */
+  async addToBatch(
+    db: Db,
+    input: {
+      businessId: string;
+      storeId: string;
+      productId: string;
+      quantity: number | Prisma.Decimal;
+      batchNumber: string | null;
+      expiryDate: Date | null;
+      costPrice?: number | Prisma.Decimal | null;
+    },
+  ) {
+    const existing = await db.batch.findFirst({
+      where: {
+        storeId: input.storeId,
+        productId: input.productId,
+        batchNumber: input.batchNumber,
+        expiryDate: input.expiryDate,
+      },
+      select: { id: true },
+    });
+    const quantity = String(round3(Number(input.quantity)));
+    if (existing) {
+      await db.batch.update({
+        where: { id: existing.id },
+        data: {
+          quantity: { increment: quantity },
+          ...(input.costPrice != null ? { costPrice: input.costPrice } : {}),
+        },
+      });
+    } else {
+      await db.batch.create({
+        data: {
+          businessId: input.businessId,
+          storeId: input.storeId,
+          productId: input.productId,
+          batchNumber: input.batchNumber,
+          expiryDate: input.expiryDate,
+          quantity,
+          costPrice: input.costPrice ?? null,
+        },
+      });
+    }
+  }
+
+  /**
+   * The batch side of a stock change made by hand (an adjustment, a stock
+   * take): for batch-tracked products, stock removed comes out of the
+   * batches first-expiry-first, as a sale's does, and stock added goes into
+   * the batch given, or an undated one. Other products have no batches to
+   * keep in step and are left alone.
+   */
+  async syncBatches(
+    db: Db,
+    businessId: string,
+    storeId: string,
+    changes: {
+      productId: string;
+      quantity: number;
+      batchNumber?: string | null;
+      expiryDate?: Date | null;
+    }[],
+  ) {
+    const moved = changes.filter((c) => c.quantity !== 0);
+    if (moved.length === 0) return;
+    const tracked = new Set(
+      (
+        await db.product.findMany({
+          where: { id: { in: [...new Set(moved.map((c) => c.productId))] }, trackBatches: true },
+          select: { id: true },
+        })
+      ).map((p) => p.id),
+    );
+    const ours = moved.filter((c) => tracked.has(c.productId));
+    await this.consumeBatchesFEFO(
+      db,
+      storeId,
+      ours.filter((c) => c.quantity < 0).map((c) => ({ productId: c.productId, quantity: -c.quantity })),
+    );
+    for (const c of ours.filter((c) => c.quantity > 0)) {
+      await this.addToBatch(db, {
+        businessId,
+        storeId,
+        productId: c.productId,
+        quantity: c.quantity,
+        batchNumber: c.batchNumber ?? null,
+        expiryDate: c.expiryDate ?? null,
+      });
+    }
+  }
+
+  /**
+   * A manual stock change (damage, count correction, etc.). For a serialised
+   * product the units must be named: added ones go on file as in stock,
+   * removed ones come off it -- DAMAGED for damage or expiry, LOST otherwise
+   * -- so the serial list and the count move together. For a batch-tracked
+   * one the batches move with it: removed stock comes out first-expiry-first,
+   * added stock goes into the batch given (or an undated one).
    */
   async adjust(businessId: string, userId: string, dto: AdjustStockDto) {
     await this.assertStoreAndProduct(businessId, dto.storeId, dto.productId);
     const product = await this.prisma.product.findUnique({
       where: { id: dto.productId },
-      select: { name: true, trackSerials: true },
+      select: { name: true, trackSerials: true, trackBatches: true },
     });
     const serials = InventoryService.checkSerials(
       { name: product!.name, trackSerials: product!.trackSerials },
       Math.abs(dto.delta),
       dto.serials,
     );
+    if (dto.batchNumber || dto.expiryDate) {
+      if (!product!.trackBatches) {
+        throw new BadRequestException(`${product!.name} isn't tracked by batch — leave Batch and Expiry blank`);
+      }
+      if (dto.delta < 0) {
+        throw new BadRequestException('Stock taken out comes from the earliest-expiring batch — leave Batch and Expiry blank');
+      }
+    }
     return this.prisma.$transaction(async (tx) => {
       const moved = await this.applyMovement(tx, {
         businessId,
@@ -305,6 +484,14 @@ export class InventoryService {
         note: dto.note,
         userId,
       });
+      await this.syncBatches(tx, businessId, dto.storeId, [
+        {
+          productId: dto.productId,
+          quantity: dto.delta,
+          batchNumber: dto.batchNumber?.trim() || null,
+          expiryDate: dto.expiryDate ? new Date(dto.expiryDate) : null,
+        },
+      ]);
       if (serials.length) {
         const unit = { businessId, storeId: dto.storeId, productId: dto.productId, serials };
         if (dto.delta > 0) {
@@ -532,7 +719,7 @@ export class InventoryService {
         take: q.limit,
         include: {
           product: {
-            select: { id: true, name: true, sku: true, unit: true, reorderLevel: true, trackSerials: true },
+            select: { id: true, name: true, sku: true, unit: true, reorderLevel: true, trackSerials: true, trackBatches: true },
           },
           store: { select: { id: true, name: true } },
         },
@@ -1472,6 +1659,15 @@ export class InventoryService {
             reference,
           })),
           { allowNegative: true }, // the physical count wins, whatever it says
+        );
+        // Batch-tracked products: a shortfall comes out of the batches
+        // first-expiry-first, stock found goes into an undated batch -- the
+        // count can't say which batch it belongs to.
+        await this.syncBatches(
+          tx,
+          businessId,
+          dto.storeId,
+          changed.map((l) => ({ productId: l.productId, quantity: l.variance })),
         );
       }
       // Bring the serial list to exactly the units counted: missing ones are

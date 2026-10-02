@@ -28,7 +28,7 @@ import { MailService } from '../src/mail/mail.service';
 import { AuthService } from '../src/auth/auth.service';
 import { AuditService } from '../src/audit/audit.service';
 import { InventoryService } from '../src/inventory/inventory.service';
-import { PurchasesService } from '../src/purchases/purchases.service';
+import { PurchasesService, purchaseTotals, weightedCost } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
 import { UsersService } from '../src/users/users.service';
 import { StoreScopeGuard } from '../src/common/guards/store-scope.guard';
@@ -1123,6 +1123,7 @@ async function aSupplierRefundIsOwedUntilReceived() {
     quantity: dec(10),
     returnedQty: dec(0),
     costPrice: dec(50),
+    taxRate: dec(0),
     batchNumber: null,
     expiryDate: null,
   };
@@ -1134,6 +1135,7 @@ async function aSupplierRefundIsOwedUntilReceived() {
     supplierId: 'sup1',
     status: 'RECEIVED',
     subtotal: dec(500),
+    tax: dec(0),
     total: dec(500),
     amountPaid: dec(500),
     refundDue: dec(0),
@@ -1142,6 +1144,9 @@ async function aSupplierRefundIsOwedUntilReceived() {
   };
   const ledger: any[] = [];
   const tx: any = {
+    // Average cost: no shelf to read, so no cost changes.
+    product: { findMany: async () => [] },
+    stockItem: { groupBy: async () => [] },
     $queryRaw: async (_sql: any, delta: string) => {
       item.returnedQty = item.returnedQty.plus(delta);
       return [{ id: item.id }];
@@ -3084,6 +3089,69 @@ async function aShopSeesItsOwnSubscription() {
  * write-off empties the batch as well as the shelf -- and refuses stock that
  * hasn't expired yet.
  */
+async function stockChangedByHandMovesTheBatches() {
+  const day = 24 * 60 * 60 * 1000;
+  const soon = new Date(Date.now() + 3 * day);
+  const later = new Date(Date.now() + 30 * day);
+  let written: { ids: string[]; qtys: string[] } | undefined;
+  const created: any[] = [];
+  const db: any = {
+    // p1 (milk) is batch-tracked; p2 (soap) is not.
+    product: { findMany: async () => [{ id: 'p1' }] },
+    batch: {
+      findMany: async () => [
+        { id: 'b-soon', productId: 'p1', expiryDate: soon, createdAt: new Date(0), quantity: new Prisma.Decimal(4) },
+        { id: 'b-later', productId: 'p1', expiryDate: later, createdAt: new Date(0), quantity: new Prisma.Decimal(10) },
+      ],
+      findFirst: async () => null,
+      create: async ({ data }: any) => created.push(data),
+    },
+    $executeRaw: async (_s: TemplateStringsArray, ids: string[], qtys: string[]) => {
+      written = { ids, qtys };
+    },
+  };
+  const inventory = new InventoryService(stub<PrismaService>({}));
+
+  // 6 damaged: the 4 expiring soonest go first, then 2 of the next batch.
+  await inventory.syncBatches(db, 'b1', 's1', [{ productId: 'p1', quantity: -6 }]);
+  assert.deepStrictEqual(written, { ids: ['b-soon', 'b-later'], qtys: ['0', '8'] }, 'removed stock comes out first-expiry-first');
+
+  // Stock found at a count goes into an undated batch; soap has no batches.
+  await inventory.syncBatches(db, 'b1', 's1', [
+    { productId: 'p1', quantity: 3 },
+    { productId: 'p2', quantity: 5 },
+  ]);
+  assert.deepStrictEqual(
+    created.map((c) => [c.productId, c.quantity, c.batchNumber, c.expiryDate]),
+    [['p1', '3', null, null]],
+    'added stock lands in a batch; an untracked product gets none',
+  );
+}
+
+function aPurchaseCarriesItsVatAndAveragesItsCost() {
+  // 10 x 100 at 13% and 5 x 40 exempt: 1,200 of goods, 130 of input VAT.
+  assert.deepStrictEqual(
+    purchaseTotals([
+      { quantity: 10, costPrice: 100, taxRate: 13 },
+      { quantity: 5, costPrice: 40 },
+    ]),
+    { subtotal: 1200, tax: 130, total: 1330 },
+  );
+
+  // 10 on the shelf at 100, 10 more arrive at 110: the cost is 105, not 110.
+  assert.strictEqual(weightedCost(10, 100, [{ quantity: 10, costPrice: 110 }]), 105);
+  // Nothing on hand, or never costed: the delivery sets it.
+  assert.strictEqual(weightedCost(0, 100, [{ quantity: 5, costPrice: 120 }]), 120);
+  assert.strictEqual(weightedCost(8, 0, [{ quantity: 5, costPrice: 120 }]), 120);
+  // A purchase edit: the old line (10 at 110) comes off, the new (10 at 90) goes on.
+  assert.strictEqual(
+    weightedCost(20, 105, [{ quantity: -10, costPrice: 110 }, { quantity: 10, costPrice: 90 }]),
+    95,
+  );
+  // Everything sent back: no quantity left to average, the cost stands.
+  assert.strictEqual(weightedCost(5, 100, [{ quantity: -5, costPrice: 100 }]), 100);
+}
+
 async function expiredStockIsHandled() {
   const day = 24 * 60 * 60 * 1000;
   const past = new Date(Date.now() - 10 * day);
@@ -3112,7 +3180,7 @@ async function expiredStockIsHandled() {
     stub<ShiftsService>({}),
     stub<PaymentsService>({}),
   );
-  await (sales as any).consumeBatchesFEFOBatch(tx, 's1', [{ productId: 'p1', quantity: 3 }]);
+  await new InventoryService(stub<PrismaService>({})).consumeBatchesFEFO(tx, 's1', [{ productId: 'p1', quantity: 3 }]);
   assert.deepStrictEqual(written, { ids: ['good'], qtys: ['2'] }, 'the in-date batch is used, not the expired one');
 
   // Pharmacy: 5 of the 10 on hand are expired.
@@ -4549,6 +4617,8 @@ async function main() {
   await aCategoryCannotBecomeItsOwnAncestor();
   await anOwnerJoinsTheTillAlreadyOpen();
   await stockTakePreviewComputesVariances();
+  await stockChangedByHandMovesTheBatches();
+  aPurchaseCarriesItsVatAndAveragesItsCost();
   await reorderSuggestionsGroupBySupplier();
   await variantGenerationCoversEveryCombination();
   await serialRulesGuardEveryUnit();

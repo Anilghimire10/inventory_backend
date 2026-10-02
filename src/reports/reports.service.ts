@@ -6,6 +6,7 @@ import {
   PaymentMethod,
   PaymentType,
   Prisma,
+  PurchaseStatus,
   SaleStatus,
   StockMovementType,
 } from '@prisma/client';
@@ -1019,6 +1020,7 @@ export class ReportsService {
       }
     }
 
+    const purchases = await this.inputTax(businessId, opts);
     return {
       taxableAmount: round2(taxableAmount),
       taxCollected: round2(taxCollected),
@@ -1030,6 +1032,59 @@ export class ReportsService {
           taxableAmount: round2(v.taxableAmount),
           tax: round2(v.tax),
         })),
+      purchases,
+      // What is owed to the tax office for the period: VAT collected on
+      // sales less the VAT paid to suppliers. Negative is a credit carried.
+      netTax: round2(round2(taxCollected) - purchases.taxPaid),
+    };
+  }
+
+  /**
+   * Input VAT: what suppliers charged on goods received in the period, by
+   * rate, less anything sent back to them. Dated by when the goods arrived,
+   * the date on the supplier's invoice; a draft never received has no VAT.
+   */
+  private async inputTax(
+    businessId: string,
+    opts: { from?: string; to?: string; storeId?: string },
+  ) {
+    const lines = await this.prisma.purchaseItem.findMany({
+      where: {
+        taxRate: { gt: 0 },
+        purchase: {
+          businessId,
+          status: PurchaseStatus.RECEIVED,
+          ...(opts.storeId ? { storeId: opts.storeId } : {}),
+          ...(opts.from || opts.to
+            ? {
+                receivedAt: {
+                  ...(opts.from ? { gte: new Date(opts.from) } : {}),
+                  ...(opts.to ? { lte: new Date(opts.to) } : {}),
+                },
+              }
+            : {}),
+        },
+      },
+      select: { quantity: true, returnedQty: true, costPrice: true, taxRate: true },
+    });
+    const byRate = new Map<number, { taxableAmount: number; tax: number }>();
+    for (const l of lines) {
+      const kept = Number(l.quantity) - Number(l.returnedQty);
+      if (kept <= 0) continue;
+      const rate = Number(l.taxRate);
+      const net = kept * Number(l.costPrice);
+      const cur = byRate.get(rate) ?? { taxableAmount: 0, tax: 0 };
+      cur.taxableAmount += net;
+      cur.tax += (net * rate) / 100;
+      byRate.set(rate, cur);
+    }
+    const rows = [...byRate.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([rate, v]) => ({ rate, taxableAmount: round2(v.taxableAmount), tax: round2(v.tax) }));
+    return {
+      taxableAmount: round2(rows.reduce((n, r) => n + r.taxableAmount, 0)),
+      taxPaid: round2(rows.reduce((n, r) => n + r.tax, 0)),
+      byRate: rows,
     };
   }
 

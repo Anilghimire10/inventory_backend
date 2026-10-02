@@ -248,7 +248,7 @@ export class SalesService {
       );
       const batchTracked = lines.filter((l) => l.trackBatches);
       if (batchTracked.length) {
-        await this.consumeBatchesFEFOBatch(
+        await this.inventory.consumeBatchesFEFO(
           tx,
           storeId,
           batchTracked.map((l) => ({ productId: l.productId, quantity: l.quantity })),
@@ -994,74 +994,6 @@ export class SalesService {
     });
     const next = last ? Number(last.receiptNo.slice(4)) + 1 : 1;
     return `INV-${String(next).padStart(6, '0')}`;
-  }
-
-  /**
-   * Reduce batch quantities oldest-expiry-first (First-Expired-First-Out)
-   * for every batch-tracked line in one shot: one read for all products'
-   * batches, then a single bulk write for every batch touched, instead of
-   * a read + N updates per line.
-   *
-   * Batches already past their date go last. Taken strictly by date they
-   * went first, so selling one unit of a product with an expired batch on
-   * the shelf recorded the expired unit as the one sold -- and the good
-   * stock as what was left.
-   */
-  private async consumeBatchesFEFOBatch(
-    tx: Prisma.TransactionClient,
-    storeId: string,
-    items: { productId: string; quantity: number }[],
-  ) {
-    if (items.length === 0) return;
-    const productIds = items.map((i) => i.productId);
-    const batches = await tx.batch.findMany({
-      where: { storeId, productId: { in: productIds }, quantity: { gt: 0 } },
-      orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
-    });
-    // Stable sort: in-date (and undated) batches keep their order, expired
-    // ones move behind them.
-    const cutoff = expiredCutoff();
-    batches.sort(
-      (a, b) =>
-        Number(!!a.expiryDate && a.expiryDate <= cutoff) - Number(!!b.expiryDate && b.expiryDate <= cutoff),
-    );
-    const batchesByProduct = new Map<string, typeof batches>();
-    for (const b of batches) {
-      const arr = batchesByProduct.get(b.productId);
-      if (arr) arr.push(b);
-      else batchesByProduct.set(b.productId, [b]);
-    }
-
-    // Final quantity per batch (not a delta) -- a product can appear on more
-    // than one line, so we keep consuming the same in-memory batch list
-    // across lines and only record each batch's *last* resulting quantity.
-    const finalQtyByBatchId = new Map<string, number>();
-    for (const item of items) {
-      let remaining = item.quantity;
-      const productBatches = batchesByProduct.get(item.productId) ?? [];
-      for (const batch of productBatches) {
-        if (remaining <= 0) break;
-        const available = Number(batch.quantity);
-        if (available <= 0) continue;
-        const take = round3(Math.min(available, remaining));
-        const left = round3(available - take);
-        batch.quantity = new Prisma.Decimal(left);
-        finalQtyByBatchId.set(batch.id, left);
-        remaining = round3(remaining - take);
-      }
-      // If batches don't cover it, StockItem remains the source of truth; we
-      // don't block the sale on batch bookkeeping.
-    }
-
-    if (finalQtyByBatchId.size === 0) return;
-    const updateIds = [...finalQtyByBatchId.keys()];
-    const updateQtys = updateIds.map((id) => String(finalQtyByBatchId.get(id)!));
-    await tx.$executeRaw`
-      UPDATE "Batch" AS b
-      SET quantity = v.qty::numeric
-      FROM (SELECT * FROM UNNEST(${updateIds}::text[], ${updateQtys}::text[])) AS v(id, qty)
-      WHERE b.id = v.id
-    `;
   }
 
   private async assertStore(businessId: string, storeId: string) {

@@ -4,6 +4,7 @@ import {
   ArrayMaxSize,
   IsArray,
   IsBoolean,
+  IsDateString,
   IsEnum,
   IsInt,
   IsNumber,
@@ -90,6 +91,17 @@ export class AdjustStockDto {
   @IsString({ each: true })
   @MaxLength(64, { each: true })
   serials?: string[];
+
+  @ApiPropertyOptional({ description: 'Batch-tracked products, stock added: the batch it goes into' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  batchNumber?: string;
+
+  @ApiPropertyOptional({ description: 'Batch-tracked products, stock added: its expiry date', example: '2026-12-31' })
+  @IsOptional()
+  @IsDateString()
+  expiryDate?: string;
 }
 
 export class SetReorderLevelDto {
