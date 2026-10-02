@@ -277,7 +277,19 @@ export class ShiftsService {
     });
     if (own) return own.id;
 
-    if (!storeId || !isManagement(user.role)) return null;
+    if (!isManagement(user.role)) return null;
+    // Asked without a store -- an owner on "all stores" -- a shop with only
+    // one has nothing to disambiguate: that's where the till is. With several
+    // it stays a question for the client.
+    if (!storeId) {
+      const stores = await this.prisma.store.findMany({
+        where: { businessId: user.businessId, isActive: true },
+        select: { id: true },
+        take: 2,
+      });
+      if (stores.length !== 1) return null;
+      storeId = stores[0].id;
+    }
 
     // Two is already the ambiguous case, so ask for two and stop.
     const open = await this.prisma.shift.findMany({
