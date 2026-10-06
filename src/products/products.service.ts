@@ -101,6 +101,7 @@ export class ProductsService {
       ...(q.storeId ? { stockItems: { some: { storeId: q.storeId } } } : {}),
       ...(q.activeOnly !== false ? { isActive: true } : {}),
       ...(q.categoryId ? { categories: { some: { id: q.categoryId } } } : {}),
+      ...(q.taxId ? { taxId: q.taxId } : {}),
       ...(q.ids?.length ? { id: { in: q.ids } } : {}),
       ...(q.parentId ? { parentId: q.parentId } : {}),
       ...(q.excludeVariants ? { parentId: null } : {}),

@@ -835,6 +835,20 @@ export class PurchasesService {
         supplier: true,
         store: { select: { id: true, name: true } },
         items: { include: { product: { select: { id: true, name: true, sku: true } } } },
+        // For the details dialog: what was paid when, and which units came in.
+        payments: {
+          where: { type: { in: [PaymentType.SUPPLIER_PAYMENT, PaymentType.SUPPLIER_REFUND] } },
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            type: true,
+            method: true,
+            amount: true,
+            createdAt: true,
+            user: { select: { name: true } },
+          },
+        },
+        serials: { select: { productId: true, serialNumber: true, status: true }, orderBy: { serialNumber: 'asc' } },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
