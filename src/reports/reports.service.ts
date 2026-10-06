@@ -183,11 +183,6 @@ export class ReportsService {
     storeId?: string,
     includeFinancials = true,
   ) {
-    const tz = await this.timezone(businessId);
-    // Local midnight, not the server's. On a US-hosted box serving Kathmandu
-    // these are 5h45m apart, which is the whole early trade of the day.
-    const startOfToday = startOfDay(tz);
-
     const saleWhere = {
       businessId,
       ...(storeId ? { storeId } : {}),
@@ -200,7 +195,17 @@ export class ReportsService {
       status: BOOKED,
     };
 
-    const [sales, lowStock, expiring, inventoryValue, topProducts, slowProducts] =
+    // Everything starts at once. The database is a long way from the app (a
+    // round trip is most of a second in production), so each wave of awaits
+    // costs that again: the zone lookup used to go first and the charts and
+    // credit after the counts, three waves. Only the two charts need the zone,
+    // so they alone wait for it, alongside the rest -- two waves.
+    //
+    // Charts and the credit position are financial, so owner/manager only.
+    // Credit is here rather than buried in Analytics because what is owed is
+    // money already out the door -- for a shop running udhaaro it is usually
+    // a more pressing number than margin.
+    const [sales, lowStock, expiring, inventoryValue, topProducts, slowProducts, credit, charts] =
       await Promise.all([
         this.prisma.sale.aggregate({
           where: completedWhere,
@@ -214,19 +219,20 @@ export class ReportsService {
           : Promise.resolve(null),
         this.topProducts(businessId, storeId, 5),
         this.slowProducts(businessId, storeId, 5),
+        includeFinancials ? this.creditAgeing(businessId, { storeId }) : Promise.resolve(undefined),
+        includeFinancials
+          ? this.timezone(businessId).then((tz) =>
+              Promise.all([
+                this.salesTrend(businessId, storeId, 14, tz),
+                // Local midnight, not the server's. On a US-hosted box serving
+                // Kathmandu these are 5h45m apart, which is the whole early
+                // trade of the day.
+                this.hourlyToday(businessId, storeId, startOfDay(tz), tz),
+              ]),
+            )
+          : Promise.resolve(undefined),
       ]);
-
-    // Charts and the credit position below are financial, so owner/manager
-    // only. Credit is here rather than buried in Analytics because what is
-    // owed is money already out the door -- for a shop running udhaaro it is
-    // usually a more pressing number than margin.
-    const [salesTrend, hourlyToday, credit] = includeFinancials
-      ? await Promise.all([
-          this.salesTrend(businessId, storeId, 14, tz),
-          this.hourlyToday(businessId, storeId, startOfToday, tz),
-          this.creditAgeing(businessId, { storeId }),
-        ])
-      : [undefined, undefined, undefined];
+    const [salesTrend, hourlyToday] = charts ?? [undefined, undefined];
 
     return {
       totalSalesCount: sales._count,

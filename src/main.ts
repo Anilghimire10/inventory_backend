@@ -91,6 +91,12 @@ async function bootstrap() {
         ]
       : true,
     credentials: true,
+    // The web app calls the API on another origin, so nearly every request
+    // (it carries Authorization) is preceded by an OPTIONS preflight. Without
+    // a max age browsers keep that answer for 5 seconds, which doubled the
+    // round trips of almost every call. Chrome caps this at 2 hours, Firefox
+    // at 24; the allowlist above still decides who gets an answer at all.
+    maxAge: 86400,
   });
 
   // Validate + transform every incoming DTO; strip unknown fields
