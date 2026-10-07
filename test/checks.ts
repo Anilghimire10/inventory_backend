@@ -842,6 +842,8 @@ function returnHarness(opts: {
   salePaymentMethod?: PaymentMethod | null;
   /** The till the returner is on, as ShiftsService resolves it. */
   shiftId?: string | null;
+  /** No till resolved because several are open and none was named. */
+  tillsAmbiguous?: boolean;
   /** Lines whose product is batch-tracked. */
   batchTracked?: string[];
 }) {
@@ -942,7 +944,10 @@ function returnHarness(opts: {
       },
     }),
     stub<MailService>({}),
-    stub<ShiftsService>({ resolveShiftId: async () => opts.shiftId ?? null }),
+    stub<ShiftsService>({
+      resolveShiftId: async () => opts.shiftId ?? null,
+      tillFor: async () => ({ shiftId: opts.shiftId ?? null, ambiguous: !!opts.tillsAmbiguous }),
+    }),
     stub<PaymentsService>({
       record: async (input: any) => {
         state.payments.push(input);
@@ -1599,6 +1604,61 @@ async function aCashierReadsOnlyTheirOwnShift() {
   assert.strictEqual(seen.expectedCash, 1000, 'management still reads every till');
 }
 
+/**
+ * Cash never moves through an unnamed till while several are open. An owner
+ * with none of their own, at a store with two running, used to have a cash
+ * refund (or cash taken against credit) booked to no till: the drawer it
+ * really went through then counted short (or over) at close, and the cashier
+ * answered for it.
+ */
+async function cashNeedsANamedTill() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  // The rule itself: two open, none the owner's, none named.
+  const open = [{ id: 'sh-a', userId: 'u2' }, { id: 'sh-b', userId: 'u3' }];
+  const shifts = new ShiftsService(
+    stub<PrismaService>({
+      shift: {
+        findFirst: async (args: any) =>
+          args.where.id
+            ? (open.find((sh) => sh.id === args.where.id) ?? null)
+            : (open.find((sh) => sh.userId === args.where.userId) ?? null),
+        findMany: async () => open,
+      },
+    }),
+    stub<PaymentsService>({}),
+  );
+  assert.deepStrictEqual(await shifts.tillFor(owner, 's1'), { shiftId: null, ambiguous: true });
+  assert.deepStrictEqual(await shifts.tillFor(owner, 's1', 'sh-b'), { shiftId: 'sh-b', ambiguous: false });
+  assert.deepStrictEqual(
+    await shifts.tillFor({ ...user, userId: 'u9' }, 's1'),
+    { shiftId: null, ambiguous: false },
+    'a cashier with no till is simply on none',
+  );
+
+  // A cash refund in that state is refused, and nothing is written.
+  const build = () =>
+    returnHarness({
+      sale: { subtotal: 100, total: 100, amountPaid: 100 },
+      items: [{ id: 'tea', quantity: 1, lineTotal: 100 }],
+      salePaymentMethod: PaymentMethod.CASH,
+      tillsAmbiguous: true,
+    });
+  const cash = build();
+  await assert.rejects(
+    cash.ret([['tea', 1]], { items: [{ saleItemId: 'tea', quantity: 1 }] }),
+    (e: any) => e.getStatus() === 409 && e.getResponse().code === 'TILL_CHOICE' && /comes out of/.test(e.message),
+    'a cash refund names the till it comes out of',
+  );
+  assert.strictEqual(cash.state.payments.length, 0, 'and no refund is recorded');
+  // Back on the card: no drawer involved, so nothing to choose.
+  const card = build();
+  const res = await card.ret([['tea', 1]], {
+    refundMethod: PaymentMethod.CARD,
+    items: [{ saleItemId: 'tea', quantity: 1 }],
+  });
+  assert.strictEqual(res.refund, 100, 'a card refund goes through');
+}
+
 const utcDay = (iso: string) => new Date(`${iso}T00:00:00Z`);
 
 /**
@@ -1982,7 +2042,10 @@ async function aStaleReadCannotOverReturnALine() {
     prisma,
     inventory,
     stub<MailService>({}),
-    stub<ShiftsService>({ resolveShiftId: async () => null }),
+    stub<ShiftsService>({
+      resolveShiftId: async () => null,
+      tillFor: async () => ({ shiftId: null, ambiguous: false }),
+    }),
     stub<PaymentsService>({ record: async () => undefined }),
   );
 
@@ -5047,6 +5110,7 @@ async function main() {
   await aClosedTillTakesNoMoreMoney();
   await twoOwnersOpenOneTill();
   await aCashierReadsOnlyTheirOwnShift();
+  await cashNeedsANamedTill();
   await aReturnGoesBackToTheBatchItCameFrom();
   await aReturnCanBeWrittenOffAsExpired();
   await aSecondDateMovesAProductOntoBatches();

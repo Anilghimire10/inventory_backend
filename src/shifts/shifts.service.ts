@@ -93,6 +93,18 @@ function checkCashCount(count: Record<string, number>, countedCash: number) {
   return clean;
 }
 
+/**
+ * Refuses cash that would be booked to no till because several are open and
+ * the caller named none. The client shows a till picker on this code.
+ */
+export const chooseTill = (direction: 'in' | 'out') =>
+  new ConflictException({
+    statusCode: 409,
+    error: 'Conflict',
+    code: 'TILL_CHOICE',
+    message: `Several tills are open here. Choose which till the cash ${direction === 'out' ? 'comes out of' : 'goes into'}.`,
+  });
+
 /** Thrown when money is booked to a till that has been counted and closed. */
 const shiftClosed = () =>
   new ConflictException({
@@ -311,7 +323,26 @@ export class ShiftsService {
     storeId?: string,
     preferShiftId?: string,
   ): Promise<string | null> {
-    if (preferShiftId) return this.joinable(user, preferShiftId, storeId);
+    return (await this.tillFor(user, storeId, preferShiftId)).shiftId;
+  }
+
+  /**
+   * `resolveShiftId`, saying also when there was no till only because it was
+   * ambiguous: an owner or manager with none of their own at a store where
+   * two or more are open. A sale can't get there (the POS asks which till
+   * before it sells), but cash handed back on a return or taken against
+   * credit can -- and booked to no till, it leaves the drawer it really went
+   * through over or short at close, with the cashier blamed. Callers moving
+   * cash refuse that case (see `chooseTill`) rather than guess.
+   */
+  async tillFor(
+    user: AuthUser,
+    storeId?: string,
+    preferShiftId?: string,
+  ): Promise<{ shiftId: string | null; ambiguous: boolean }> {
+    if (preferShiftId) {
+      return { shiftId: await this.joinable(user, preferShiftId, storeId), ambiguous: false };
+    }
 
     const own = await this.prisma.shift.findFirst({
       where: {
@@ -323,9 +354,9 @@ export class ShiftsService {
       select: { id: true },
       orderBy: { openedAt: 'desc' },
     });
-    if (own) return own.id;
+    if (own) return { shiftId: own.id, ambiguous: false };
 
-    if (!isManagement(user.role)) return null;
+    if (!isManagement(user.role)) return { shiftId: null, ambiguous: false };
     // Asked without a store -- an owner on "all stores" -- a shop with only
     // one has nothing to disambiguate: that's where the till is. With several
     // it stays a question for the client.
@@ -335,7 +366,7 @@ export class ShiftsService {
         select: { id: true },
         take: 2,
       });
-      if (stores.length !== 1) return null;
+      if (stores.length !== 1) return { shiftId: null, ambiguous: false };
       storeId = stores[0].id;
     }
 
@@ -346,7 +377,9 @@ export class ShiftsService {
       orderBy: { openedAt: 'asc' },
       take: 2,
     });
-    return open.length === 1 ? open[0].id : null;
+    return open.length === 1
+      ? { shiftId: open[0].id, ambiguous: false }
+      : { shiftId: null, ambiguous: open.length > 1 };
   }
 
   /**

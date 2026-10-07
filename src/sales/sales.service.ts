@@ -14,7 +14,7 @@ import {
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { ShiftsService, holdShiftOpen } from '../shifts/shifts.service';
+import { ShiftsService, chooseTill, holdShiftOpen } from '../shifts/shifts.service';
 import { PaymentsService, SETTLE_METHODS } from '../payments/payments.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
@@ -584,7 +584,7 @@ export class SalesService {
       );
     }
 
-    const [trackedProducts, shiftId] = await Promise.all([
+    const [trackedProducts, till] = await Promise.all([
       this.prisma.product.findMany({
         where: {
           id: { in: found.items.map((i) => i.productId) },
@@ -596,8 +596,9 @@ export class SalesService {
       // The refund comes out of the drawer at the counter now, not the one the
       // sale was rung up on: a return a week later is paid from today's till,
       // and that till's count is the one it has to explain.
-      this.shifts.resolveShiftId(user, found.storeId, dto.shiftId),
+      this.shifts.tillFor(user, found.storeId, dto.shiftId),
     ]);
+    const shiftId = till.shiftId;
     const serialised = new Set(trackedProducts.filter((p) => p.trackSerials).map((p) => p.id));
     const batched = new Set(trackedProducts.filter((p) => p.trackBatches).map((p) => p.id));
 
@@ -723,6 +724,10 @@ export class SalesService {
       let method: PaymentMethod | null = null;
       if (cashBack > 0) {
         method = dto.refundMethod ?? (await this.defaultRefundMethod(tx, sale.id));
+        // Cash out of an unnamed drawer, with several open: booked to none,
+        // the drawer it really came from counts short at close. Only known
+        // here -- the tender and how much goes back read the locked rows.
+        if (till.ambiguous && method === PaymentMethod.CASH) throw chooseTill('out');
         await this.payments.record(
           {
             businessId: sale.businessId,
