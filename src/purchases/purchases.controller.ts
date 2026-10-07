@@ -65,6 +65,25 @@ export class ReorderDraftDto {
   supplierId?: string;
 }
 
+/** Which delivery some stock came on: a batch, or a product's own stock. */
+export class ReturnableQueryDto {
+  @ApiProperty()
+  @IsString()
+  @MaxLength(64)
+  storeId: string;
+
+  @ApiProperty()
+  @IsString()
+  @MaxLength(64)
+  productId: string;
+
+  @ApiPropertyOptional({ description: 'The batch; omit for a product without batches' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  batchId?: string;
+}
+
 @ApiTags('purchases')
 @ApiBearerAuth()
 @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
@@ -157,6 +176,16 @@ export class PurchasesController {
   @Post('reorder-drafts')
   reorderDrafts(@CurrentUser() u: AuthUser, @Body() dto: ReorderDraftDto) {
     return this.purchases.createReorderDrafts(u.businessId, dto);
+  }
+
+  /**
+   * The received purchase lines some stock could go back to the supplier
+   * against -- for "Return to supplier" on the Expiring list, where what is
+   * known is the batch, not the purchase it arrived on.
+   */
+  @Get('returnable')
+  returnable(@CurrentUser() u: AuthUser, @Query() q: ReturnableQueryDto) {
+    return this.purchases.returnableLines(u.businessId, q, u);
   }
 
   @Get()

@@ -12,8 +12,8 @@ import {
 } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { AdjustStockDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
-import { expiredCutoff, isExpired, soonCutoff } from '../common/expiry';
+import { AdjustStockDto, ClearanceDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
+import { expiredCutoff, inDateFirst, isExpired, soonCutoff } from '../common/expiry';
 import { readStockRow, type StockRow } from './stock-import';
 import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
@@ -28,6 +28,7 @@ import { allowsFraction } from '../common/units';
 
 /** Quantities are numeric(12,3); keep JS float arithmetic on that grid. */
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /** Where a serialised unit is, in words, for error messages and the till. */
 function describeSerial(r: {
@@ -76,6 +77,123 @@ export interface MovementInput {
   reason?: AdjustmentReason | null;
   note?: string | null;
   reference?: string | null;
+}
+
+/** See InventoryService.addToBatch. */
+async function putInBatch(
+  db: Db,
+  input: {
+    businessId: string;
+    storeId: string;
+    productId: string;
+    quantity: number | Prisma.Decimal;
+    batchNumber: string | null;
+    expiryDate: Date | null;
+    costPrice?: number | Prisma.Decimal | null;
+  },
+) {
+  const existing = await db.batch.findFirst({
+    where: {
+      storeId: input.storeId,
+      productId: input.productId,
+      batchNumber: input.batchNumber,
+      expiryDate: input.expiryDate,
+    },
+    select: { id: true },
+  });
+  const quantity = String(round3(Number(input.quantity)));
+  if (existing) {
+    await db.batch.update({
+      where: { id: existing.id },
+      data: {
+        quantity: { increment: quantity },
+        ...(input.costPrice != null ? { costPrice: input.costPrice } : {}),
+      },
+    });
+  } else {
+    await db.batch.create({
+      data: {
+        businessId: input.businessId,
+        storeId: input.storeId,
+        productId: input.productId,
+        batchNumber: input.batchNumber,
+        expiryDate: input.expiryDate,
+        quantity,
+        costPrice: input.costPrice ?? null,
+      },
+    });
+  }
+}
+
+/**
+ * Switch a product that keeps one expiry date on itself over to batches,
+ * keeping the date of the stock already on the shelf.
+ *
+ * One date for every unit can't describe two deliveries: a new one either
+ * overwrote the date -- old stock about to expire then read as fresh and
+ * dropped off the Expiring list -- or writing off "the expired stock" took
+ * every unit at the store, fresh ones included. Batches hold each delivery's
+ * date. What is on hand at each store becomes a batch dated with the
+ * product's expiry (merging into any batch already there with that date, and
+ * only for what existing batches don't already cover), its markdown moves
+ * onto that batch, and the product-level date is cleared so nothing counts
+ * the same stock twice.
+ *
+ * `incoming` is stock already added to the shelf in this transaction that
+ * belongs to a new batch, not the old date: a delivery that triggered this.
+ */
+export async function convertToBatches(
+  db: Db,
+  productId: string,
+  incoming?: { storeId: string; quantity: number },
+) {
+  const product = await db.product.findUniqueOrThrow({
+    where: { id: productId },
+    select: { businessId: true, trackBatches: true, expiryDate: true, costPrice: true },
+  });
+  if (product.trackBatches) return;
+  const [stock, batches] = await Promise.all([
+    db.stockItem.findMany({
+      where: { productId, quantity: { gt: 0 } },
+      select: { storeId: true, quantity: true, clearancePrice: true, clearanceFor: true },
+    }),
+    db.batch.groupBy({
+      by: ['storeId'],
+      where: { productId, quantity: { gt: 0 } },
+      _sum: { quantity: true },
+    }),
+  ]);
+  const covered = new Map(batches.map((b) => [b.storeId, Number(b._sum.quantity ?? 0)]));
+  for (const s of stock) {
+    const arriving = incoming?.storeId === s.storeId ? incoming.quantity : 0;
+    const old = round3(Number(s.quantity) - arriving - (covered.get(s.storeId) ?? 0));
+    if (old <= 0) continue;
+    await putInBatch(db, {
+      businessId: product.businessId,
+      storeId: s.storeId,
+      productId,
+      quantity: old,
+      batchNumber: null,
+      expiryDate: product.expiryDate,
+      costPrice: product.costPrice,
+    });
+    const markedDown =
+      s.clearancePrice !== null && s.clearanceFor?.getTime() === product.expiryDate?.getTime();
+    if (markedDown) {
+      await db.batch.updateMany({
+        where: { storeId: s.storeId, productId, batchNumber: null, expiryDate: product.expiryDate },
+        data: { clearancePrice: s.clearancePrice },
+      });
+    }
+  }
+  await db.stockItem.updateMany({
+    where: { productId },
+    data: { clearancePrice: null, clearanceFor: null },
+  });
+  await db.product.update({
+    where: { id: productId },
+    data: { trackBatches: true, expiryDate: null },
+  });
 }
 
 @Injectable()
@@ -291,25 +409,22 @@ export class InventoryService {
    * way stock leaves the shelf: an adjustment or a stock take that removes
    * stock has to draw the batches down too, or they drift above the shelf
    * and the Expiring list counts stock that isn't there.
+   *
+   * Returns what each item took, batch by batch, in the order given -- the
+   * sale keeps it so a return can put units back where they came from.
    */
   async consumeBatchesFEFO(
     db: Db,
     storeId: string,
     items: { productId: string; quantity: number }[],
-  ) {
-    if (items.length === 0) return;
+  ): Promise<{ batchId: string; quantity: number }[][]> {
+    if (items.length === 0) return [];
     const productIds = items.map((i) => i.productId);
     const batches = await db.batch.findMany({
       where: { storeId, productId: { in: productIds }, quantity: { gt: 0 } },
       orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
     });
-    // Stable sort: in-date (and undated) batches keep their order, expired
-    // ones move behind them.
-    const cutoff = expiredCutoff();
-    batches.sort(
-      (a, b) =>
-        Number(!!a.expiryDate && a.expiryDate <= cutoff) - Number(!!b.expiryDate && b.expiryDate <= cutoff),
-    );
+    inDateFirst(batches);
     const batchesByProduct = new Map<string, typeof batches>();
     for (const b of batches) {
       const arr = batchesByProduct.get(b.productId);
@@ -321,7 +436,10 @@ export class InventoryService {
     // than one line, so we keep consuming the same in-memory batch list
     // across lines and only record each batch's *last* resulting quantity.
     const finalQtyByBatchId = new Map<string, number>();
+    const taken: { batchId: string; quantity: number }[][] = [];
     for (const item of items) {
+      const took: { batchId: string; quantity: number }[] = [];
+      taken.push(took);
       let remaining = item.quantity;
       const productBatches = batchesByProduct.get(item.productId) ?? [];
       for (const batch of productBatches) {
@@ -332,13 +450,14 @@ export class InventoryService {
         const left = round3(available - take);
         batch.quantity = new Prisma.Decimal(left);
         finalQtyByBatchId.set(batch.id, left);
+        took.push({ batchId: batch.id, quantity: take });
         remaining = round3(remaining - take);
       }
       // If batches don't cover it, StockItem remains the source of truth; we
       // don't block the sale on batch bookkeeping.
     }
 
-    if (finalQtyByBatchId.size === 0) return;
+    if (finalQtyByBatchId.size === 0) return taken;
     const updateIds = [...finalQtyByBatchId.keys()];
     const updateQtys = updateIds.map((id) => String(finalQtyByBatchId.get(id)!));
     await db.$executeRaw`
@@ -347,6 +466,7 @@ export class InventoryService {
       FROM (SELECT * FROM UNNEST(${updateIds}::text[], ${updateQtys}::text[])) AS v(id, qty)
       WHERE b.id = v.id
     `;
+    return taken;
   }
 
   /**
@@ -367,37 +487,7 @@ export class InventoryService {
       costPrice?: number | Prisma.Decimal | null;
     },
   ) {
-    const existing = await db.batch.findFirst({
-      where: {
-        storeId: input.storeId,
-        productId: input.productId,
-        batchNumber: input.batchNumber,
-        expiryDate: input.expiryDate,
-      },
-      select: { id: true },
-    });
-    const quantity = String(round3(Number(input.quantity)));
-    if (existing) {
-      await db.batch.update({
-        where: { id: existing.id },
-        data: {
-          quantity: { increment: quantity },
-          ...(input.costPrice != null ? { costPrice: input.costPrice } : {}),
-        },
-      });
-    } else {
-      await db.batch.create({
-        data: {
-          businessId: input.businessId,
-          storeId: input.storeId,
-          productId: input.productId,
-          batchNumber: input.batchNumber,
-          expiryDate: input.expiryDate,
-          quantity,
-          costPrice: input.costPrice ?? null,
-        },
-      });
-    }
+    return putInBatch(db, input);
   }
 
   /**
@@ -646,7 +736,35 @@ export class InventoryService {
             note: 'Opening stock (import)',
             userId,
           });
-          if (p.product.trackBatches) {
+          // Read here, not from the sheet's product list: an earlier row may
+          // have moved this product onto batches.
+          const current = await tx.product.findUniqueOrThrow({
+            where: { id: p.product.id },
+            select: { trackBatches: true, expiryDate: true },
+          });
+          let batched = current.trackBatches;
+          // Stock already on the shelf carries another date: keep both on
+          // batches rather than re-dating the old units with this row's.
+          if (
+            !batched &&
+            p.expiryDate &&
+            current.expiryDate &&
+            current.expiryDate.getTime() !== p.expiryDate.getTime()
+          ) {
+            const stock = await tx.stockItem.findMany({
+              where: { productId: p.product.id, quantity: { gt: 0 } },
+              select: { storeId: true, quantity: true },
+            });
+            const old = stock.reduce(
+              (n, s) => n + Number(s.quantity) - (s.storeId === p.storeId ? p.quantity : 0),
+              0,
+            );
+            if (round3(old) > 0) {
+              await convertToBatches(tx, p.product.id, { storeId: p.storeId, quantity: p.quantity });
+              batched = true;
+            }
+          }
+          if (batched) {
             await tx.batch.create({
               data: {
                 businessId,
@@ -673,7 +791,7 @@ export class InventoryService {
           // batches keeps an expiry date on the product itself.
           const productUpdate = {
             ...(p.cost != null && Number(p.product.costPrice) === 0 ? { costPrice: p.cost } : {}),
-            ...(!p.product.trackBatches && p.expiryDate ? { expiryDate: p.expiryDate } : {}),
+            ...(!batched && p.expiryDate ? { expiryDate: p.expiryDate } : {}),
           };
           if (Object.keys(productUpdate).length) {
             await tx.product.update({ where: { id: p.product.id }, data: productUpdate });
@@ -1098,31 +1216,84 @@ export class InventoryService {
   }
 
   /**
-   * Customer return of a batch-tracked product: put the quantity back into a
-   * batch, so expiry tracking counts it again. Without this every return
-   * left the batches short of the shelf, and expiry alerts under-counted.
+   * Customer return of a batch-tracked product: put the units back into the
+   * batch they were sold from, so expiry tracking counts them again. Without
+   * this every return left the batches short of the shelf, and expiry alerts
+   * under-counted.
    *
-   * ponytail: a sale consumes batches first-expiry-first without recording
-   * which batch each unit came from, so the batch it goes back to is
-   * inferred -- the earliest-expiring one the store already held when the
-   * sale was made, which is the one FEFO would have taken it from. Erring
-   * that way also warns about expiry sooner rather than later. Record the
-   * batch on the sale line if exact traceability is ever needed.
+   * A sale records which batches each line drew (SaleItemBatch), and units go
+   * back to those, soonest-expiring first -- which unit of a mixed line came
+   * back can't be known, and erring early warns about expiry sooner rather
+   * than later. Goods written off on return (`restock: false`) never reach a
+   * batch, but still count against what the line drew, so a later return
+   * can't put back more than came out.
+   *
+   * A sale from before batches were recorded has none, and the batch is
+   * inferred: the one the till would have sold from when the sale was made.
+   * That is in-date first. Taken strictly by date, it was often a batch that
+   * had already expired, so a good unit was filed under it and written off
+   * with it.
    */
   async restoreBatchOnReturn(
     db: Db,
-    input: { storeId: string; productId: string; quantity: number; soldAt: Date },
+    input: {
+      storeId: string;
+      productId: string;
+      saleItemId: string;
+      quantity: number;
+      soldAt: Date;
+      restock: boolean;
+    },
   ) {
-    const batch = await db.batch.findFirst({
+    const drawn = await db.saleItemBatch.findMany({
+      where: { saleItemId: input.saleItemId },
+      select: {
+        id: true,
+        batchId: true,
+        quantity: true,
+        returnedQty: true,
+        batch: { select: { expiryDate: true } },
+      },
+    });
+    if (drawn.length) {
+      // NULL expiries last, as a sale orders them.
+      const order = (d: Date | null) => d?.getTime() ?? Number.POSITIVE_INFINITY;
+      drawn.sort((a, b) => order(a.batch.expiryDate) - order(b.batch.expiryDate));
+      let remaining = round3(input.quantity);
+      for (const d of drawn) {
+        if (remaining <= 0) break;
+        const open = round3(Number(d.quantity) - Number(d.returnedQty));
+        if (open <= 0) continue;
+        const back = round3(Math.min(open, remaining));
+        await db.saleItemBatch.update({
+          where: { id: d.id },
+          data: { returnedQty: { increment: String(back) } },
+        });
+        if (input.restock) {
+          await db.batch.update({
+            where: { id: d.batchId },
+            data: { quantity: { increment: String(back) } },
+          });
+        }
+        remaining = round3(remaining - back);
+      }
+      // Anything past what the batches covered was sold with none to draw
+      // from; StockItem stays the source of truth for it, as on the sale.
+      return;
+    }
+
+    if (!input.restock) return;
+    const candidates = await db.batch.findMany({
       where: {
         storeId: input.storeId,
         productId: input.productId,
         createdAt: { lte: input.soldAt },
       },
-      // The same order a sale consumes them in (NULL expiries sort last).
       orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
-      select: { id: true },
+      select: { id: true, expiryDate: true },
     });
+    // Expired as of the sale, not today: that is what the till skipped then.
+    const batch = inDateFirst(candidates, expiredCutoff(input.soldAt))[0];
     // No batch to put it in: StockItem stays the source of truth, exactly as
     // when a sale finds its batches short.
     if (!batch) return;
@@ -1334,7 +1505,7 @@ export class InventoryService {
           expiryDate: { not: null, lte: cutoff },
         },
         include: {
-          product: { select: { id: true, name: true, sku: true } },
+          product: { select: { id: true, name: true, sku: true, sellingPrice: true } },
           store: { select: { id: true, name: true } },
         },
         orderBy: { expiryDate: 'asc' },
@@ -1350,7 +1521,9 @@ export class InventoryService {
           storeId: true,
           productId: true,
           quantity: true,
-          product: { select: { id: true, name: true, sku: true, expiryDate: true } },
+          clearancePrice: true,
+          clearanceFor: true,
+          product: { select: { id: true, name: true, sku: true, expiryDate: true, sellingPrice: true } },
           store: { select: { id: true, name: true } },
         },
       }),
@@ -1360,8 +1533,9 @@ export class InventoryService {
         ...b,
         source: 'batch' as const,
         expired: isExpired(b.expiryDate, now),
+        clearancePrice: b.clearancePrice === null ? null : Number(b.clearancePrice),
       })),
-      ...productStock.map(({ product: { expiryDate, ...product }, ...s }) => ({
+      ...productStock.map(({ product: { expiryDate, ...product }, clearancePrice, clearanceFor, ...s }) => ({
         id: `product:${s.storeId}:${s.productId}`,
         source: 'product' as const,
         storeId: s.storeId,
@@ -1372,6 +1546,11 @@ export class InventoryService {
         product,
         store: s.store,
         expired: isExpired(expiryDate, now),
+        // A markdown set against an older date doesn't carry to new stock.
+        clearancePrice:
+          clearancePrice !== null && clearanceFor?.getTime() === expiryDate?.getTime()
+            ? Number(clearancePrice)
+            : null,
       })),
     ];
     return rows.sort((a, b) => a.expiryDate!.getTime() - b.expiryDate!.getTime());
@@ -1436,6 +1615,63 @@ export class InventoryService {
       }
       return { writtenOff: qty };
     }, TX_OPTS);
+  }
+
+  /**
+   * Mark stock nearing its date down to sell it before it has to be written
+   * off, or end the markdown (`price: null`).
+   *
+   * For a batch, the till prices units drawn from it at the clearance price
+   * while it is in date; the batches sell soonest-expiry first, so these go
+   * before fresher stock. For a product keeping one expiry date on itself,
+   * every unit at the store is marked down -- but only while that date
+   * stands: `clearanceFor` pins it, so stock arriving with a new date is not
+   * sold off cheap with the old.
+   *
+   * Only stock still in date: past it, the till doesn't sell from it first
+   * (and a pharmacy can't sell it at all), so there is nothing to price.
+   */
+  async setClearance(businessId: string, dto: ClearanceDto) {
+    await this.assertStoreAndProduct(businessId, dto.storeId, dto.productId);
+    const product = await this.prisma.product.findUniqueOrThrow({
+      where: { id: dto.productId },
+      select: { sellingPrice: true, expiryDate: true, trackBatches: true },
+    });
+    const price = dto.price === null ? null : round2(dto.price);
+    if (price !== null && price >= Number(product.sellingPrice)) {
+      throw new BadRequestException(
+        `A clearance price must be below the selling price of ${Number(product.sellingPrice).toFixed(2)}`,
+      );
+    }
+
+    if (dto.batchId) {
+      const batch = await this.prisma.batch.findFirst({
+        where: { id: dto.batchId, businessId, storeId: dto.storeId, productId: dto.productId },
+        select: { id: true, expiryDate: true, quantity: true },
+      });
+      if (!batch) throw new NotFoundException('Batch not found');
+      if (price !== null) {
+        if (isExpired(batch.expiryDate)) throw new BadRequestException('This batch has already expired — write it off instead');
+        if (Number(batch.quantity) <= 0) throw new BadRequestException('This batch has nothing left to sell');
+      }
+      await this.prisma.batch.update({ where: { id: batch.id }, data: { clearancePrice: price } });
+      return { clearancePrice: price };
+    }
+
+    if (product.trackBatches) {
+      throw new BadRequestException('This product is tracked by batch — mark down a batch');
+    }
+    if (price !== null && (!product.expiryDate || isExpired(product.expiryDate))) {
+      throw new BadRequestException(
+        product.expiryDate ? 'This product has already expired — write it off instead' : 'This product has no expiry date',
+      );
+    }
+    const updated = await this.prisma.stockItem.updateMany({
+      where: { storeId: dto.storeId, productId: dto.productId },
+      data: { clearancePrice: price, clearanceFor: price === null ? null : product.expiryDate },
+    });
+    if (updated.count === 0) throw new NotFoundException('This store doesn’t carry that product');
+    return { clearancePrice: price };
   }
 
   async movements(businessId: string, q: QueryMovementsDto) {

@@ -11,7 +11,9 @@ import {
   IsOptional,
   IsString,
   MaxLength,
+  Min,
   NotEquals,
+  ValidateIf,
 } from 'class-validator';
 
 /** Opening stock rows from a spreadsheet. */
@@ -49,6 +51,18 @@ export class WriteOffExpiredDto {
   @IsString()
   @MaxLength(64)
   batchId?: string;
+}
+
+/**
+ * Mark stock nearing its date down to sell it in time: one batch, or (no
+ * batchId) a product's own dated stock at a store. `price: null` ends it.
+ */
+export class ClearanceDto extends WriteOffExpiredDto {
+  @ApiProperty({ nullable: true, description: 'Clearance price per unit; null to end the markdown', example: 80 })
+  @ValidateIf((o: ClearanceDto) => o.price !== null)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  price: number | null;
 }
 
 export class AdjustStockDto {

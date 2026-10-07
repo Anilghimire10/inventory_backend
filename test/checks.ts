@@ -27,7 +27,7 @@ import { CategoriesService } from '../src/categories/categories.service';
 import { MailService } from '../src/mail/mail.service';
 import { AuthService } from '../src/auth/auth.service';
 import { AuditService } from '../src/audit/audit.service';
-import { InventoryService } from '../src/inventory/inventory.service';
+import { InventoryService, convertToBatches } from '../src/inventory/inventory.service';
 import { PurchasesService, purchaseTotals, weightedCost } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
 import { UsersService } from '../src/users/users.service';
@@ -875,6 +875,7 @@ function returnHarness(opts: {
     payments: [] as any[],
     moves: [] as any[],
     batchesBack: [] as any[],
+    writtenOffFromBatches: [] as any[],
     stockBack: 0,
     transactions: 0,
   };
@@ -933,8 +934,11 @@ function returnHarness(opts: {
         state.stockBack += moves.reduce((n, m) => n + m.quantity, 0);
       },
       returnSerialsToStock: async () => undefined,
+      // Every batch-tracked line is reported, so it counts against what the
+      // line drew; only restocked units go back into a batch.
       restoreBatchOnReturn: async (_tx: any, input: any) => {
-        state.batchesBack.push([input.productId, input.quantity]);
+        if (input.restock) state.batchesBack.push([input.productId, input.quantity]);
+        else state.writtenOffFromBatches.push([input.productId, input.quantity]);
       },
     }),
     stub<MailService>({}),
@@ -1157,7 +1161,8 @@ async function aSupplierRefundIsOwedUntilReceived() {
     // Average cost: no shelf to read, so no cost changes.
     product: { findMany: async () => [] },
     stockItem: { groupBy: async () => [] },
-    $queryRaw: async (_sql: any, delta: string) => {
+    $queryRaw: async (sql: TemplateStringsArray, delta: string) => {
+      if (sql.join('?').includes('FROM "Purchase"')) return [{ id: purchase.id }]; // the row lock
       item.returnedQty = item.returnedQty.plus(delta);
       return [{ id: item.id }];
     },
@@ -1179,8 +1184,17 @@ async function aSupplierRefundIsOwedUntilReceived() {
       findUniqueOrThrow: async () => purchase,
     },
   };
+  // What the return reads before its transaction: the purchase as it was
+  // before a 500 payment landed. The money must come from the row it locks.
+  let beforePayment: any = { ...purchase, amountPaid: dec(0) };
   const prisma = stub<PrismaService>({
-    purchase: { findFirst: async () => purchase },
+    purchase: {
+      findFirst: async () => {
+        const read = beforePayment ?? purchase;
+        beforePayment = null; // only the return's first read is stale
+        return read;
+      },
+    },
     product: { findMany: async () => [] },
     $transaction: async (fn: any) => fn(tx),
   });
@@ -1190,7 +1204,8 @@ async function aSupplierRefundIsOwedUntilReceived() {
     stub<PaymentsService>({ record: async (input: any) => ledger.push(input) }),
   );
 
-  // Send 4 back: 200 of goods the supplier has been paid for.
+  // Send 4 back: 200 of goods the supplier has been paid for. Worked out from
+  // the copy read first, the 500 paid would have been written back to 0.
   const ret: any = await service.returnItems('b1', 'u1', 'pu1', {
     items: [{ purchaseItemId: 'pi1', quantity: 4 }],
   } as any);
@@ -1250,6 +1265,11 @@ async function damagedReturnsAreWrittenOff() {
     h.state.batchesBack,
     [['p-good', 1]],
     'the good unit rejoins a batch for expiry tracking; the written-off ones do not',
+  );
+  assert.deepStrictEqual(
+    h.state.writtenOffFromBatches,
+    [['p-broken', 2]],
+    'but they still count against the batches the line was sold from',
   );
   assert.strictEqual(h.state.payments[0].note, 'cracked in the box', 'the refund carries the reason');
 }
@@ -1577,6 +1597,207 @@ async function aCashierReadsOnlyTheirOwnShift() {
   );
   const seen: any = await service.report('b1', 'sh-other', owner);
   assert.strictEqual(seen.expectedCash, 1000, 'management still reads every till');
+}
+
+const utcDay = (iso: string) => new Date(`${iso}T00:00:00Z`);
+
+/**
+ * A sale says which batch its units came out of, and a return puts them back
+ * there. Before, the return guessed the earliest-expiring batch -- often one
+ * already expired, which the sale had skipped -- so a good unit was filed
+ * under it and later written off with it.
+ */
+async function aReturnGoesBackToTheBatchItCameFrom() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  // As the database orders them: expiry ascending, undated last.
+  const shelf = () => [
+    { id: 'A', productId: 'p1', expiryDate: utcDay('2020-01-01'), quantity: dec(5) }, // expired
+    { id: 'B', productId: 'p1', expiryDate: utcDay('2099-01-01'), quantity: dec(2) },
+    { id: 'C', productId: 'p1', expiryDate: null, quantity: dec(4) },
+  ];
+  const fefoDb: any = { batch: { findMany: async () => shelf() }, $executeRaw: async () => 0 };
+  const inventory = new InventoryService(stub<PrismaService>(fefoDb));
+  assert.deepStrictEqual(
+    await inventory.consumeBatchesFEFO(fefoDb, 's1', [{ productId: 'p1', quantity: 3 }]),
+    [[{ batchId: 'B', quantity: 2 }, { batchId: 'C', quantity: 1 }]],
+    'a sale draws in-date stock first and reports what it took',
+  );
+
+  const run = async (
+    drawn: { id: string; batchId: string; quantity: number; returnedQty: number; expiryDate: Date | null }[],
+    input: { quantity: number; restock: boolean; soldAt?: Date },
+  ) => {
+    const batchesBack: [string, number][] = [];
+    const rowsBack: [string, number][] = [];
+    const db: any = {
+      saleItemBatch: {
+        findMany: async () =>
+          drawn.map((d) => ({ ...d, quantity: dec(d.quantity), returnedQty: dec(d.returnedQty), batch: { expiryDate: d.expiryDate } })),
+        update: async ({ where, data }: any) => rowsBack.push([where.id, Number(data.returnedQty.increment)]),
+      },
+      batch: {
+        findMany: async () => shelf().map(({ id, expiryDate }) => ({ id, expiryDate })),
+        update: async ({ where, data }: any) => batchesBack.push([where.id, Number(data.quantity.increment)]),
+      },
+    };
+    await inventory.restoreBatchOnReturn(db, {
+      storeId: 's1',
+      productId: 'p1',
+      saleItemId: 'line1',
+      soldAt: input.soldAt ?? utcDay('2021-06-01'),
+      quantity: input.quantity,
+      restock: input.restock,
+    });
+    return { batchesBack, rowsBack };
+  };
+
+  const drawn = [
+    { id: 'r-c', batchId: 'C', quantity: 1, returnedQty: 0, expiryDate: null },
+    { id: 'r-b', batchId: 'B', quantity: 2, returnedQty: 1, expiryDate: utcDay('2099-01-01') },
+  ];
+  const back = await run(drawn, { quantity: 2, restock: true });
+  assert.deepStrictEqual(back.batchesBack, [['B', 1], ['C', 1]], 'back to the batches it was sold from, soonest first, never past what each gave');
+  assert.deepStrictEqual(back.rowsBack, [['r-b', 1], ['r-c', 1]]);
+
+  const broken = await run(drawn, { quantity: 1, restock: false });
+  assert.deepStrictEqual(broken.batchesBack, [], 'a unit written off on return reaches no batch');
+  assert.deepStrictEqual(broken.rowsBack, [['r-b', 1]], 'but counts against what the line drew');
+
+  // A sale from before batches were recorded: inferred as the one the till
+  // sold from that day -- B, in date -- not A, already expired by then.
+  const legacy = await run([], { quantity: 1, restock: true });
+  assert.deepStrictEqual(legacy.batchesBack, [['B', 1]], 'an old sale is put back into in-date stock, not the expired batch');
+}
+
+/**
+ * A return can write goods off as expired, not only damaged, so Money Leaks
+ * reports what actually happened to them.
+ */
+async function aReturnCanBeWrittenOffAsExpired() {
+  const build = () =>
+    returnHarness({
+      sale: { subtotal: 200, total: 200, amountPaid: 200 },
+      items: [{ id: 'milk', quantity: 2, lineTotal: 200 }],
+      salePaymentMethod: PaymentMethod.CASH,
+      batchTracked: ['milk'],
+    });
+  const h = build();
+  await h.ret([['milk', 2]], {
+    reason: 'sour',
+    items: [{ saleItemId: 'milk', quantity: 2, writeOffReason: 'EXPIRED' }],
+  });
+  assert.deepStrictEqual(
+    h.state.moves.map((m) => [m.type, m.quantity, m.reason ?? null, m.note]),
+    [
+      ['RETURN_IN', 2, null, 'sour'],
+      ['ADJUSTMENT', -2, 'EXPIRED', 'Returned expired: sour'],
+    ],
+    'booked back in and written off as expired',
+  );
+  assert.strictEqual(h.state.stockBack, 0, 'nothing reaches the shelf');
+  assert.deepStrictEqual(h.state.writtenOffFromBatches, [['p-milk', 2]]);
+
+  await assert.rejects(
+    build().ret([['milk', 1]], {
+      items: [{ saleItemId: 'milk', quantity: 1, restock: true, writeOffReason: 'EXPIRED' }],
+    }),
+    /can’t also go back on the shelf/,
+    'a line cannot be both restocked and written off',
+  );
+}
+
+/**
+ * A product keeping one expiry date on itself moves onto batches when a
+ * delivery brings another date, instead of the old units taking the new one.
+ */
+async function aSecondDateMovesAProductOntoBatches() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  const product: any = { businessId: 'b1', trackBatches: false, expiryDate: utcDay('2026-11-01'), costPrice: dec(40) };
+  const batches: any[] = [];
+  const stockItems: any[] = [
+    // 10 old units at s1 plus the 6 just delivered; 3 old units at s2, marked down.
+    { storeId: 's1', quantity: dec(16), clearancePrice: null, clearanceFor: null },
+    { storeId: 's2', quantity: dec(3), clearancePrice: dec(30), clearanceFor: utcDay('2026-11-01') },
+  ];
+  const db: any = {
+    product: {
+      findUniqueOrThrow: async () => product,
+      update: async ({ data }: any) => Object.assign(product, data),
+    },
+    stockItem: {
+      findMany: async () => stockItems,
+      updateMany: async ({ data }: any) => stockItems.forEach((s) => Object.assign(s, data)),
+    },
+    batch: {
+      groupBy: async () => [],
+      findFirst: async ({ where }: any) =>
+        batches.find((b) => b.storeId === where.storeId && b.expiryDate?.getTime() === where.expiryDate?.getTime()) ?? null,
+      create: async ({ data }: any) => batches.push({ ...data, clearancePrice: null }),
+      update: async () => undefined,
+      updateMany: async ({ where, data }: any) =>
+        batches.filter((b) => b.storeId === where.storeId).forEach((b) => Object.assign(b, data)),
+    },
+  };
+  await convertToBatches(db, 'p1', { storeId: 's1', quantity: 6 });
+  assert.deepStrictEqual(
+    batches.map((b) => [b.storeId, Number(b.quantity), b.expiryDate.toISOString().slice(0, 10), b.clearancePrice && Number(b.clearancePrice)]),
+    [
+      ['s1', 10, '2026-11-01', null],
+      ['s2', 3, '2026-11-01', 30],
+    ],
+    'the stock already on hand keeps its date, as a batch; the delivery is left for its own',
+  );
+  assert.strictEqual(product.trackBatches, true);
+  assert.strictEqual(product.expiryDate, null, 'no product-level date left to count the same stock twice');
+  assert.ok(stockItems.every((s) => s.clearancePrice === null), 'the markdown moved onto the batch');
+
+  // Already on batches: nothing to do.
+  const before = batches.length;
+  await convertToBatches(db, 'p1');
+  assert.strictEqual(batches.length, before);
+}
+
+/** A markdown is a price below the shelf price, for stock still in date. */
+async function clearanceIsForStockStillInDate() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  const writes: any[] = [];
+  const build = (batch: any, product: any = {}) =>
+    new InventoryService(
+      stub<PrismaService>({
+        store: { findFirst: async () => ({ id: 's1' }) },
+        product: {
+          findFirst: async () => ({ id: 'p1' }),
+          findUniqueOrThrow: async () => ({ sellingPrice: dec(100), expiryDate: null, trackBatches: true, ...product }),
+        },
+        batch: {
+          findFirst: async () => batch,
+          update: async ({ data }: any) => writes.push(['batch', data.clearancePrice]),
+        },
+        stockItem: {
+          updateMany: async ({ data }: any) => {
+            writes.push(['stock', data.clearancePrice, data.clearanceFor?.toISOString().slice(0, 10) ?? null]);
+            return { count: 1 };
+          },
+        },
+      }),
+    );
+  const soon = { id: 'b1', expiryDate: utcDay('2099-01-01'), quantity: dec(4) };
+  const dto = (price: number | null, batchId?: string) => ({ storeId: 's1', productId: 'p1', batchId, price });
+
+  await build(soon).setClearance('b1', dto(80, 'b1'));
+  await assert.rejects(build(soon).setClearance('b1', dto(100, 'b1')), /below the selling price/);
+  await assert.rejects(
+    build({ ...soon, expiryDate: utcDay('2020-01-01') }).setClearance('b1', dto(50, 'b1')),
+    /already expired/,
+  );
+  await build({ ...soon, expiryDate: utcDay('2020-01-01') }).setClearance('b1', dto(null, 'b1'));
+  // A product's own date: the markdown is pinned to that date.
+  await build(null, { trackBatches: false, expiryDate: utcDay('2099-03-01') }).setClearance('b1', dto(60));
+  assert.deepStrictEqual(writes, [
+    ['batch', 80],
+    ['batch', null],
+    ['stock', 60, '2099-03-01'],
+  ], 'an expired batch can still have its markdown ended');
 }
 
 /**
@@ -4826,6 +5047,10 @@ async function main() {
   await aClosedTillTakesNoMoreMoney();
   await twoOwnersOpenOneTill();
   await aCashierReadsOnlyTheirOwnShift();
+  await aReturnGoesBackToTheBatchItCameFrom();
+  await aReturnCanBeWrittenOffAsExpired();
+  await aSecondDateMovesAProductOntoBatches();
+  await clearanceIsForStockStillInDate();
   aShopAlwaysTakesCash();
   await aPlanLimitsBranches();
   await devMailGoesToOneInbox();

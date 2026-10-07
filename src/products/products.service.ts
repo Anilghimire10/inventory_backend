@@ -10,9 +10,11 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { GenerateVariantsDto } from './dto/generate-variants.dto';
-import { expiredCutoff, soonCutoff } from '../common/expiry';
+import { expiredCutoff, inDateFirst, isExpired, soonCutoff } from '../common/expiry';
 import { readProductRow } from './product-import';
 import { paginate } from '../common/dto/pagination.dto';
+import { TX_OPTS } from '../common/prisma-tx';
+import { convertToBatches } from '../inventory/inventory.service';
 
 const DETAIL_INCLUDE = {
   categories: { select: { id: true, name: true } },
@@ -150,7 +152,7 @@ export class ProductsService {
           ...this.detailInclude,
           stockItems: {
             where: { storeId: q.storeId },
-            select: { quantity: true, reorderLevel: true },
+            select: { quantity: true, reorderLevel: true, clearancePrice: true, clearanceFor: true },
           },
         },
       }),
@@ -166,6 +168,15 @@ export class ProductsService {
         // same rule as InventoryService.lowStock()'s
         // COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel").
         effectiveReorderLevel: here?.reorderLevel || product.reorderLevel,
+        // A product keeping one expiry date on itself, marked down at this
+        // store: every unit, while that date stands and hasn't passed.
+        ...(here?.clearancePrice != null &&
+        !product.trackBatches &&
+        product.expiryDate &&
+        here.clearanceFor?.getTime() === product.expiryDate.getTime() &&
+        !isExpired(product.expiryDate)
+          ? { clearance: [{ quantity: null, price: Number(here.clearancePrice) }] }
+          : {}),
       };
     });
     return paginate(await this.withExpiry(rows, q.storeId), total, q.page, q.limit);
@@ -218,7 +229,46 @@ export class ProductsService {
       else if (!e.nextBatchExpiry || b.expiryDate! < e.nextBatchExpiry) e.nextBatchExpiry = b.expiryDate;
       info.set(b.productId, e);
     }
-    return rows.map((r) => ({ ...r, expiry: info.get(r.id) ?? { expiredQty: 0, nextBatchExpiry: null } }));
+    const tiers = storeId ? await this.clearanceTiers(ids, storeId, cutoff) : new Map();
+    return rows.map((r) => ({
+      ...r,
+      expiry: info.get(r.id) ?? { expiredQty: 0, nextBatchExpiry: null },
+      ...(tiers.has(r.id) ? { clearance: tiers.get(r.id) } : {}),
+    }));
+  }
+
+  /**
+   * How the till prices a batch-tracked product with a batch marked down:
+   * its in-date batches in the order a sale draws them (soonest expiry
+   * first, see inDateFirst), each with its clearance price or null for full
+   * price. Units past these are full price. Only for products with a
+   * markdown, so a plain product list costs one small query more.
+   */
+  private async clearanceTiers(productIds: string[], storeId: string, cutoff: Date) {
+    const tiers = new Map<string, { quantity: number; price: number | null }[]>();
+    if (!productIds.length) return tiers;
+    const inDate = { OR: [{ expiryDate: null }, { expiryDate: { gt: cutoff } }] };
+    const marked = await this.prisma.batch.findMany({
+      where: { productId: { in: productIds }, storeId, quantity: { gt: 0 }, clearancePrice: { not: null }, ...inDate },
+      select: { productId: true },
+      distinct: ['productId'],
+    });
+    if (!marked.length) return tiers;
+    const batches = await this.prisma.batch.findMany({
+      where: { productId: { in: marked.map((m) => m.productId) }, storeId, quantity: { gt: 0 } },
+      orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
+      select: { productId: true, expiryDate: true, quantity: true, clearancePrice: true },
+    });
+    for (const b of inDateFirst(batches, cutoff)) {
+      if (b.expiryDate && b.expiryDate <= cutoff) continue; // the till sells these last, at full price
+      const list = tiers.get(b.productId) ?? [];
+      list.push({
+        quantity: Number(b.quantity),
+        price: b.clearancePrice === null ? null : Number(b.clearancePrice),
+      });
+      tiers.set(b.productId, list);
+    }
+    return tiers;
   }
 
   /**
@@ -377,7 +427,11 @@ export class ProductsService {
   }
 
   async update(businessId: string, id: string, dto: UpdateProductDto) {
-    await this.findOne(businessId, id);
+    const before = await this.findOne(businessId, id);
+    // Switching batches on: the stock on the shelf keeps the date it has, as
+    // a batch, instead of being left in none (see convertToBatches). The
+    // form's product-level date goes with it -- it is now the batch's.
+    const toBatches = dto.trackBatches === true && !before.trackBatches;
     // storeIds is availability, not a product column — it must not reach
     // Prisma via ...rest.
     const { categoryIds, expiryDate, taxId, storeIds, ...rest } = dto;
@@ -404,8 +458,8 @@ export class ProductsService {
       }
     }
     await this.assertCategories(businessId, categoryIds);
-    try {
-      return await this.prisma.product.update({
+    const write = async (db: Prisma.TransactionClient | PrismaService) =>
+      db.product.update({
         where: { id },
         data: {
           ...rest,
@@ -417,7 +471,7 @@ export class ProductsService {
               ? { taxId, taxRate: await this.resolveTaxRate(businessId, taxId) }
               : { taxId: null, taxRate: 0 }
             : {}),
-          ...(expiryDate !== undefined
+          ...(expiryDate !== undefined && !toBatches
             ? { expiryDate: expiryDate ? new Date(expiryDate) : null }
             : {}),
           // `set` replaces the full category list when the field is provided.
@@ -427,6 +481,14 @@ export class ProductsService {
         },
         include: this.detailInclude,
       });
+
+    try {
+      return toBatches
+        ? await this.prisma.$transaction(async (tx) => {
+            await convertToBatches(tx, id);
+            return write(tx);
+          }, TX_OPTS)
+        : await write(this.prisma);
     } catch (e) {
       throw this.handleUnique(e);
     }

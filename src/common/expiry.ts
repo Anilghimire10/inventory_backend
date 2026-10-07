@@ -21,3 +21,20 @@ export function expiredCutoff(now = new Date()): Date {
 export function soonCutoff(now = new Date(), days = EXPIRY_SOON_DAYS): Date {
   return new Date(now.getTime() + days * DAY_MS);
 }
+
+/**
+ * The order the till sells batches in: soonest expiry first, but batches
+ * already past their date behind every in-date (or undated) one. Stable, so
+ * callers sort by expiry then age first and this only moves the expired back.
+ *
+ * One rule for everything that has to agree with it: the sale drawing stock
+ * down, the return inferring where an old sale's units came from, and the
+ * till pricing clearance stock before it is drawn.
+ */
+export function inDateFirst<T extends { expiryDate: Date | null }>(
+  batches: T[],
+  cutoff = expiredCutoff(),
+): T[] {
+  const expired = (b: T) => Number(!!b.expiryDate && b.expiryDate <= cutoff);
+  return batches.sort((a, b) => expired(a) - expired(b));
+}

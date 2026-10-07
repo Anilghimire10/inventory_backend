@@ -21,7 +21,7 @@ import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
 import { CreateSaleDto, SaleItemDto } from './dto/create-sale.dto';
 import { HoldSaleDto } from './dto/hold-sale.dto';
-import { ReturnSaleDto } from './dto/return-sale.dto';
+import { ReturnItemDto, ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
@@ -50,6 +50,16 @@ export interface ReturnLine {
 const round2 = (n: number) => Math.round(n * 100) / 100;
 /** Quantities are numeric(12,3) — keep float arithmetic on that grid. */
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+/**
+ * Why a returned line goes straight to write-off, or null when it goes back
+ * on the shelf. `restock: false` on its own is damage, as it always was;
+ * naming a reason writes off with that reason.
+ */
+function writtenOff(r: ReturnItemDto): AdjustmentReason | null {
+  if (r.writeOffReason) return r.writeOffReason;
+  return r.restock === false ? AdjustmentReason.DAMAGE : null;
+}
 
 @Injectable()
 export class SalesService {
@@ -179,6 +189,10 @@ export class SalesService {
       // counted and closed since. Hold it open until this sale is in.
       await holdShiftOpen(tx, shiftId);
       const receiptNo = await this.nextReceiptNo(tx, businessId);
+      // Named here rather than left to the database, so the batches each
+      // line draws below can be recorded against it. Fresh per attempt: a
+      // receipt-number retry runs this whole callback again.
+      const lineIds = lines.map(() => randomUUID());
 
       const sale = await tx.sale.create({
         data: {
@@ -199,7 +213,8 @@ export class SalesService {
           prescriptionRef: dto.prescriptionRef,
           note: dto.note,
           items: {
-            create: lines.map((l) => ({
+            create: lines.map((l, i) => ({
+              id: lineIds[i],
               productId: l.productId,
               name: l.name,
               quantity: l.quantity,
@@ -249,13 +264,25 @@ export class SalesService {
           reference: sale.id,
         })),
       );
-      const batchTracked = lines.filter((l) => l.trackBatches);
+      const batchTracked = lines
+        .map((l, i) => ({ ...l, saleItemId: lineIds[i] }))
+        .filter((l) => l.trackBatches);
       if (batchTracked.length) {
-        await this.inventory.consumeBatchesFEFO(
+        const taken = await this.inventory.consumeBatchesFEFO(
           tx,
           storeId,
           batchTracked.map((l) => ({ productId: l.productId, quantity: l.quantity })),
         );
+        // Which batch each line's units came out of, for a return to put
+        // them back into.
+        const drawn = batchTracked.flatMap((l, i) =>
+          (taken[i] ?? []).map((t) => ({
+            saleItemId: l.saleItemId,
+            batchId: t.batchId,
+            quantity: t.quantity,
+          })),
+        );
+        if (drawn.length) await tx.saleItemBatch.createMany({ data: drawn });
       }
       for (const l of serialLines) {
         await this.inventory.sellSerials(tx, {
@@ -551,6 +578,11 @@ export class SalesService {
     if (!found) throw new NotFoundException('Sale not found');
     assertOwnStore(user, found.storeId);
     this.assertReturnable(found.status);
+    if (dto.items.some((r) => r.writeOffReason && r.restock === true)) {
+      throw new BadRequestException(
+        'A line written off as damaged or expired can’t also go back on the shelf',
+      );
+    }
 
     const [trackedProducts, shiftId] = await Promise.all([
       this.prisma.product.findMany({
@@ -600,10 +632,10 @@ export class SalesService {
       const { creditCancelled, cashBack } = this.splitRefund(sale, refund, balance);
 
       // Stock-back-in is batched (one read + one bulk write for all lines).
-      // Goods that came back damaged are booked in and written off in the
-      // same batch: they never reach the shelf, and the history shows both
-      // what came back and why it isn't there. Batched together, their net
-      // change is zero, so the write-off can't fail for want of stock.
+      // Goods that came back damaged or expired are booked in and written off
+      // in the same batch: they never reach the shelf, and the history shows
+      // both what came back and why it isn't there. Batched together, their
+      // net change is zero, so the write-off can't fail for want of stock.
       const reason = dto.reason?.trim() || null;
       await this.inventory.applyMovementsBatch(
         tx,
@@ -618,14 +650,14 @@ export class SalesService {
           };
           return [
             { ...back, type: StockMovementType.RETURN_IN, quantity: r.quantity, note: reason },
-            ...(r.restock === false
+            ...(writtenOff(r)
               ? [
                   {
                     ...back,
                     type: StockMovementType.ADJUSTMENT,
                     quantity: -r.quantity,
-                    reason: AdjustmentReason.DAMAGE,
-                    note: reason ? `Returned damaged: ${reason}` : 'Returned damaged',
+                    reason: writtenOff(r)!,
+                    note: `Returned ${writtenOff(r) === AdjustmentReason.EXPIRED ? 'expired' : 'damaged'}${reason ? `: ${reason}` : ''}`,
                   },
                 ]
               : []),
@@ -659,16 +691,19 @@ export class SalesService {
             saleId: sale.id,
             quantity: r.quantity,
             serials: r.serials,
-            damaged: r.restock === false,
+            damaged: !!writtenOff(r),
           });
         }
-        // Written-off goods never reach the shelf, so they rejoin no batch.
-        if (batched.has(item.productId) && r.restock !== false) {
+        // Written-off goods never reach the shelf, so they rejoin no batch;
+        // they still count against what the line drew from its batches.
+        if (batched.has(item.productId)) {
           await this.inventory.restoreBatchOnReturn(tx, {
             storeId: sale.storeId,
             productId: item.productId,
+            saleItemId: item.id,
             quantity: r.quantity,
             soldAt: sale.createdAt,
+            restock: !writtenOff(r),
           });
         }
       }

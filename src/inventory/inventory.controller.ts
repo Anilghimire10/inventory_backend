@@ -1,7 +1,7 @@
 import { BadRequestException, Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { InventoryService } from './inventory.service';
-import { AdjustStockDto, ImportStockDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
+import { AdjustStockDto, ClearanceDto, ImportStockDto, SetReorderLevelDto, WriteOffExpiredDto } from './dto/adjust-stock.dto';
 import { StockTakeDto, TransferStockDto } from './dto/stock-ops.dto';
 import {
   ExpiringDto,
@@ -96,6 +96,16 @@ export class InventoryController {
   @Post('expiring/write-off')
   writeOffExpired(@CurrentUser() u: AuthUser, @Body() dto: WriteOffExpiredDto) {
     return this.inventory.writeOffExpired(u.businessId, u.userId, dto);
+  }
+
+  /**
+   * Mark stock nearing its date down, or end the markdown (price null). A
+   * pricing call, so owners and managers only.
+   */
+  @Roles(UserRole.OWNER, UserRole.MANAGER)
+  @Post('expiring/clearance')
+  setClearance(@Body() dto: ClearanceDto, @CurrentUser() u: AuthUser) {
+    return this.inventory.setClearance(u.businessId, dto);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)

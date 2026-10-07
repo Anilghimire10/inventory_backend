@@ -11,7 +11,7 @@ import {
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { InventoryService } from '../inventory/inventory.service';
+import { InventoryService, convertToBatches } from '../inventory/inventory.service';
 import { PaymentsService } from '../payments/payments.service';
 import { CreatePurchaseDto, PurchaseItemDto } from './dto/create-purchase.dto';
 import { UpdatePurchaseDto } from './dto/update-purchase.dto';
@@ -483,6 +483,7 @@ export class PurchasesService {
       // (natural-key batch merge, serial reconciliation) that does not reduce
       // to a single statement. A throw anywhere still rolls the whole receive
       // back.
+      const arriving = PurchasesService.arrivingByProduct(purchase.items);
       for (const item of purchase.items) {
         await this.receiveBatch(
           tx,
@@ -490,6 +491,7 @@ export class PurchasesService {
           purchase.storeId,
           !!productMap.get(item.productId)?.trackBatches,
           item,
+          arriving.get(item.productId),
         );
         await this.inventory.receiveSerials(tx, {
           businessId,
@@ -536,7 +538,6 @@ export class PurchasesService {
       );
     }
 
-    const itemMap = new Map(purchase.items.map((it) => [it.id, it]));
     const serialised = new Set(
       (
         await this.prisma.product.findMany({
@@ -549,43 +550,62 @@ export class PurchasesService {
         })
       ).map((p) => p.id),
     );
-    let value = 0;
-    let vatBack = 0;
-    for (const r of dto.items) {
-      const item = itemMap.get(r.purchaseItemId);
-      if (!item) throw new BadRequestException('Invalid purchase item');
-      const returnable = round3(
-        Number(item.quantity) - Number(item.returnedQty),
-      );
-      if (r.quantity > returnable) {
-        throw new BadRequestException(
-          `Cannot return ${r.quantity} of this line (only ${returnable} left)`,
-        );
-      }
-      value += Number(item.costPrice) * r.quantity;
-      // The VAT charged on the goods goes back with them.
-      vatBack += (Number(item.costPrice) * r.quantity * Number(item.taxRate)) / 100;
-    }
-    value = round2(value);
-    vatBack = round2(vatBack);
-    const newSubtotal = round2(Number(purchase.subtotal) - value);
-    const newTax = round2(Math.max(Number(purchase.tax) - vatBack, 0));
-    const newTotal = round2(Number(purchase.total) - value - vatBack);
     const batched = await this.batchTracked(
       businessId,
       purchase.items.map((i) => i.productId),
     );
-    // Returning goods shrinks what is owed, but the money already handed over
-    // doesn't shrink with it. Without clamping, a return against a fully-paid
-    // purchase left amountPaid above total and `outstanding` went negative --
-    // a nonsense balance that reads as "the supplier owes us" everywhere it
-    // is displayed. Clamp it, and report the excess as what it is: money the
-    // supplier now owes back, which is settled outside this record.
-    const paidBefore = Number(purchase.amountPaid);
-    const newAmountPaid = round2(Math.min(paidBefore, Math.max(newTotal, 0)));
-    const refundDueFromSupplier = round2(paidBefore - newAmountPaid);
 
     return this.prisma.$transaction(async (tx) => {
+      // Everything that decides the money is read under the purchase's row
+      // lock. The totals below are written as values, not increments, so
+      // worked out from a copy read before this transaction they overwrote
+      // whatever landed in between: a supplier payment recorded at the same
+      // moment vanished from amountPaid (the ledger still had it, so the
+      // Credit page asked for it again), and two returns on different lines
+      // each wrote a total that only took off their own goods.
+      await tx.$queryRaw`SELECT id FROM "Purchase" WHERE id = ${purchase.id} FOR UPDATE`;
+      const locked = await tx.purchase.findUniqueOrThrow({
+        where: { id: purchase.id },
+        include: { items: true },
+      });
+      if (locked.status !== PurchaseStatus.RECEIVED) {
+        throw new BadRequestException(
+          'Only a received purchase can be returned to the supplier',
+        );
+      }
+      const itemMap = new Map(locked.items.map((it) => [it.id, it]));
+      let value = 0;
+      let vatBack = 0;
+      for (const r of dto.items) {
+        const item = itemMap.get(r.purchaseItemId);
+        if (!item) throw new BadRequestException('Invalid purchase item');
+        const returnable = round3(
+          Number(item.quantity) - Number(item.returnedQty),
+        );
+        if (r.quantity > returnable) {
+          throw new BadRequestException(
+            `Cannot return ${r.quantity} of this line (only ${returnable} left)`,
+          );
+        }
+        value += Number(item.costPrice) * r.quantity;
+        // The VAT charged on the goods goes back with them.
+        vatBack += (Number(item.costPrice) * r.quantity * Number(item.taxRate)) / 100;
+      }
+      value = round2(value);
+      vatBack = round2(vatBack);
+      const newSubtotal = round2(Number(locked.subtotal) - value);
+      const newTax = round2(Math.max(Number(locked.tax) - vatBack, 0));
+      const newTotal = round2(Number(locked.total) - value - vatBack);
+      // Returning goods shrinks what is owed, but the money already handed
+      // over doesn't shrink with it. Without clamping, a return against a
+      // fully-paid purchase left amountPaid above total and `outstanding` went
+      // negative -- a nonsense balance that reads as "the supplier owes us"
+      // everywhere it is displayed. Clamp it, and report the excess as what it
+      // is: money the supplier now owes back, settled outside this record.
+      const paidBefore = Number(locked.amountPaid);
+      const newAmountPaid = round2(Math.min(paidBefore, Math.max(newTotal, 0)));
+      const refundDueFromSupplier = round2(paidBefore - newAmountPaid);
+
       // The goods leave the average at the cost they came in at.
       await this.averageCosts(
         tx,
@@ -673,7 +693,7 @@ export class PurchasesService {
           ...(refundDueFromSupplier > 0
             ? { refundDue: { increment: refundDueFromSupplier } }
             : {}),
-          note: dto.note ?? purchase.note,
+          note: dto.note ?? locked.note,
         },
         include: { items: true },
       });
@@ -688,6 +708,65 @@ export class PurchasesService {
         refundDueFromSupplier,
       };
     }, TX_OPTS);
+  }
+
+  /**
+   * Received purchase lines some stock could be sent back against, newest
+   * delivery first.
+   *
+   * For a batch, only lines with its batch number and expiry: that is the
+   * batch the return reverses (reverseBatchIfNeeded matches on the same
+   * pair), so a line from another delivery would take the wrong batch down.
+   * A product without batches can go back against any delivery of it.
+   */
+  async returnableLines(
+    businessId: string,
+    q: { storeId: string; productId: string; batchId?: string },
+    actor?: AuthUser,
+  ) {
+    if (actor) assertOwnStore(actor, q.storeId);
+    let batch: { batchNumber: string | null; expiryDate: Date | null; quantity: Prisma.Decimal } | null = null;
+    if (q.batchId) {
+      batch = await this.prisma.batch.findFirst({
+        where: { id: q.batchId, businessId, storeId: q.storeId, productId: q.productId },
+        select: { batchNumber: true, expiryDate: true, quantity: true },
+      });
+      if (!batch) throw new NotFoundException('Batch not found');
+    }
+    const lines = await this.prisma.purchaseItem.findMany({
+      where: {
+        productId: q.productId,
+        purchase: { businessId, storeId: q.storeId, status: PurchaseStatus.RECEIVED },
+        ...(batch ? { batchNumber: batch.batchNumber, expiryDate: batch.expiryDate } : {}),
+      },
+      select: {
+        id: true,
+        quantity: true,
+        returnedQty: true,
+        costPrice: true,
+        purchase: {
+          select: {
+            id: true,
+            reference: true,
+            receivedAt: true,
+            supplier: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { purchase: { receivedAt: 'desc' } },
+      take: 20,
+    });
+    return lines
+      .map((l) => ({
+        purchaseId: l.purchase.id,
+        purchaseItemId: l.id,
+        reference: l.purchase.reference,
+        receivedAt: l.purchase.receivedAt,
+        supplier: l.purchase.supplier,
+        costPrice: Number(l.costPrice),
+        returnable: round3(Number(l.quantity) - Number(l.returnedQty)),
+      }))
+      .filter((l) => l.returnable > 0);
   }
 
   /**
@@ -1017,6 +1096,7 @@ export class PurchasesService {
     // (natural-key batch merge, serial reconciliation) that doesn't reduce
     // to a single statement. A throw anywhere still rolls the whole purchase
     // back.
+    const arriving = PurchasesService.arrivingByProduct(dto.items);
     for (const item of dto.items) {
       await this.receiveBatch(tx, businessId, storeId, !!productMap.get(item.productId)?.trackBatches, {
         productId: item.productId,
@@ -1024,7 +1104,7 @@ export class PurchasesService {
         costPrice: new Prisma.Decimal(item.costPrice),
         batchNumber: item.batchNumber ?? null,
         expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
-      });
+      }, arriving.get(item.productId));
       await this.inventory.receiveSerials(tx, {
         businessId,
         storeId,
@@ -1102,6 +1182,12 @@ export class PurchasesService {
       batchNumber: string | null;
       expiryDate: Date | null;
     },
+    /**
+     * Units of this product the delivery has already put on the shelf at
+     * this store -- its other lines included -- so a switch to batches
+     * doesn't date them with the old stock.
+     */
+    arriving = Number(item.quantity),
   ) {
     if (trackBatches) {
       await this.inventory.addToBatch(tx, {
@@ -1114,11 +1200,52 @@ export class PurchasesService {
         costPrice: item.costPrice,
       });
     } else if (item.expiryDate) {
+      const current = await tx.product.findUniqueOrThrow({
+        where: { id: item.productId },
+        select: { trackBatches: true, expiryDate: true },
+      });
+      // An earlier line of this delivery already moved it onto batches.
+      if (current.trackBatches) {
+        await this.receiveBatch(tx, businessId, storeId, true, item);
+        return;
+      }
+      const newDate = current.expiryDate?.getTime() !== item.expiryDate.getTime();
+      const oldStock = newDate && current.expiryDate ? await this.stockBesides(tx, item.productId, storeId, arriving) : 0;
+      if (oldStock > 0) {
+        // Stock on the shelf already carries another date. Overwriting it
+        // made those units read as fresh; keep both dates on batches.
+        await convertToBatches(tx, item.productId, { storeId, quantity: arriving });
+        await this.receiveBatch(tx, businessId, storeId, true, item);
+        return;
+      }
       await tx.product.update({
         where: { id: item.productId },
         data: { expiryDate: item.expiryDate },
       });
     }
+  }
+
+  /** Units of a product on hand anywhere, besides what is arriving here. */
+  private async stockBesides(
+    tx: Prisma.TransactionClient,
+    productId: string,
+    storeId: string,
+    arriving: number,
+  ) {
+    const rows = await tx.stockItem.findMany({
+      where: { productId, quantity: { gt: 0 } },
+      select: { storeId: true, quantity: true },
+    });
+    return round3(
+      rows.reduce((sum, r) => sum + Number(r.quantity) - (r.storeId === storeId ? arriving : 0), 0),
+    );
+  }
+
+  /** Per product, what a delivery's lines add up to. */
+  private static arrivingByProduct(items: { productId: string; quantity: Prisma.Decimal | number }[]) {
+    const total = new Map<string, number>();
+    for (const i of items) total.set(i.productId, round3((total.get(i.productId) ?? 0) + Number(i.quantity)));
+    return total;
   }
 
   /**

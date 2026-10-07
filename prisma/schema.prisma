@@ -408,6 +408,12 @@ model StockItem {
   product      Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
   quantity     Decimal  @default(0) @db.Decimal(12, 3) // fractional: weighed goods (kg/L)
   reorderLevel Int      @default(0) // overrides product.reorderLevel when > 0
+  /// Clearance price for stock nearing its date, for a product that keeps one
+  /// expiry date on itself rather than batches. Only applies while the
+  /// product's expiry is still `clearanceFor`: stock that arrives with a new
+  /// date isn't marked down with the old.
+  clearancePrice Decimal?  @db.Decimal(12, 2)
+  clearanceFor   DateTime?
   updatedAt    DateTime @updatedAt
 
   @@unique([storeId, productId])
@@ -431,8 +437,12 @@ model Batch {
   expiryDate  DateTime?
   quantity    Decimal   @default(0) @db.Decimal(12, 3)
   costPrice   Decimal?  @db.Decimal(12, 2)
+  /// Marked down to sell before it expires. The till prices units drawn from
+  /// this batch at this while it is in date.
+  clearancePrice Decimal? @db.Decimal(12, 2)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+  saleItems   SaleItemBatch[]
 
   @@index([businessId])
   @@index([storeId, productId])
@@ -645,8 +655,29 @@ model SaleItem {
   taxRate     Decimal @default(0) @db.Decimal(5, 2)
   lineTotal   Decimal @db.Decimal(12, 2)
   returnedQty Decimal @default(0) @db.Decimal(12, 3)
+  batches     SaleItemBatch[]
 
   @@index([saleId])
+}
+
+/// Which batch the units of a sale line came out of.
+///
+/// A sale draws batches down first-expiry-first, and a return used to guess
+/// where its units went back -- sometimes into a batch that had already
+/// expired, so a good unit was later written off with it. With this, a
+/// return puts each unit back into the batch it was sold from.
+model SaleItemBatch {
+  id          String   @id @default(cuid())
+  saleItemId  String
+  saleItem    SaleItem @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+  batchId     String
+  batch       Batch    @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  quantity    Decimal  @db.Decimal(12, 3)
+  /// Units of this allocation already returned, damaged or not.
+  returnedQty Decimal  @default(0) @db.Decimal(12, 3)
+
+  @@index([saleItemId])
+  @@index([batchId])
 }
 
 // ---------- Till sessions ----------
