@@ -6,6 +6,7 @@ import {
 import { PaymentMethod, PaymentType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
+import { holdShiftOpen } from '../shifts/shifts.service';
 import { QueryCustomerDto } from './dto/query-customer.dto';
 import {
   CreateCustomerDto,
@@ -106,6 +107,9 @@ export class CustomersService {
     await this.ensure(businessId, id);
 
     return this.prisma.$transaction(async (tx) => {
+      // Cash taken into a till that has closed since it was picked would
+      // never reach a Z report.
+      await holdShiftOpen(tx, context.shiftId);
       // Atomic guarded decrement: the balance check and the write happen in
       // one statement against the row's live value, so two concurrent
       // payments can't both pass a stale "amount <= balance" check and drive

@@ -98,6 +98,15 @@ import { BusinessService } from '../src/business/business.service';
 import { SubscriptionRemindersService } from '../src/platform/subscription-reminders.service';
 
 const stub = <T>(impl: unknown) => impl as T;
+/**
+ * A stub Prisma client that can run a transaction: the callback gets the same
+ * stub back, and the advisory lock a shift open takes is a no-op.
+ */
+const withTx = <T extends object>(db: T) => {
+  const client: any = { ...db, $executeRaw: async () => 0 };
+  client.$transaction = (fn: (tx: unknown) => unknown) => fn(client);
+  return client as T;
+};
 const user: AuthUser = {
   userId: 'u1',
   businessId: 'b1',
@@ -364,7 +373,7 @@ async function cashControlOnAShift() {
   {
     let createdShift: any = null;
     const service = new ShiftsService(
-      stub<PrismaService>({
+      stub<PrismaService>(withTx({
         store: { findFirst: async () => ({ id: 's1' }) },
         shift: {
           // Nothing open at the store; the last close left 1500.
@@ -374,7 +383,7 @@ async function cashControlOnAShift() {
               : { cashLeft: new Prisma.Decimal(1500), closedAt: new Date(), user: { name: 'Ramesh' } },
           create: async (args: any) => (createdShift = args.data),
         },
-      }),
+      })),
       stub<PaymentsService>({}),
     );
     const suggested = await service.suggestedFloat(user, 's1');
@@ -399,7 +408,7 @@ async function oneDrawerOneShift() {
   const build = (open: { id: string; userId: string; name: string }[]) => {
     const created: any[] = [];
     const service = new ShiftsService(
-      stub<PrismaService>({
+      stub<PrismaService>(withTx({
         store: { findFirst: async () => ({ id: 's1' }) },
         shift: {
           findFirst: async (args: any) => {
@@ -412,7 +421,7 @@ async function oneDrawerOneShift() {
             return { id: 'new', ...args.data };
           },
         },
-      }),
+      })),
       stub<PaymentsService>({}),
     );
     return { service, created };
@@ -872,6 +881,7 @@ function returnHarness(opts: {
   const tx = {
     $queryRaw: async (strings: TemplateStringsArray, ...params: any[]) => {
       const sql = strings.join('?');
+      if (sql.includes('FROM "Shift"')) return [{ id: params[0] }]; // the till is open
       if (sql.includes('FROM "Sale"')) return [{ id: sale.id }];
       if (sql.includes('FROM "Customer"')) return [{ creditBalance: dec(state.balance) }];
       // The guarded bump: applied only while it stays within the line.
@@ -1369,6 +1379,8 @@ async function aPartPaymentKeepsItsTender() {
             create: async ({ data }: any) => (sale = { id: 'sale1', ...data }),
           },
           customer: { update: async () => ({}) },
+          // sh1 is still open.
+          $queryRaw: async () => [{ id: 'sh1' }],
         }),
     });
     const service = new SalesService(
@@ -1403,6 +1415,168 @@ async function aPartPaymentKeepsItsTender() {
   // A client that names no tender for the part paid gets the counter default.
   const credit = await checkout(PaymentMethod.CREDIT, 100);
   assert.strictEqual(credit.payment.method, PaymentMethod.CASH);
+}
+
+/**
+ * A till closed while a sale was on its way takes no more money.
+ *
+ * The sale picks its till before its transaction starts. If the drawer is
+ * counted and closed in between, the sale used to land on the closed shift
+ * anyway: in its gross, missing from its expected cash, and the Z report over
+ * or short with nothing to say why. Now the sale is refused and nothing is
+ * written.
+ */
+async function aClosedTillTakesNoMoreMoney() {
+  const attempt = async (tillOpen: boolean) => {
+    const written: string[] = [];
+    const locked: string[] = [];
+    const prisma = stub<PrismaService>({
+      store: { findFirst: async () => ({ id: 's1' }) },
+      business: { findUnique: async () => ({ taxEnabled: false, taxInclusive: false }) },
+      product: {
+        findMany: async () => [
+          { id: 'p1', name: 'Tea', sellingPrice: 50, costPrice: 30, taxRate: 0, isTaxable: false, isActive: true, isRxRequired: false, trackBatches: false, trackSerials: false },
+        ],
+      },
+      $transaction: async (fn: any) =>
+        fn({
+          $queryRaw: async (sql: TemplateStringsArray, ...params: any[]) => {
+            assert.ok(sql.join('?').includes('FOR SHARE'), 'the till row is held, not just read');
+            locked.push(params[0]);
+            return tillOpen ? [{ id: params[0] }] : [];
+          },
+          sale: {
+            findFirst: async () => null,
+            create: async ({ data }: any) => {
+              written.push('sale');
+              return { id: 'sale1', ...data, items: [] };
+            },
+          },
+        }),
+    });
+    const service = new SalesService(
+      prisma,
+      stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
+      stub<MailService>({}),
+      stub<ShiftsService>({ resolveShiftId: async () => 'sh1' }),
+      stub<PaymentsService>({ record: async () => written.push('payment') }),
+    );
+    const result = service.create(user, { items: [{ productId: 'p1', quantity: 1 }] } as any);
+    return { result, written, locked };
+  };
+
+  const open = await attempt(true);
+  await open.result;
+  assert.deepStrictEqual(open.locked, ['sh1'], 'the sale holds its till open while it writes');
+  assert.ok(open.written.includes('sale'));
+
+  const closed = await attempt(false);
+  await assert.rejects(
+    closed.result,
+    (e: any) => e.getStatus() === 409 && e.getResponse().code === 'SHIFT_CLOSED',
+    'a sale for a till closed since it was picked is refused',
+  );
+  assert.deepStrictEqual(closed.written, [], 'and writes neither the sale nor its payment');
+}
+
+/**
+ * Two owners at one counter. Each joins the till that is open; with none open
+ * and both opening at once, only one drawer opens and the other is sent to
+ * it. Without the per-store lock both found nothing running and both opened.
+ */
+async function twoOwnersOpenOneTill() {
+  const owner1: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  const owner2: AuthUser = { ...user, userId: 'owner2', role: 'MANAGER' as AuthUser['role'] };
+  const open: any[] = [];
+  // Lets the other request run between every read and write, the way two
+  // requests interleave on a real server.
+  const yieldTurn = () => new Promise((r) => setImmediate(r));
+  const db: any = {
+    store: { findFirst: async () => ({ id: 's1' }) },
+    shift: {
+      findFirst: async (args: any) => {
+        await yieldTurn();
+        if (args.where.closedAt !== null) return null; // nothing closed before
+        const hit = open.find((sh) => !args.where.userId || sh.userId === args.where.userId);
+        return hit ? { ...hit, user: { name: hit.name } } : null;
+      },
+      create: async ({ data }: any) => {
+        await yieldTurn();
+        const row = { id: `sh-${data.userId}`, ...data, name: data.userId };
+        open.push(row);
+        return row;
+      },
+    },
+  };
+  // pg_advisory_xact_lock: held from the call to the end of the transaction.
+  let queue = Promise.resolve();
+  db.$transaction = async (fn: (tx: unknown) => unknown) => {
+    let release = () => {};
+    const tx = {
+      ...db,
+      $executeRaw: async (sql: TemplateStringsArray, ...params: any[]) => {
+        assert.ok(sql.join('?').includes('pg_advisory_xact_lock'));
+        assert.strictEqual(params[0], 'shift-open:s1', 'locked per store');
+        const prev = queue;
+        queue = new Promise<void>((r) => (release = r));
+        await prev;
+        return 0;
+      },
+    };
+    try {
+      return await fn(tx);
+    } finally {
+      release();
+    }
+  };
+  const service = new ShiftsService(stub<PrismaService>(db), stub<PaymentsService>({}));
+
+  const results = await Promise.allSettled([
+    service.open(owner1, { storeId: 's1', openingFloat: 1000 }),
+    service.open(owner2, { storeId: 's1', openingFloat: 1000 }),
+  ]);
+  assert.strictEqual(open.length, 1, 'one counter, one drawer');
+  const refused = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+  assert.ok(refused, 'the second owner is not given a drawer of their own');
+  assert.strictEqual(refused.reason.getResponse().code, 'TILL_OPEN', 'they are sent to join it');
+}
+
+/**
+ * A cashier reads only their own shift reports. They can't join anyone
+ * else's till, and a colleague's report would show that drawer's expected
+ * cash and variance to anyone holding its id -- which every sale carries.
+ */
+async function aCashierReadsOnlyTheirOwnShift() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  const theirs = {
+    id: 'sh-other', businessId: 'b1', userId: 'u9', openedAt: new Date(), closedAt: null,
+    openingFloat: 1000, expectedCash: null, countedCash: null, variance: null,
+    refundsAtClose: null, carriedFloat: null, cashLeft: null,
+    business: { shiftBlindClose: false, shiftVarianceNoteOver: null }, cashMovements: [],
+  };
+  const service = new ShiftsService(
+    stub<PrismaService>({
+      shift: {
+        findFirst: async ({ where }: any) =>
+          where.id === theirs.id && (!where.userId || where.userId === theirs.userId)
+            ? theirs
+            : null,
+      },
+      sale: { findMany: async () => [] },
+      cashMovement: { findMany: async () => [] },
+    }),
+    stub<PaymentsService>({
+      cashCollectedOnShift: async () => 0,
+      cashRefundedOnShift: async () => 0,
+    }),
+  );
+  await assert.rejects(
+    service.report('b1', 'sh-other', user),
+    (e: any) => e.getStatus() === 404,
+    "a cashier can't read a colleague's drawer, nor learn that it exists",
+  );
+  const seen: any = await service.report('b1', 'sh-other', owner);
+  assert.strictEqual(seen.expectedCash, 1000, 'management still reads every till');
 }
 
 /**
@@ -1562,6 +1736,7 @@ async function aStaleReadCannotOverReturnALine() {
           // The sale lock. The read after it is the stale one here: that
           // lock is what normally prevents this, and the guard below is what
           // still holds if it ever doesn't.
+          if (sql.join('?').includes('FROM "Shift"')) return [{ id: params[0] }];
           if (sql.join('?').includes('FROM "Sale"')) return [{ id: 'sale1' }];
           const delta = new Prisma.Decimal(params[0]);
           if (committed.returnedQty.plus(delta).greaterThan(committed.quantity)) {
@@ -3851,7 +4026,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
 
   await assert.rejects(
     build([ramesh]).resolveShiftId(owner, 's1', 'sh-closed'),
-    /No open shift/,
+    (e: any) => e.getResponse().code === 'SHIFT_CLOSED',
     'a remembered till that has since closed is refused, not silently swapped',
   );
 
@@ -3872,6 +4047,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
 async function everyPaymentLeavesATrail() {
   const recorded: any[] = [];
   let balance = 500;
+  let tillOpen = true;
 
   const makeService = () => {
     const prisma = stub<PrismaService>({
@@ -3890,6 +4066,8 @@ async function everyPaymentLeavesATrail() {
       // the stub just runs the callback, and the assertions below check that
       // a failure part-way leaves nothing behind.
       $transaction: async (fn: any) => fn(prisma),
+      // holdShiftOpen: the till's row, while it is open.
+      $queryRaw: async () => (tillOpen ? [{ id: 'sh1' }] : []),
     });
     const payments = stub<PaymentsService>({
       record: async (input: any) => {
@@ -3913,6 +4091,18 @@ async function everyPaymentLeavesATrail() {
   assert.strictEqual(recorded[0].amount, 200, 'amount recorded positive');
   assert.strictEqual(recorded[0].method, 'CARD', 'method carried through, not defaulted');
   assert.strictEqual(recorded[0].shiftId, 'sh1', 'attributed to the till that took it');
+
+  // The till was counted and closed between picking it and paying in: the
+  // cash would never reach a Z report, so nothing is taken.
+  tillOpen = false;
+  await assert.rejects(
+    service.payCredit('b1', 'c1', 50, { userId: 'u1', shiftId: 'sh1' }),
+    (e: any) => e.getStatus() === 409 && e.getResponse().code === 'SHIFT_CLOSED',
+    'cash is not booked into a closed till',
+  );
+  assert.strictEqual(balance, 300, 'and the customer still owes it');
+  assert.strictEqual(recorded.length, 1);
+  tillOpen = true;
 
   // Overpaying must move nothing and record nothing.
   await assert.rejects(
@@ -4633,6 +4823,9 @@ async function main() {
   await aPinnedCashierReturnsOnlyAtTheirStore();
   await aProductChargesTheTaxItShows();
   await aPartPaymentKeepsItsTender();
+  await aClosedTillTakesNoMoreMoney();
+  await twoOwnersOpenOneTill();
+  await aCashierReadsOnlyTheirOwnShift();
   aShopAlwaysTakesCash();
   await aPlanLimitsBranches();
   await devMailGoesToOneInbox();

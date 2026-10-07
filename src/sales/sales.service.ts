@@ -14,7 +14,7 @@ import {
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { ShiftsService } from '../shifts/shifts.service';
+import { ShiftsService, holdShiftOpen } from '../shifts/shifts.service';
 import { PaymentsService, SETTLE_METHODS } from '../payments/payments.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
@@ -175,6 +175,9 @@ export class SalesService {
       : PaymentMethod.CASH;
 
     return this.createWithReceiptRetry(async () => this.prisma.$transaction(async (tx) => {
+      // The till was resolved before this transaction; it may have been
+      // counted and closed since. Hold it open until this sale is in.
+      await holdShiftOpen(tx, shiftId);
       const receiptNo = await this.nextReceiptNo(tx, businessId);
 
       const sale = await tx.sale.create({
@@ -567,6 +570,9 @@ export class SalesService {
     const batched = new Set(trackedProducts.filter((p) => p.trackBatches).map((p) => p.id));
 
     return this.prisma.$transaction(async (tx) => {
+      // The refund comes out of this till's drawer, so it must still be open
+      // to take it -- see holdShiftOpen.
+      await holdShiftOpen(tx, shiftId);
       // One return per sale at a time. Everything below reads the sale after
       // this, so a return that was waiting sees the one before it in full.
       await tx.$queryRaw`SELECT id FROM "Sale" WHERE id = ${found.id} FOR UPDATE`;
