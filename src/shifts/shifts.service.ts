@@ -153,12 +153,13 @@ export class ShiftsService {
    * store. One open shift per user per store, enforced by the DB.
    *
    * A shift is a drawer, not a login. An owner or manager arriving at a store
-   * where a till is already running is refused a shift of their own unless
-   * they say this counter has a separate cash drawer: opening one by habit
-   * splits one drawer's cash across two Z reports, and neither then counts
-   * out. They join the open till instead (see `current`). A cashier can't
-   * join someone else's till, so a cashier taking over counts the drawer
-   * out and in -- that handover is the check.
+   * where a till is already running chooses: work on that till -- a
+   * cashier's, or another owner's or manager's -- or open their own. Their
+   * own is only opened when they ask for it (`separateDrawer`), never by
+   * habit: a second shift on one physical drawer splits its cash across two
+   * Z reports, and neither then counts out. A cashier can't work on someone
+   * else's till, so a cashier taking over counts the drawer out and in --
+   * that handover is the check.
    */
   async open(user: AuthUser, dto: OpenShiftDto) {
     let storeId = dto.storeId ?? user.storeId;
@@ -201,8 +202,8 @@ export class ShiftsService {
               error: 'Conflict',
               code: 'TILL_OPEN',
               message:
-                `${running.user.name}’s till is already open at this store. Join it, ` +
-                'or open a separate drawer only if this counter has its own cash.',
+                `${running.user.name}’s till is already open at this store. Work on it, ` +
+                'or choose to open your own till.',
             });
           }
         }
@@ -303,7 +304,9 @@ export class ShiftsService {
    * join. With two running, which drawer the owner's cash goes into is a
    * question only the person standing there can answer, so this returns null
    * and the client asks (see `openAtStore`). Passing `preferShiftId` is that
-   * answer coming back.
+   * answer coming back. The POS asks even with one running -- work on it, or
+   * open your own -- and always sends its answer; the automatic join is the
+   * fallback for a caller that names no till.
    */
   async current(user: AuthUser, storeId?: string, preferShiftId?: string) {
     const id = await this.resolveShiftId(user, storeId, preferShiftId);
@@ -383,11 +386,13 @@ export class ShiftsService {
   }
 
   /**
-   * Every till open at a store — what the client offers when `current()`
-   * found more than one and had to ask which drawer the owner is on.
+   * Every till open at a store — what an owner or manager chooses from: work
+   * on one of these (a cashier's, or another owner's or manager's), or open
+   * their own.
    *
    * Management only: it names who is on each till, which is not a cashier's
-   * business, and only management can join one anyway.
+   * business, and only management can join one anyway. The opener's role is
+   * included so the choice can say whose drawer it is, not just a name.
    */
   async openAtStore(user: AuthUser, storeId: string) {
     const shifts = await this.prisma.shift.findMany({
@@ -397,7 +402,7 @@ export class ShiftsService {
         openedAt: true,
         openingFloat: true,
         userId: true,
-        user: { select: { id: true, name: true } },
+        user: { select: { id: true, name: true, role: true } },
         _count: { select: { sales: true } },
       },
       orderBy: { openedAt: 'asc' },
