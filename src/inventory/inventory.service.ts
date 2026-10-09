@@ -1222,11 +1222,14 @@ export class InventoryService {
    * under-counted.
    *
    * A sale records which batches each line drew (SaleItemBatch), and units go
-   * back to those, soonest-expiring first -- which unit of a mixed line came
-   * back can't be known, and erring early warns about expiry sooner rather
-   * than later. Goods written off on return (`restock: false`) never reach a
-   * batch, but still count against what the line drew, so a later return
-   * can't put back more than came out.
+   * back to those, soonest-expiring first among the in-date ones -- which
+   * unit of a mixed line came back can't be known, and erring early warns
+   * about expiry sooner rather than later. A unit put back on the shelf was
+   * judged good, so it never goes into a batch already past its date while an
+   * in-date one it was drawn from has room. Goods written off on return
+   * (`restock: false`) never reach a batch, but still count against what the
+   * line drew -- the expired batches first -- so a later return can't put
+   * back more than came out.
    *
    * A sale from before batches were recorded has none, and the batch is
    * inferred: the one the till would have sold from when the sale was made.
@@ -1259,6 +1262,14 @@ export class InventoryService {
       // NULL expiries last, as a sale orders them.
       const order = (d: Date | null) => d?.getTime() ?? Number.POSITIVE_INFINITY;
       drawn.sort((a, b) => order(a.batch.expiryDate) - order(b.batch.expiryDate));
+      // A unit put back on the shelf is a good one: in-date batches first, as
+      // the till sells them (inDateFirst), so it isn't filed under a batch
+      // already past its date and written off with it. One written off on
+      // return is counted against the expired batches first.
+      const cutoff = expiredCutoff();
+      const expired = (d: (typeof drawn)[number]) =>
+        Number(!!d.batch.expiryDate && d.batch.expiryDate <= cutoff);
+      drawn.sort((a, b) => (input.restock ? expired(a) - expired(b) : expired(b) - expired(a)));
       let remaining = round3(input.quantity);
       for (const d of drawn) {
         if (remaining <= 0) break;

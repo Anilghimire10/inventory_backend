@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { PaymentMethod, PaymentType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TX_OPTS } from '../common/prisma-tx';
 import { PaymentsService } from '../payments/payments.service';
 import { holdShiftOpen } from '../shifts/shifts.service';
 import { QueryCustomerDto } from './dto/query-customer.dto';
@@ -141,7 +142,7 @@ export class CustomersService {
       );
 
       return tx.customer.findUniqueOrThrow({ where: { id } });
-    });
+    }, TX_OPTS);
   }
 
   /**

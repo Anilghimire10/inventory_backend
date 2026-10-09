@@ -210,26 +210,32 @@ export class ProductsService {
    */
   private async withExpiry<T extends { id: string; trackBatches: boolean }>(rows: T[], storeId?: string) {
     const ids = rows.filter((r) => r.trackBatches).map((r) => r.id);
+    // At one store the till needs the expiry summary and any clearance
+    // pricing, and one read of that store's batches -- undated ones and the
+    // markdown included, in the order a sale draws them -- serves both. They
+    // used to be up to three queries one after another, each a full round
+    // trip to the database on the till's busiest screen.
     const batches = ids.length
       ? await this.prisma.batch.findMany({
           where: {
             productId: { in: ids },
             quantity: { gt: 0 },
-            expiryDate: { not: null },
-            ...(storeId ? { storeId } : {}),
+            ...(storeId ? { storeId } : { expiryDate: { not: null } }),
           },
-          select: { productId: true, expiryDate: true, quantity: true },
+          ...(storeId ? { orderBy: [{ expiryDate: 'asc' as const }, { createdAt: 'asc' as const }] } : {}),
+          select: { productId: true, expiryDate: true, quantity: true, clearancePrice: true },
         })
       : [];
     const cutoff = expiredCutoff();
     const info = new Map<string, { expiredQty: number; nextBatchExpiry: Date | null }>();
     for (const b of batches) {
+      if (!b.expiryDate) continue;
       const e = info.get(b.productId) ?? { expiredQty: 0, nextBatchExpiry: null };
-      if (b.expiryDate! <= cutoff) e.expiredQty = Math.round((e.expiredQty + Number(b.quantity)) * 1000) / 1000;
-      else if (!e.nextBatchExpiry || b.expiryDate! < e.nextBatchExpiry) e.nextBatchExpiry = b.expiryDate;
+      if (b.expiryDate <= cutoff) e.expiredQty = Math.round((e.expiredQty + Number(b.quantity)) * 1000) / 1000;
+      else if (!e.nextBatchExpiry || b.expiryDate < e.nextBatchExpiry) e.nextBatchExpiry = b.expiryDate;
       info.set(b.productId, e);
     }
-    const tiers = storeId ? await this.clearanceTiers(ids, storeId, cutoff) : new Map();
+    const tiers = storeId ? ProductsService.clearanceTiers(batches, cutoff) : new Map();
     return rows.map((r) => ({
       ...r,
       expiry: info.get(r.id) ?? { expiredQty: 0, nextBatchExpiry: null },
@@ -241,26 +247,21 @@ export class ProductsService {
    * How the till prices a batch-tracked product with a batch marked down:
    * its in-date batches in the order a sale draws them (soonest expiry
    * first, see inDateFirst), each with its clearance price or null for full
-   * price. Units past these are full price. Only for products with a
-   * markdown, so a plain product list costs one small query more.
+   * price. Units past these are full price. Only for products with an
+   * in-date batch marked down. `batches` is one store's, soonest expiry first.
    */
-  private async clearanceTiers(productIds: string[], storeId: string, cutoff: Date) {
+  private static clearanceTiers(
+    batches: { productId: string; expiryDate: Date | null; quantity: Prisma.Decimal; clearancePrice: Prisma.Decimal | null }[],
+    cutoff: Date,
+  ) {
     const tiers = new Map<string, { quantity: number; price: number | null }[]>();
-    if (!productIds.length) return tiers;
-    const inDate = { OR: [{ expiryDate: null }, { expiryDate: { gt: cutoff } }] };
-    const marked = await this.prisma.batch.findMany({
-      where: { productId: { in: productIds }, storeId, quantity: { gt: 0 }, clearancePrice: { not: null }, ...inDate },
-      select: { productId: true },
-      distinct: ['productId'],
-    });
-    if (!marked.length) return tiers;
-    const batches = await this.prisma.batch.findMany({
-      where: { productId: { in: marked.map((m) => m.productId) }, storeId, quantity: { gt: 0 } },
-      orderBy: [{ expiryDate: 'asc' }, { createdAt: 'asc' }],
-      select: { productId: true, expiryDate: true, quantity: true, clearancePrice: true },
-    });
-    for (const b of inDateFirst(batches, cutoff)) {
-      if (b.expiryDate && b.expiryDate <= cutoff) continue; // the till sells these last, at full price
+    const inDate = (d: Date | null) => !d || d > cutoff;
+    const marked = new Set(
+      batches.filter((b) => b.clearancePrice !== null && inDate(b.expiryDate)).map((b) => b.productId),
+    );
+    if (!marked.size) return tiers;
+    for (const b of inDateFirst(batches.filter((x) => marked.has(x.productId)), cutoff)) {
+      if (!inDate(b.expiryDate)) continue; // the till sells these last, at full price
       const list = tiers.get(b.productId) ?? [];
       list.push({
         quantity: Number(b.quantity),
@@ -485,6 +486,15 @@ export class ProductsService {
     try {
       return toBatches
         ? await this.prisma.$transaction(async (tx) => {
+            // A date typed in the same save is the date of the stock on hand:
+            // set it first so the conversion carries it, rather than the old
+            // date (or none) while the typed one was dropped.
+            if (expiryDate !== undefined) {
+              await tx.product.update({
+                where: { id },
+                data: { expiryDate: expiryDate ? new Date(expiryDate) : null },
+              });
+            }
             await convertToBatches(tx, id);
             return write(tx);
           }, TX_OPTS)

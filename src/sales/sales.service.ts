@@ -121,11 +121,12 @@ export class SalesService {
     // two branches could ring up a sale at one and have it stamped onto the
     // other branch's drawer. Both Z reports were then wrong, and neither had
     // anything in it to show why.
-    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive, businessType }, shiftId] =
+    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive, businessType }, till] =
       await Promise.all([
         this.buildLines(businessId, storeId, dto),
-        this.shifts.resolveShiftId(user, storeId, dto.shiftId),
+        this.shifts.tillFor(user, storeId, dto.shiftId),
       ]);
+    const shiftId = till.shiftId;
 
     // A pharmacy can't sell expired stock. Other shops get a warning at the
     // till and may go ahead; this is the one place that refuses outright.
@@ -183,6 +184,13 @@ export class SalesService {
     const tender = SETTLE_METHODS.includes(requestedMethod)
       ? requestedMethod
       : PaymentMethod.CASH;
+    // Cash into an unnamed drawer, with several open: booked to none, the
+    // drawer that took it counts over at close. The POS always names its
+    // till; this holds the rule for any other caller, as returns and credit
+    // payments already do.
+    if (till.ambiguous && amountPaid > 0 && tender === PaymentMethod.CASH) {
+      throw chooseTill('in');
+    }
 
     return this.createWithReceiptRetry(async () => this.prisma.$transaction(async (tx) => {
       // The till was resolved before this transaction; it may have been

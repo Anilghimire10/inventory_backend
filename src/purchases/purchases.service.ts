@@ -378,13 +378,15 @@ export class PurchasesService {
             quantity: item.quantity,
             reference: id,
           });
-          await this.receiveBatch(tx, businessId, newStoreId, batched.has(item.productId), {
+          const nowBatched = await this.receiveBatch(tx, businessId, newStoreId, batched.has(item.productId), {
             productId: item.productId,
             quantity: item.quantity,
             costPrice: new Prisma.Decimal(item.costPrice),
             batchNumber: item.batchNumber ?? null,
             expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
           });
+          // A dated line moved it onto batches: its later lines follow.
+          if (nowBatched) batched.add(item.productId);
         }
       }
 
@@ -484,15 +486,20 @@ export class PurchasesService {
       // to a single statement. A throw anywhere still rolls the whole receive
       // back.
       const arriving = PurchasesService.arrivingByProduct(purchase.items);
+      // Products an earlier line of this delivery moved onto batches.
+      const nowBatched = new Set<string>();
       for (const item of purchase.items) {
-        await this.receiveBatch(
+        const left = arriving.get(item.productId) ?? Number(item.quantity);
+        const batched = await this.receiveBatch(
           tx,
           businessId,
           purchase.storeId,
-          !!productMap.get(item.productId)?.trackBatches,
+          !!productMap.get(item.productId)?.trackBatches || nowBatched.has(item.productId),
           item,
-          arriving.get(item.productId),
+          left,
         );
+        if (batched) nowBatched.add(item.productId);
+        arriving.set(item.productId, round3(left - Number(item.quantity)));
         await this.inventory.receiveSerials(tx, {
           businessId,
           storeId: purchase.storeId,
@@ -738,6 +745,10 @@ export class PurchasesService {
         productId: q.productId,
         purchase: { businessId, storeId: q.storeId, status: PurchaseStatus.RECEIVED },
         ...(batch ? { batchNumber: batch.batchNumber, expiryDate: batch.expiryDate } : {}),
+        // Only lines with something left to send back. Filtered here, not
+        // after `take`: twenty fully returned recent lines used to hide an
+        // older delivery that still had returnable units.
+        quantity: { gt: this.prisma.purchaseItem.fields.returnedQty },
       },
       select: {
         id: true,
@@ -1097,14 +1108,26 @@ export class PurchasesService {
     // to a single statement. A throw anywhere still rolls the whole purchase
     // back.
     const arriving = PurchasesService.arrivingByProduct(dto.items);
+    // Products an earlier line of this delivery moved onto batches.
+    const nowBatched = new Set<string>();
     for (const item of dto.items) {
-      await this.receiveBatch(tx, businessId, storeId, !!productMap.get(item.productId)?.trackBatches, {
-        productId: item.productId,
-        quantity: item.quantity,
-        costPrice: new Prisma.Decimal(item.costPrice),
-        batchNumber: item.batchNumber ?? null,
-        expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
-      }, arriving.get(item.productId));
+      const left = arriving.get(item.productId) ?? Number(item.quantity);
+      const batched = await this.receiveBatch(
+        tx,
+        businessId,
+        storeId,
+        !!productMap.get(item.productId)?.trackBatches || nowBatched.has(item.productId),
+        {
+          productId: item.productId,
+          quantity: item.quantity,
+          costPrice: new Prisma.Decimal(item.costPrice),
+          batchNumber: item.batchNumber ?? null,
+          expiryDate: item.expiryDate ? new Date(item.expiryDate) : null,
+        },
+        left,
+      );
+      if (batched) nowBatched.add(item.productId);
+      arriving.set(item.productId, round3(left - Number(item.quantity)));
       await this.inventory.receiveSerials(tx, {
         businessId,
         storeId,
@@ -1169,6 +1192,10 @@ export class PurchasesService {
    * (a sale only consumes them for tracked products), so a batch made for it
    * sat on the Expiring list for good; its expiry date, if given, is kept on
    * the product instead, as Import stock does.
+   *
+   * Says whether the product is batch-tracked once this line is in: a dated
+   * line can move it onto batches, and the delivery's later lines of it --
+   * dated or not -- must then go into batches too.
    */
   private async receiveBatch(
     tx: Prisma.TransactionClient,
@@ -1183,12 +1210,13 @@ export class PurchasesService {
       expiryDate: Date | null;
     },
     /**
-     * Units of this product the delivery has already put on the shelf at
-     * this store -- its other lines included -- so a switch to batches
-     * doesn't date them with the old stock.
+     * Units of this product, already on the shelf at this store, that this
+     * line and the delivery's later lines bring -- so a switch to batches
+     * doesn't date them with the old stock. An earlier line's units are not
+     * in it: they already carry their date, and count as stock that is there.
      */
     arriving = Number(item.quantity),
-  ) {
+  ): Promise<boolean> {
     if (trackBatches) {
       await this.inventory.addToBatch(tx, {
         businessId,
@@ -1199,6 +1227,7 @@ export class PurchasesService {
         expiryDate: item.expiryDate,
         costPrice: item.costPrice,
       });
+      return true;
     } else if (item.expiryDate) {
       const current = await tx.product.findUniqueOrThrow({
         where: { id: item.productId },
@@ -1206,8 +1235,7 @@ export class PurchasesService {
       });
       // An earlier line of this delivery already moved it onto batches.
       if (current.trackBatches) {
-        await this.receiveBatch(tx, businessId, storeId, true, item);
-        return;
+        return this.receiveBatch(tx, businessId, storeId, true, item);
       }
       const newDate = current.expiryDate?.getTime() !== item.expiryDate.getTime();
       const oldStock = newDate && current.expiryDate ? await this.stockBesides(tx, item.productId, storeId, arriving) : 0;
@@ -1215,14 +1243,14 @@ export class PurchasesService {
         // Stock on the shelf already carries another date. Overwriting it
         // made those units read as fresh; keep both dates on batches.
         await convertToBatches(tx, item.productId, { storeId, quantity: arriving });
-        await this.receiveBatch(tx, businessId, storeId, true, item);
-        return;
+        return this.receiveBatch(tx, businessId, storeId, true, item);
       }
       await tx.product.update({
         where: { id: item.productId },
         data: { expiryDate: item.expiryDate },
       });
     }
+    return false;
   }
 
   /** Units of a product on hand anywhere, besides what is arriving here. */
@@ -1241,7 +1269,10 @@ export class PurchasesService {
     );
   }
 
-  /** Per product, what a delivery's lines add up to. */
+  /**
+   * Per product, what a delivery's lines add up to. Callers count it down as
+   * they go, so each line is handed what it and the lines after it bring.
+   */
   private static arrivingByProduct(items: { productId: string; quantity: Prisma.Decimal | number }[]) {
     const total = new Map<string, number>();
     for (const i of items) total.set(i.productId, round3((total.get(i.productId) ?? 0) + Number(i.quantity)));

@@ -1412,7 +1412,7 @@ async function aPartPaymentKeepsItsTender() {
       prisma,
       stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
       stub<MailService>({}),
-      stub<ShiftsService>({ resolveShiftId: async () => 'sh1' }),
+      stub<ShiftsService>({ tillFor: async () => ({ shiftId: 'sh1', ambiguous: false }) }),
       stub<PaymentsService>({ record: async (input: any) => payments.push(input) }),
     );
     await service.create(user, {
@@ -1440,6 +1440,46 @@ async function aPartPaymentKeepsItsTender() {
   // A client that names no tender for the part paid gets the counter default.
   const credit = await checkout(PaymentMethod.CREDIT, 100);
   assert.strictEqual(credit.payment.method, PaymentMethod.CASH);
+}
+
+/**
+ * An owner with no till of their own, at a store with two open, rings up a
+ * cash sale naming neither: the cash would be booked to no drawer, and the
+ * one that took it would count over at close. Refused, as a cash refund or a
+ * cash credit payment already is; a card sale has no drawer to get wrong.
+ */
+async function aCashSaleNamesItsTillWhenSeveralAreOpen() {
+  const sell = (paymentMethod: PaymentMethod) => {
+    let created = false;
+    const prisma = stub<PrismaService>({
+      store: { findFirst: async () => ({ id: 's1' }) },
+      business: { findUnique: async () => ({ taxEnabled: false, taxInclusive: false }) },
+      product: {
+        findMany: async () => [
+          { id: 'p1', name: 'Rice', sellingPrice: 100, costPrice: 60, taxRate: 0, isTaxable: false, isActive: true, isRxRequired: false, trackBatches: false, trackSerials: false },
+        ],
+      },
+      $transaction: async (fn: any) =>
+        fn({
+          sale: { findFirst: async () => null, create: async ({ data }: any) => ((created = true), { id: 'sale1', ...data }) },
+          $queryRaw: async () => [],
+        }),
+    });
+    const service = new SalesService(
+      prisma,
+      stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
+      stub<MailService>({}),
+      stub<ShiftsService>({ tillFor: async () => ({ shiftId: null, ambiguous: true }) }),
+      stub<PaymentsService>({ record: async () => undefined }),
+    );
+    return { result: service.create(user, { items: [{ productId: 'p1', quantity: 1 }], paymentMethod } as any), created: () => created };
+  };
+  const cash = sell(PaymentMethod.CASH);
+  await assert.rejects(cash.result, (e: any) => e.getResponse?.().code === 'TILL_CHOICE', 'cash with no till named is refused');
+  assert.strictEqual(cash.created(), false, 'and nothing is written');
+  const card = sell(PaymentMethod.CARD);
+  await card.result;
+  assert.strictEqual(card.created(), true, 'a card sale has no drawer to get wrong');
 }
 
 /**
@@ -1483,7 +1523,7 @@ async function aClosedTillTakesNoMoreMoney() {
       prisma,
       stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
       stub<MailService>({}),
-      stub<ShiftsService>({ resolveShiftId: async () => 'sh1' }),
+      stub<ShiftsService>({ tillFor: async () => ({ shiftId: 'sh1', ambiguous: false }) }),
       stub<PaymentsService>({ record: async () => written.push('payment') }),
     );
     const result = service.create(user, { items: [{ productId: 'p1', quantity: 1 }] } as any);
@@ -1722,6 +1762,18 @@ async function aReturnGoesBackToTheBatchItCameFrom() {
   const broken = await run(drawn, { quantity: 1, restock: false });
   assert.deepStrictEqual(broken.batchesBack, [], 'a unit written off on return reaches no batch');
   assert.deepStrictEqual(broken.rowsBack, [['r-b', 1]], 'but counts against what the line drew');
+
+  // A line that drew from an expired batch as well as an in-date one. Sorted
+  // by date alone the expired one came first, and a good unit put back on the
+  // shelf was filed under it -- to be written off with it.
+  const mixed = [
+    { id: 'r-a', batchId: 'A', quantity: 1, returnedQty: 0, expiryDate: utcDay('2020-01-01') },
+    { id: 'r-b', batchId: 'B', quantity: 2, returnedQty: 0, expiryDate: utcDay('2099-01-01') },
+  ];
+  const good = await run(mixed, { quantity: 1, restock: true });
+  assert.deepStrictEqual(good.batchesBack, [['B', 1]], 'a good unit goes back into the in-date batch, not the expired one');
+  const bad = await run(mixed, { quantity: 1, restock: false });
+  assert.deepStrictEqual(bad.rowsBack, [['r-a', 1]], 'a unit written off on return counts against the expired batch first');
 
   // A sale from before batches were recorded: inferred as the one the till
   // sold from that day -- B, in date -- not A, already expired by then.
@@ -5107,6 +5159,7 @@ async function main() {
   await aPinnedCashierReturnsOnlyAtTheirStore();
   await aProductChargesTheTaxItShows();
   await aPartPaymentKeepsItsTender();
+  await aCashSaleNamesItsTillWhenSeveralAreOpen();
   await aClosedTillTakesNoMoreMoney();
   await twoOwnersOpenOneTill();
   await aCashierReadsOnlyTheirOwnShift();

@@ -15,6 +15,7 @@ import {
   UserRole,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TX_OPTS } from '../common/prisma-tx';
 import { AuthUser } from '../common/types/auth-user';
 import { PaymentsService } from '../payments/payments.service';
 import { paginate } from '../common/dto/pagination.dto';
@@ -222,7 +223,7 @@ export class ShiftsService {
             note: dto.note,
           },
         });
-      });
+      }, TX_OPTS);
     } catch (err) {
       // Partial unique index on (userId, storeId) WHERE closedAt IS NULL.
       // Checking in JS first would let two concurrent requests both open a
@@ -610,7 +611,7 @@ export class ShiftsService {
           ...(note ? { note } : {}),
         },
       });
-    });
+    }, TX_OPTS);
 
     return this.report(user.businessId, id, user);
   }
@@ -655,7 +656,7 @@ export class ShiftsService {
         },
         include: { user: { select: { id: true, name: true } } },
       });
-    });
+    }, TX_OPTS);
     return { ...movement, amount: Number(movement.amount) };
   }
 
