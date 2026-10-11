@@ -788,6 +788,31 @@ async function variantGenerationCoversEveryCombination() {
     seeded.every((r) => r.storeId === 's1'),
     'variants are stocked only where their parent is carried',
   );
+
+  // The same combination entered with its attributes the other way round is
+  // still the same variant: "S / Red" from an earlier run is Red in size S.
+  const again: any[] = [];
+  const reordered = new ProductsService(
+    stub<PrismaService>({
+      ...(prisma as any),
+      product: {
+        findFirst: async () => parent,
+        findMany: async () => [{ variantName: 'S / Red', attributes: { Size: 'S', Colour: 'Red' } }],
+        create: async ({ data }: any) => {
+          again.push(data);
+          return { ...data, id: `w${again.length}` };
+        },
+      },
+    }),
+  );
+  const res2: any = await reordered.generateVariants('b1', 'p1', {
+    options: [
+      { name: 'Colour', values: ['Red', 'Blue'] },
+      { name: 'Size', values: ['S'] },
+    ],
+  });
+  assert.deepStrictEqual(again.map((c) => c.variantName), ['Blue / S'], 'Red in S already exists, whatever the order');
+  assert.strictEqual(res2.skipped, 1);
 }
 
 async function serialRulesGuardEveryUnit() {

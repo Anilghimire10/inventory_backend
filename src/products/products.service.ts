@@ -544,9 +544,23 @@ export class ProductsService {
 
     const existing = await this.prisma.product.findMany({
       where: { parentId, businessId },
-      select: { variantName: true },
+      select: { variantName: true, attributes: true },
     });
+    // The same combination whatever order its attributes were entered in:
+    // matched on the name alone, "Size, Colour" after "Colour, Size" made
+    // "S / Red" beside "Red / S" -- one variant twice.
+    const comboKey = (attrs: Record<string, string>) =>
+      JSON.stringify(
+        Object.entries(attrs)
+          .map(([k, v]) => [k.trim().toLowerCase(), String(v).trim().toLowerCase()])
+          .sort(([a], [b]) => a.localeCompare(b)),
+      );
     const taken = new Set(existing.map((e) => e.variantName));
+    const takenCombos = new Set(
+      existing
+        .filter((e) => e.attributes && typeof e.attributes === 'object' && !Array.isArray(e.attributes))
+        .map((e) => comboKey(e.attributes as Record<string, string>)),
+    );
 
     // A variant is carried wherever its parent is: generating one into a
     // store that does not stock the style would put it on that branch's shelf
@@ -560,7 +574,7 @@ export class ProductsService {
     const created: ProductDetail[] = [];
     for (const combo of combos) {
       const label = Object.values(combo).join(' / ');
-      if (taken.has(label)) continue;
+      if (taken.has(label) || takenCombos.has(comboKey(combo))) continue;
       const suffix = Object.values(combo)
         .map((v) => v.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())
         .join('-');
