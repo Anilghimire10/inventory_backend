@@ -9,6 +9,7 @@ import {
   PaymentType,
 } from '@prisma/client';
 import * as argon2 from 'argon2';
+import { firstCounter } from '../src/counters/default-counter';
 
 const prisma = new PrismaClient();
 
@@ -68,7 +69,12 @@ async function main() {
       data: { name: 'Demo Store', type: BusinessType.RETAIL, currency: 'NPR', taxEnabled: true },
     });
     const store = await prisma.store.create({
-      data: { businessId: business.id, name: 'Main Store', phone: '555-0100' },
+      data: {
+        businessId: business.id,
+        name: 'Main Store',
+        phone: '555-0100',
+        counters: firstCounter(business.id),
+      },
     });
     owner = await prisma.user.create({
       data: {

@@ -24,6 +24,8 @@ const TOPICS: Record<string, LiveTopic[]> = {
   payments: ['customers', 'sales'],
   shifts: ['shifts', 'sales'],
   stores: ['settings', 'stock'],
+  // A counter added, renamed or taken out of use: the till's choice and Settings.
+  counters: ['shifts', 'settings'],
   business: ['settings'],
   users: ['settings'],
   support: ['support'],

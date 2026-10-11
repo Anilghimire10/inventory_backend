@@ -22,6 +22,7 @@ import { PlatformModule } from './platform/platform.module';
 import { BusinessModule } from './business/business.module';
 import { UsersModule } from './users/users.module';
 import { StoresModule } from './stores/stores.module';
+import { CountersModule } from './counters/counters.module';
 import { CategoriesModule } from './categories/categories.module';
 import { TaxesModule } from './taxes/taxes.module';
 import { ProductsModule } from './products/products.module';
@@ -72,6 +73,7 @@ import { MaintenanceGuard } from './common/guards/maintenance.guard';
     BusinessModule,
     UsersModule,
     StoresModule,
+    CountersModule,
     CategoriesModule,
     TaxesModule,
     ProductsModule,

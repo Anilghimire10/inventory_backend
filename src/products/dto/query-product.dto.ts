@@ -34,6 +34,12 @@ export class QueryProductDto extends PaginationDto {
   @MaxLength(64)
   categoryId?: string;
 
+  @ApiPropertyOptional({ description: 'Only products charged this tax (Taxes → a tax\'s details)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  taxId?: string;
+
   @ApiPropertyOptional({ description: 'Only active products', default: true })
   @IsOptional()
   @QueryBoolean()

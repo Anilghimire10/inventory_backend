@@ -41,6 +41,7 @@ import {
   SuspendDto,
   UpdateBusinessDto,
 } from './dto/platform.dto';
+import { firstCounter } from '../counters/default-counter';
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -345,7 +346,11 @@ export class PlatformService {
         },
       });
       const store = await tx.store.create({
-        data: { businessId: business.id, name: 'Main Store' },
+        data: {
+          businessId: business.id,
+          name: 'Main Store',
+          counters: firstCounter(business.id),
+        },
       });
       const owner = await tx.user.create({
         data: {
@@ -926,6 +931,9 @@ export class PlatformService {
       await tx.sale.deleteMany({ where: { businessId } });
       await tx.purchase.deleteMany({ where: { businessId } });
       await tx.shift.deleteMany({ where: { businessId } });
+      // A store can't be deleted while a counter still points at it, and
+      // every store has one: without this every delete failed.
+      await tx.counter.deleteMany({ where: { businessId } });
       await tx.business.delete({ where: { id: businessId } });
     }, { ...TX_OPTS, timeout: 120_000 });
 

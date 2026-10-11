@@ -10,9 +10,11 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { GenerateVariantsDto } from './dto/generate-variants.dto';
-import { expiredCutoff, soonCutoff } from '../common/expiry';
+import { expiredCutoff, inDateFirst, isExpired, soonCutoff } from '../common/expiry';
 import { readProductRow } from './product-import';
 import { paginate } from '../common/dto/pagination.dto';
+import { TX_OPTS } from '../common/prisma-tx';
+import { convertToBatches } from '../inventory/inventory.service';
 
 const DETAIL_INCLUDE = {
   categories: { select: { id: true, name: true } },
@@ -101,6 +103,7 @@ export class ProductsService {
       ...(q.storeId ? { stockItems: { some: { storeId: q.storeId } } } : {}),
       ...(q.activeOnly !== false ? { isActive: true } : {}),
       ...(q.categoryId ? { categories: { some: { id: q.categoryId } } } : {}),
+      ...(q.taxId ? { taxId: q.taxId } : {}),
       ...(q.ids?.length ? { id: { in: q.ids } } : {}),
       ...(q.parentId ? { parentId: q.parentId } : {}),
       ...(q.excludeVariants ? { parentId: null } : {}),
@@ -149,7 +152,7 @@ export class ProductsService {
           ...this.detailInclude,
           stockItems: {
             where: { storeId: q.storeId },
-            select: { quantity: true, reorderLevel: true },
+            select: { quantity: true, reorderLevel: true, clearancePrice: true, clearanceFor: true },
           },
         },
       }),
@@ -165,6 +168,15 @@ export class ProductsService {
         // same rule as InventoryService.lowStock()'s
         // COALESCE(NULLIF(si."reorderLevel", 0), p."reorderLevel").
         effectiveReorderLevel: here?.reorderLevel || product.reorderLevel,
+        // A product keeping one expiry date on itself, marked down at this
+        // store: every unit, while that date stands and hasn't passed.
+        ...(here?.clearancePrice != null &&
+        !product.trackBatches &&
+        product.expiryDate &&
+        here.clearanceFor?.getTime() === product.expiryDate.getTime() &&
+        !isExpired(product.expiryDate)
+          ? { clearance: [{ quantity: null, price: Number(here.clearancePrice) }] }
+          : {}),
       };
     });
     return paginate(await this.withExpiry(rows, q.storeId), total, q.page, q.limit);
@@ -198,26 +210,66 @@ export class ProductsService {
    */
   private async withExpiry<T extends { id: string; trackBatches: boolean }>(rows: T[], storeId?: string) {
     const ids = rows.filter((r) => r.trackBatches).map((r) => r.id);
+    // At one store the till needs the expiry summary and any clearance
+    // pricing, and one read of that store's batches -- undated ones and the
+    // markdown included, in the order a sale draws them -- serves both. They
+    // used to be up to three queries one after another, each a full round
+    // trip to the database on the till's busiest screen.
     const batches = ids.length
       ? await this.prisma.batch.findMany({
           where: {
             productId: { in: ids },
             quantity: { gt: 0 },
-            expiryDate: { not: null },
-            ...(storeId ? { storeId } : {}),
+            ...(storeId ? { storeId } : { expiryDate: { not: null } }),
           },
-          select: { productId: true, expiryDate: true, quantity: true },
+          ...(storeId ? { orderBy: [{ expiryDate: 'asc' as const }, { createdAt: 'asc' as const }] } : {}),
+          select: { productId: true, expiryDate: true, quantity: true, clearancePrice: true },
         })
       : [];
     const cutoff = expiredCutoff();
     const info = new Map<string, { expiredQty: number; nextBatchExpiry: Date | null }>();
     for (const b of batches) {
+      if (!b.expiryDate) continue;
       const e = info.get(b.productId) ?? { expiredQty: 0, nextBatchExpiry: null };
-      if (b.expiryDate! <= cutoff) e.expiredQty = Math.round((e.expiredQty + Number(b.quantity)) * 1000) / 1000;
-      else if (!e.nextBatchExpiry || b.expiryDate! < e.nextBatchExpiry) e.nextBatchExpiry = b.expiryDate;
+      if (b.expiryDate <= cutoff) e.expiredQty = Math.round((e.expiredQty + Number(b.quantity)) * 1000) / 1000;
+      else if (!e.nextBatchExpiry || b.expiryDate < e.nextBatchExpiry) e.nextBatchExpiry = b.expiryDate;
       info.set(b.productId, e);
     }
-    return rows.map((r) => ({ ...r, expiry: info.get(r.id) ?? { expiredQty: 0, nextBatchExpiry: null } }));
+    const tiers = storeId ? ProductsService.clearanceTiers(batches, cutoff) : new Map();
+    return rows.map((r) => ({
+      ...r,
+      expiry: info.get(r.id) ?? { expiredQty: 0, nextBatchExpiry: null },
+      ...(tiers.has(r.id) ? { clearance: tiers.get(r.id) } : {}),
+    }));
+  }
+
+  /**
+   * How the till prices a batch-tracked product with a batch marked down:
+   * its in-date batches in the order a sale draws them (soonest expiry
+   * first, see inDateFirst), each with its clearance price or null for full
+   * price. Units past these are full price. Only for products with an
+   * in-date batch marked down. `batches` is one store's, soonest expiry first.
+   */
+  private static clearanceTiers(
+    batches: { productId: string; expiryDate: Date | null; quantity: Prisma.Decimal; clearancePrice: Prisma.Decimal | null }[],
+    cutoff: Date,
+  ) {
+    const tiers = new Map<string, { quantity: number; price: number | null }[]>();
+    const inDate = (d: Date | null) => !d || d > cutoff;
+    const marked = new Set(
+      batches.filter((b) => b.clearancePrice !== null && inDate(b.expiryDate)).map((b) => b.productId),
+    );
+    if (!marked.size) return tiers;
+    for (const b of inDateFirst(batches.filter((x) => marked.has(x.productId)), cutoff)) {
+      if (!inDate(b.expiryDate)) continue; // the till sells these last, at full price
+      const list = tiers.get(b.productId) ?? [];
+      list.push({
+        quantity: Number(b.quantity),
+        price: b.clearancePrice === null ? null : Number(b.clearancePrice),
+      });
+      tiers.set(b.productId, list);
+    }
+    return tiers;
   }
 
   /**
@@ -376,7 +428,11 @@ export class ProductsService {
   }
 
   async update(businessId: string, id: string, dto: UpdateProductDto) {
-    await this.findOne(businessId, id);
+    const before = await this.findOne(businessId, id);
+    // Switching batches on: the stock on the shelf keeps the date it has, as
+    // a batch, instead of being left in none (see convertToBatches). The
+    // form's product-level date goes with it -- it is now the batch's.
+    const toBatches = dto.trackBatches === true && !before.trackBatches;
     // storeIds is availability, not a product column — it must not reach
     // Prisma via ...rest.
     const { categoryIds, expiryDate, taxId, storeIds, ...rest } = dto;
@@ -403,8 +459,8 @@ export class ProductsService {
       }
     }
     await this.assertCategories(businessId, categoryIds);
-    try {
-      return await this.prisma.product.update({
+    const write = async (db: Prisma.TransactionClient | PrismaService) =>
+      db.product.update({
         where: { id },
         data: {
           ...rest,
@@ -416,7 +472,7 @@ export class ProductsService {
               ? { taxId, taxRate: await this.resolveTaxRate(businessId, taxId) }
               : { taxId: null, taxRate: 0 }
             : {}),
-          ...(expiryDate !== undefined
+          ...(expiryDate !== undefined && !toBatches
             ? { expiryDate: expiryDate ? new Date(expiryDate) : null }
             : {}),
           // `set` replaces the full category list when the field is provided.
@@ -426,6 +482,23 @@ export class ProductsService {
         },
         include: this.detailInclude,
       });
+
+    try {
+      return toBatches
+        ? await this.prisma.$transaction(async (tx) => {
+            // A date typed in the same save is the date of the stock on hand:
+            // set it first so the conversion carries it, rather than the old
+            // date (or none) while the typed one was dropped.
+            if (expiryDate !== undefined) {
+              await tx.product.update({
+                where: { id },
+                data: { expiryDate: expiryDate ? new Date(expiryDate) : null },
+              });
+            }
+            await convertToBatches(tx, id);
+            return write(tx);
+          }, TX_OPTS)
+        : await write(this.prisma);
     } catch (e) {
       throw this.handleUnique(e);
     }
@@ -471,9 +544,23 @@ export class ProductsService {
 
     const existing = await this.prisma.product.findMany({
       where: { parentId, businessId },
-      select: { variantName: true },
+      select: { variantName: true, attributes: true },
     });
+    // The same combination whatever order its attributes were entered in:
+    // matched on the name alone, "Size, Colour" after "Colour, Size" made
+    // "S / Red" beside "Red / S" -- one variant twice.
+    const comboKey = (attrs: Record<string, string>) =>
+      JSON.stringify(
+        Object.entries(attrs)
+          .map(([k, v]) => [k.trim().toLowerCase(), String(v).trim().toLowerCase()])
+          .sort(([a], [b]) => a.localeCompare(b)),
+      );
     const taken = new Set(existing.map((e) => e.variantName));
+    const takenCombos = new Set(
+      existing
+        .filter((e) => e.attributes && typeof e.attributes === 'object' && !Array.isArray(e.attributes))
+        .map((e) => comboKey(e.attributes as Record<string, string>)),
+    );
 
     // A variant is carried wherever its parent is: generating one into a
     // store that does not stock the style would put it on that branch's shelf
@@ -487,7 +574,7 @@ export class ProductsService {
     const created: ProductDetail[] = [];
     for (const combo of combos) {
       const label = Object.values(combo).join(' / ');
-      if (taken.has(label)) continue;
+      if (taken.has(label) || takenCombos.has(comboKey(combo))) continue;
       const suffix = Object.values(combo)
         .map((v) => v.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())
         .join('-');

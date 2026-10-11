@@ -27,7 +27,7 @@ import { CategoriesService } from '../src/categories/categories.service';
 import { MailService } from '../src/mail/mail.service';
 import { AuthService } from '../src/auth/auth.service';
 import { AuditService } from '../src/audit/audit.service';
-import { InventoryService } from '../src/inventory/inventory.service';
+import { InventoryService, convertToBatches } from '../src/inventory/inventory.service';
 import { PurchasesService, purchaseTotals, weightedCost } from '../src/purchases/purchases.service';
 import { ProductsService } from '../src/products/products.service';
 import { UsersService } from '../src/users/users.service';
@@ -98,6 +98,15 @@ import { BusinessService } from '../src/business/business.service';
 import { SubscriptionRemindersService } from '../src/platform/subscription-reminders.service';
 
 const stub = <T>(impl: unknown) => impl as T;
+/**
+ * A stub Prisma client that can run a transaction: the callback gets the same
+ * stub back, and the advisory lock a shift open takes is a no-op.
+ */
+const withTx = <T extends object>(db: T) => {
+  const client: any = { ...db, $executeRaw: async () => 0 };
+  client.$transaction = (fn: (tx: unknown) => unknown) => fn(client);
+  return client as T;
+};
 const user: AuthUser = {
   userId: 'u1',
   businessId: 'b1',
@@ -364,8 +373,19 @@ async function cashControlOnAShift() {
   {
     let createdShift: any = null;
     const service = new ShiftsService(
-      stub<PrismaService>({
+      stub<PrismaService>(withTx({
         store: { findFirst: async () => ({ id: 's1' }) },
+        // The cashier works Counter 1.
+        user: {
+          findUnique: async () => ({
+            counterId: 'c1',
+            counter: { id: 'c1', name: 'Counter 1', storeId: 's1', isActive: true },
+          }),
+        },
+        counter: {
+          findFirst: async () => ({ id: 'c1', name: 'Counter 1', isActive: true }),
+          count: async () => 1,
+        },
         shift: {
           // Nothing open at the store; the last close left 1500.
           findFirst: async (args: any) =>
@@ -374,7 +394,7 @@ async function cashControlOnAShift() {
               : { cashLeft: new Prisma.Decimal(1500), closedAt: new Date(), user: { name: 'Ramesh' } },
           create: async (args: any) => (createdShift = args.data),
         },
-      }),
+      })),
       stub<PaymentsService>({}),
     );
     const suggested = await service.suggestedFloat(user, 's1');
@@ -383,67 +403,158 @@ async function cashControlOnAShift() {
     await service.open(user, { storeId: 's1', openingFloat: 1400 });
     assert.strictEqual(createdShift.carriedFloat, 1500, 'the 100 missing overnight is on record');
     assert.strictEqual(createdShift.openingFloat, 1400);
+    assert.strictEqual(createdShift.counterId, 'c1', 'on the counter the cashier is assigned to');
   }
 }
 
 /**
- * One drawer, one shift. An owner at a store where a till is running joins it
- * rather than opening a second one by habit -- unless they say the counter
- * has its own cash. The Z report then says whose sales are in the drawer.
+ * Counters: one drawer each, one open shift each. A cashier opens the counter
+ * they are assigned to and no other; an owner or manager chooses one when the
+ * store has more than one, and a counter already open is theirs to work on,
+ * not to open again.
  */
 async function oneDrawerOneShift() {
   const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
   const cashier: AuthUser = { ...user, userId: 'u2', role: 'CASHIER' as AuthUser['role'] };
+  const C1 = { id: 'c1', name: 'Counter 1', storeId: 's1', isActive: true };
+  const C2 = { id: 'c2', name: 'Counter 2', storeId: 's1', isActive: true };
 
-  // `open` is every shift open at store s1.
-  const build = (open: { id: string; userId: string; name: string }[]) => {
+  // `open` is every shift open at store s1; `assigned` the cashier's counter.
+  const build = (
+    open: { id: string; userId: string; name: string; counterId: string | null }[],
+    counters = [C1, C2],
+    assigned: typeof C1 | null = C1,
+  ) => {
     const created: any[] = [];
     const service = new ShiftsService(
-      stub<PrismaService>({
+      stub<PrismaService>(withTx({
         store: { findFirst: async () => ({ id: 's1' }) },
+        user: { findUnique: async () => ({ counter: assigned, counterId: assigned?.id ?? null }) },
+        counter: {
+          findFirst: async ({ where }: any) => counters.find((c) => c.id === where.id) ?? null,
+          findMany: async () => counters.filter((c) => c.isActive),
+          count: async () => counters.filter((c) => c.isActive).length,
+        },
         shift: {
           findFirst: async (args: any) => {
             if (args.where.closedAt !== null) return null; // no previous close
-            const hit = open.find((sh) => !args.where.userId || sh.userId === args.where.userId);
-            return hit ? { ...hit, user: { name: hit.name } } : null;
+            const hit = open.find((sh) =>
+              args.where.userId ? sh.userId === args.where.userId : sh.counterId === args.where.counterId,
+            );
+            const counter = counters.find((c) => c.id === hit?.counterId);
+            return hit ? { ...hit, user: { name: hit.name }, counter: counter ? { name: counter.name } : null } : null;
           },
           create: async (args: any) => {
             created.push(args.data);
             return { id: 'new', ...args.data };
           },
+          update: async ({ where, data }: any) => {
+            updated.push([where.id, data.counterId]);
+            return { ...open.find((sh) => sh.id === where.id), ...data };
+          },
+          findUniqueOrThrow: async ({ where }: any) => open.find((sh) => sh.id === where.id),
         },
-      }),
+      })),
       stub<PaymentsService>({}),
     );
-    return { service, created };
+    return { service, created, updated };
   };
-  const sangu = { id: 'sh-sangu', userId: 'u2', name: 'Sangu' };
+  const updated: [string, string][] = [];
+  const sangu = { id: 'sh-sangu', userId: 'u2', name: 'Sangu', counterId: 'c1' };
+  const code = (c: string) => (e: any) => e.getResponse?.().code === c;
 
   {
     const { service, created } = build([sangu]);
     await assert.rejects(
       service.open(owner, { storeId: 's1', openingFloat: 1200 }),
-      (e: any) => e.getStatus() === 409 && /Sangu’s till is already open/.test(e.message),
-      'an owner is sent to the open till, not given a second drawer',
+      code('COUNTER_CHOICE'),
+      'with two counters, the owner chooses which one to open',
+    );
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1200, counterId: 'c1' }),
+      (e: any) => code('COUNTER_BUSY')(e) && /Counter 1 is already open on Sangu’s shift/.test(e.message),
+      'a counter already open is worked on, not opened twice',
     );
     assert.strictEqual(created.length, 0);
-    await service.open(owner, { storeId: 's1', openingFloat: 500, separateDrawer: true });
-    assert.strictEqual(created[0].userId, 'owner1', 'unless the counter really has its own cash');
+    await service.open(owner, { storeId: 's1', openingFloat: 500, counterId: 'c2' });
+    assert.deepStrictEqual([created[0].userId, created[0].counterId], ['owner1', 'c2'], 'the free counter opens');
   }
 
   {
-    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner' };
+    const { service, created } = build([], [C1]);
+    await service.open(owner, { storeId: 's1', openingFloat: 500 });
+    assert.strictEqual(created[0].counterId, 'c1', 'one counter: nothing to choose');
+  }
+
+  {
+    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner', counterId: 'c2' };
     const { service, created } = build([sangu, mine]);
-    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1 });
-    assert.strictEqual(got.id, 'sh-mine', 'an owner with their own till open here resumes it');
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c2' });
+    assert.strictEqual(got.id, 'sh-mine', 'an owner with that counter open resumes it');
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c1' }),
+      code('OWN_SHIFT_OPEN'),
+      'one till of their own per store: close it before opening another',
+    );
     assert.strictEqual(created.length, 0);
   }
 
   {
-    const ownerTill = { id: 'sh-owner', userId: 'owner1', name: 'Owner' };
-    const { service, created } = build([ownerTill]);
+    const { service, created } = build([]);
     await service.open(cashier, { storeId: 's1', openingFloat: 1000 });
-    assert.strictEqual(created[0].userId, 'u2', 'a cashier, who cannot join, is never blocked');
+    assert.deepStrictEqual([created[0].userId, created[0].counterId], ['u2', 'c1'], 'a cashier opens their own counter');
+    await assert.rejects(
+      service.open(cashier, { storeId: 's1', openingFloat: 1000, counterId: 'c2' }),
+      (e: any) => e.getStatus() === 403,
+      'and no other',
+    );
+  }
+
+  {
+    const { service } = build([], [C1, C2], null);
+    await assert.rejects(
+      service.open(cashier, { storeId: 's1', openingFloat: 1000 }),
+      code('NO_COUNTER'),
+      'a cashier with no counter is told to ask the owner',
+    );
+  }
+
+  {
+    // The owner opened Counter 1 before its cashier arrived. One drawer, one
+    // session: the cashier works on that till rather than being locked out.
+    const ownerOnC1 = { id: 'sh-owner', userId: 'owner1', name: 'Owner', counterId: 'c1' };
+    const { service, created } = build([ownerOnC1]);
+    const got: any = await service.open(cashier, { storeId: 's1', openingFloat: 1000 });
+    assert.strictEqual(got.id, 'sh-owner', 'the cashier works on the till open at their counter');
+    assert.strictEqual(created.length, 0, 'no second shift on the drawer');
+  }
+
+  {
+    // A second tab or an older app opens without naming a counter: the till
+    // they already have here comes back, rather than "choose a counter".
+    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner', counterId: 'c2' };
+    const { service, created } = build([sangu, mine]);
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1 });
+    assert.strictEqual(got.id, 'sh-mine', 'an owner with a till open here resumes it');
+    assert.strictEqual(created.length, 0);
+  }
+
+  {
+    // A till the owner had open before counters existed belongs to none, so
+    // it held no drawer. Opened as a free counter it becomes that counter's;
+    // opened as a busy one it is refused.
+    const legacy = { id: 'sh-legacy', userId: 'owner1', name: 'Owner', counterId: null };
+    const { service, created } = build([sangu, legacy]);
+    updated.length = 0;
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c1' }),
+      code('COUNTER_BUSY'),
+      'not onto a counter someone else has open',
+    );
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c2' });
+    assert.deepStrictEqual(updated, [['sh-legacy', 'c2']], 'the old till takes the free counter');
+    assert.strictEqual(got.counterId, 'c2');
+    assert.strictEqual(created.length, 0, 'no second shift on the drawer');
   }
 
   // Whose sales are in the drawer.
@@ -677,6 +788,31 @@ async function variantGenerationCoversEveryCombination() {
     seeded.every((r) => r.storeId === 's1'),
     'variants are stocked only where their parent is carried',
   );
+
+  // The same combination entered with its attributes the other way round is
+  // still the same variant: "S / Red" from an earlier run is Red in size S.
+  const again: any[] = [];
+  const reordered = new ProductsService(
+    stub<PrismaService>({
+      ...(prisma as any),
+      product: {
+        findFirst: async () => parent,
+        findMany: async () => [{ variantName: 'S / Red', attributes: { Size: 'S', Colour: 'Red' } }],
+        create: async ({ data }: any) => {
+          again.push(data);
+          return { ...data, id: `w${again.length}` };
+        },
+      },
+    }),
+  );
+  const res2: any = await reordered.generateVariants('b1', 'p1', {
+    options: [
+      { name: 'Colour', values: ['Red', 'Blue'] },
+      { name: 'Size', values: ['S'] },
+    ],
+  });
+  assert.deepStrictEqual(again.map((c) => c.variantName), ['Blue / S'], 'Red in S already exists, whatever the order');
+  assert.strictEqual(res2.skipped, 1);
 }
 
 async function serialRulesGuardEveryUnit() {
@@ -833,6 +969,8 @@ function returnHarness(opts: {
   salePaymentMethod?: PaymentMethod | null;
   /** The till the returner is on, as ShiftsService resolves it. */
   shiftId?: string | null;
+  /** No till resolved because several are open and none was named. */
+  tillsAmbiguous?: boolean;
   /** Lines whose product is batch-tracked. */
   batchTracked?: string[];
 }) {
@@ -866,12 +1004,14 @@ function returnHarness(opts: {
     payments: [] as any[],
     moves: [] as any[],
     batchesBack: [] as any[],
+    writtenOffFromBatches: [] as any[],
     stockBack: 0,
     transactions: 0,
   };
   const tx = {
     $queryRaw: async (strings: TemplateStringsArray, ...params: any[]) => {
       const sql = strings.join('?');
+      if (sql.includes('FROM "Shift"')) return [{ id: params[0] }]; // the till is open
       if (sql.includes('FROM "Sale"')) return [{ id: sale.id }];
       if (sql.includes('FROM "Customer"')) return [{ creditBalance: dec(state.balance) }];
       // The guarded bump: applied only while it stays within the line.
@@ -923,12 +1063,18 @@ function returnHarness(opts: {
         state.stockBack += moves.reduce((n, m) => n + m.quantity, 0);
       },
       returnSerialsToStock: async () => undefined,
+      // Every batch-tracked line is reported, so it counts against what the
+      // line drew; only restocked units go back into a batch.
       restoreBatchOnReturn: async (_tx: any, input: any) => {
-        state.batchesBack.push([input.productId, input.quantity]);
+        if (input.restock) state.batchesBack.push([input.productId, input.quantity]);
+        else state.writtenOffFromBatches.push([input.productId, input.quantity]);
       },
     }),
     stub<MailService>({}),
-    stub<ShiftsService>({ resolveShiftId: async () => opts.shiftId ?? null }),
+    stub<ShiftsService>({
+      resolveShiftId: async () => opts.shiftId ?? null,
+      tillFor: async () => ({ shiftId: opts.shiftId ?? null, ambiguous: !!opts.tillsAmbiguous }),
+    }),
     stub<PaymentsService>({
       record: async (input: any) => {
         state.payments.push(input);
@@ -1147,7 +1293,8 @@ async function aSupplierRefundIsOwedUntilReceived() {
     // Average cost: no shelf to read, so no cost changes.
     product: { findMany: async () => [] },
     stockItem: { groupBy: async () => [] },
-    $queryRaw: async (_sql: any, delta: string) => {
+    $queryRaw: async (sql: TemplateStringsArray, delta: string) => {
+      if (sql.join('?').includes('FROM "Purchase"')) return [{ id: purchase.id }]; // the row lock
       item.returnedQty = item.returnedQty.plus(delta);
       return [{ id: item.id }];
     },
@@ -1169,8 +1316,17 @@ async function aSupplierRefundIsOwedUntilReceived() {
       findUniqueOrThrow: async () => purchase,
     },
   };
+  // What the return reads before its transaction: the purchase as it was
+  // before a 500 payment landed. The money must come from the row it locks.
+  let beforePayment: any = { ...purchase, amountPaid: dec(0) };
   const prisma = stub<PrismaService>({
-    purchase: { findFirst: async () => purchase },
+    purchase: {
+      findFirst: async () => {
+        const read = beforePayment ?? purchase;
+        beforePayment = null; // only the return's first read is stale
+        return read;
+      },
+    },
     product: { findMany: async () => [] },
     $transaction: async (fn: any) => fn(tx),
   });
@@ -1180,7 +1336,8 @@ async function aSupplierRefundIsOwedUntilReceived() {
     stub<PaymentsService>({ record: async (input: any) => ledger.push(input) }),
   );
 
-  // Send 4 back: 200 of goods the supplier has been paid for.
+  // Send 4 back: 200 of goods the supplier has been paid for. Worked out from
+  // the copy read first, the 500 paid would have been written back to 0.
   const ret: any = await service.returnItems('b1', 'u1', 'pu1', {
     items: [{ purchaseItemId: 'pi1', quantity: 4 }],
   } as any);
@@ -1240,6 +1397,11 @@ async function damagedReturnsAreWrittenOff() {
     h.state.batchesBack,
     [['p-good', 1]],
     'the good unit rejoins a batch for expiry tracking; the written-off ones do not',
+  );
+  assert.deepStrictEqual(
+    h.state.writtenOffFromBatches,
+    [['p-broken', 2]],
+    'but they still count against the batches the line was sold from',
   );
   assert.strictEqual(h.state.payments[0].note, 'cracked in the box', 'the refund carries the reason');
 }
@@ -1369,13 +1531,15 @@ async function aPartPaymentKeepsItsTender() {
             create: async ({ data }: any) => (sale = { id: 'sale1', ...data }),
           },
           customer: { update: async () => ({}) },
+          // sh1 is still open.
+          $queryRaw: async () => [{ id: 'sh1' }],
         }),
     });
     const service = new SalesService(
       prisma,
       stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
       stub<MailService>({}),
-      stub<ShiftsService>({ resolveShiftId: async () => 'sh1' }),
+      stub<ShiftsService>({ tillFor: async () => ({ shiftId: 'sh1', ambiguous: false }) }),
       stub<PaymentsService>({ record: async (input: any) => payments.push(input) }),
     );
     await service.create(user, {
@@ -1403,6 +1567,522 @@ async function aPartPaymentKeepsItsTender() {
   // A client that names no tender for the part paid gets the counter default.
   const credit = await checkout(PaymentMethod.CREDIT, 100);
   assert.strictEqual(credit.payment.method, PaymentMethod.CASH);
+}
+
+/**
+ * An owner with no till of their own, at a store with two open, rings up a
+ * cash sale naming neither: the cash would be booked to no drawer, and the
+ * one that took it would count over at close. Refused, as a cash refund or a
+ * cash credit payment already is; a card sale has no drawer to get wrong.
+ */
+async function aCashSaleNamesItsTillWhenSeveralAreOpen() {
+  const sell = (paymentMethod: PaymentMethod) => {
+    let created = false;
+    const prisma = stub<PrismaService>({
+      store: { findFirst: async () => ({ id: 's1' }) },
+      business: { findUnique: async () => ({ taxEnabled: false, taxInclusive: false }) },
+      product: {
+        findMany: async () => [
+          { id: 'p1', name: 'Rice', sellingPrice: 100, costPrice: 60, taxRate: 0, isTaxable: false, isActive: true, isRxRequired: false, trackBatches: false, trackSerials: false },
+        ],
+      },
+      $transaction: async (fn: any) =>
+        fn({
+          sale: { findFirst: async () => null, create: async ({ data }: any) => ((created = true), { id: 'sale1', ...data }) },
+          $queryRaw: async () => [],
+        }),
+    });
+    const service = new SalesService(
+      prisma,
+      stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
+      stub<MailService>({}),
+      stub<ShiftsService>({ tillFor: async () => ({ shiftId: null, ambiguous: true }) }),
+      stub<PaymentsService>({ record: async () => undefined }),
+    );
+    return { result: service.create(user, { items: [{ productId: 'p1', quantity: 1 }], paymentMethod } as any), created: () => created };
+  };
+  const cash = sell(PaymentMethod.CASH);
+  await assert.rejects(cash.result, (e: any) => e.getResponse?.().code === 'TILL_CHOICE', 'cash with no till named is refused');
+  assert.strictEqual(cash.created(), false, 'and nothing is written');
+  const card = sell(PaymentMethod.CARD);
+  await card.result;
+  assert.strictEqual(card.created(), true, 'a card sale has no drawer to get wrong');
+}
+
+/**
+ * A till closed while a sale was on its way takes no more money.
+ *
+ * The sale picks its till before its transaction starts. If the drawer is
+ * counted and closed in between, the sale used to land on the closed shift
+ * anyway: in its gross, missing from its expected cash, and the Z report over
+ * or short with nothing to say why. Now the sale is refused and nothing is
+ * written.
+ */
+async function aClosedTillTakesNoMoreMoney() {
+  const attempt = async (tillOpen: boolean) => {
+    const written: string[] = [];
+    const locked: string[] = [];
+    const prisma = stub<PrismaService>({
+      store: { findFirst: async () => ({ id: 's1' }) },
+      business: { findUnique: async () => ({ taxEnabled: false, taxInclusive: false }) },
+      product: {
+        findMany: async () => [
+          { id: 'p1', name: 'Tea', sellingPrice: 50, costPrice: 30, taxRate: 0, isTaxable: false, isActive: true, isRxRequired: false, trackBatches: false, trackSerials: false },
+        ],
+      },
+      $transaction: async (fn: any) =>
+        fn({
+          $queryRaw: async (sql: TemplateStringsArray, ...params: any[]) => {
+            assert.ok(sql.join('?').includes('FOR SHARE'), 'the till row is held, not just read');
+            locked.push(params[0]);
+            return tillOpen ? [{ id: params[0] }] : [];
+          },
+          sale: {
+            findFirst: async () => null,
+            create: async ({ data }: any) => {
+              written.push('sale');
+              return { id: 'sale1', ...data, items: [] };
+            },
+          },
+        }),
+    });
+    const service = new SalesService(
+      prisma,
+      stub<InventoryService>({ applyMovementsBatch: async () => undefined }),
+      stub<MailService>({}),
+      stub<ShiftsService>({ tillFor: async () => ({ shiftId: 'sh1', ambiguous: false }) }),
+      stub<PaymentsService>({ record: async () => written.push('payment') }),
+    );
+    const result = service.create(user, { items: [{ productId: 'p1', quantity: 1 }] } as any);
+    return { result, written, locked };
+  };
+
+  const open = await attempt(true);
+  await open.result;
+  assert.deepStrictEqual(open.locked, ['sh1'], 'the sale holds its till open while it writes');
+  assert.ok(open.written.includes('sale'));
+
+  const closed = await attempt(false);
+  await assert.rejects(
+    closed.result,
+    (e: any) => e.getStatus() === 409 && e.getResponse().code === 'SHIFT_CLOSED',
+    'a sale for a till closed since it was picked is refused',
+  );
+  assert.deepStrictEqual(closed.written, [], 'and writes neither the sale nor its payment');
+}
+
+/**
+ * A cashier works on the till open at their own counter -- an owner may have
+ * opened it first -- and only that one: it is what they sell into, move cash
+ * on and may close. Another counter's till stays someone else's.
+ */
+async function aCashierWorksOnTheTillAtTheirCounter() {
+  const cashier: AuthUser = { ...user, userId: 'u2', role: 'CASHIER' as AuthUser['role'] };
+  const shifts = [
+    { id: 'sh-owner', userId: 'owner1', counterId: 'c1', storeId: 's1' },
+    { id: 'sh-other', userId: 'owner2', counterId: 'c2', storeId: 's1' },
+  ];
+  const service = new ShiftsService(
+    stub<PrismaService>({
+      user: { findUnique: async () => ({ counterId: 'c1' }) },
+      shift: {
+        findFirst: async ({ where }: any) => {
+          if (where.userId) return null; // no till of their own
+          if (where.id) return shifts.find((sh) => sh.id === where.id) ?? null;
+          return shifts.find((sh) => sh.counterId === where.counterId) ?? null;
+        },
+      },
+    }),
+    stub<PaymentsService>({}),
+  );
+  assert.strictEqual(await service.resolveShiftId(cashier, 's1'), 'sh-owner', 'their counter’s till is theirs to sell into');
+  assert.strictEqual(await service.joinable(cashier, 'sh-owner'), 'sh-owner');
+  await assert.rejects(
+    service.joinable(cashier, 'sh-other'),
+    (e: any) => e.getStatus() === 403,
+    'another counter’s till is not',
+  );
+}
+
+/**
+ * Two owners at the store's one counter, opening at once: only one shift
+ * opens and the other is sent to work on it. Without the per-store lock both
+ * found the counter free and both opened it.
+ */
+async function twoOwnersOpenOneTill() {
+  const owner1: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  const owner2: AuthUser = { ...user, userId: 'owner2', role: 'MANAGER' as AuthUser['role'] };
+  const open: any[] = [];
+  // Lets the other request run between every read and write, the way two
+  // requests interleave on a real server.
+  const yieldTurn = () => new Promise((r) => setImmediate(r));
+  const db: any = {
+    store: { findFirst: async () => ({ id: 's1' }) },
+    counter: {
+      findMany: async () => [{ id: 'c1', name: 'Counter 1', isActive: true }],
+      findFirst: async () => ({ id: 'c1', name: 'Counter 1', isActive: true }),
+      count: async () => 1,
+    },
+    shift: {
+      findFirst: async (args: any) => {
+        await yieldTurn();
+        if (args.where.closedAt !== null) return null; // nothing closed before
+        const hit = open.find((sh) =>
+          args.where.userId ? sh.userId === args.where.userId : sh.counterId === args.where.counterId,
+        );
+        return hit ? { ...hit, user: { name: hit.name }, counter: { name: 'Counter 1' } } : null;
+      },
+      create: async ({ data }: any) => {
+        await yieldTurn();
+        const row = { id: `sh-${data.userId}`, ...data, name: data.userId };
+        open.push(row);
+        return row;
+      },
+    },
+  };
+  // pg_advisory_xact_lock: held from the call to the end of the transaction.
+  let queue = Promise.resolve();
+  db.$transaction = async (fn: (tx: unknown) => unknown) => {
+    let release = () => {};
+    const tx = {
+      ...db,
+      $executeRaw: async (sql: TemplateStringsArray, ...params: any[]) => {
+        assert.ok(sql.join('?').includes('pg_advisory_xact_lock'));
+        assert.strictEqual(params[0], 'shift-open:s1', 'locked per store');
+        const prev = queue;
+        queue = new Promise<void>((r) => (release = r));
+        await prev;
+        return 0;
+      },
+    };
+    try {
+      return await fn(tx);
+    } finally {
+      release();
+    }
+  };
+  const service = new ShiftsService(stub<PrismaService>(db), stub<PaymentsService>({}));
+
+  const results = await Promise.allSettled([
+    service.open(owner1, { storeId: 's1', openingFloat: 1000 }),
+    service.open(owner2, { storeId: 's1', openingFloat: 1000 }),
+  ]);
+  assert.strictEqual(open.length, 1, 'one counter, one drawer');
+  const refused = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+  assert.ok(refused, 'the second owner is not given a drawer of their own');
+  assert.strictEqual(refused.reason.getResponse().code, 'COUNTER_BUSY', 'they are sent to work on it');
+}
+
+/**
+ * A cashier reads only their own shift reports. They can't join anyone
+ * else's till, and a colleague's report would show that drawer's expected
+ * cash and variance to anyone holding its id -- which every sale carries.
+ */
+async function aCashierReadsOnlyTheirOwnShift() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  const theirs = {
+    id: 'sh-other', businessId: 'b1', userId: 'u9', counterId: 'c2', openedAt: new Date(), closedAt: null,
+    openingFloat: 1000, expectedCash: null, countedCash: null, variance: null,
+    refundsAtClose: null, carriedFloat: null, cashLeft: null,
+    business: { shiftBlindClose: false, shiftVarianceNoteOver: null }, cashMovements: [],
+  };
+  const service = new ShiftsService(
+    stub<PrismaService>({
+      // The cashier works Counter 1; the colleague's till is at Counter 2.
+      user: { findUnique: async () => ({ counterId: 'c1' }) },
+      shift: {
+        findFirst: async ({ where }: any) =>
+          where.id === theirs.id &&
+          (!where.userId || where.userId === theirs.userId) &&
+          (!where.counterId || where.counterId === theirs.counterId)
+            ? theirs
+            : null,
+      },
+      sale: { findMany: async () => [] },
+      cashMovement: { findMany: async () => [] },
+    }),
+    stub<PaymentsService>({
+      cashCollectedOnShift: async () => 0,
+      cashRefundedOnShift: async () => 0,
+    }),
+  );
+  await assert.rejects(
+    service.report('b1', 'sh-other', user),
+    (e: any) => e.getStatus() === 404,
+    "a cashier can't read a colleague's drawer, nor learn that it exists",
+  );
+  const seen: any = await service.report('b1', 'sh-other', owner);
+  assert.strictEqual(seen.expectedCash, 1000, 'management still reads every till');
+}
+
+/**
+ * Cash never moves through an unnamed till while several are open. An owner
+ * with none of their own, at a store with two running, used to have a cash
+ * refund (or cash taken against credit) booked to no till: the drawer it
+ * really went through then counted short (or over) at close, and the cashier
+ * answered for it.
+ */
+async function cashNeedsANamedTill() {
+  const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
+  // The rule itself: two open, none the owner's, none named.
+  const open = [{ id: 'sh-a', userId: 'u2' }, { id: 'sh-b', userId: 'u3' }];
+  const shifts = new ShiftsService(
+    stub<PrismaService>({
+      // The cashier below has no counter, so no till waits for them either.
+      user: { findUnique: async () => ({ counterId: null }) },
+      shift: {
+        findFirst: async (args: any) =>
+          args.where.id
+            ? (open.find((sh) => sh.id === args.where.id) ?? null)
+            : (open.find((sh) => sh.userId === args.where.userId) ?? null),
+        findMany: async () => open,
+      },
+    }),
+    stub<PaymentsService>({}),
+  );
+  assert.deepStrictEqual(await shifts.tillFor(owner, 's1'), { shiftId: null, ambiguous: true });
+  assert.deepStrictEqual(await shifts.tillFor(owner, 's1', 'sh-b'), { shiftId: 'sh-b', ambiguous: false });
+  assert.deepStrictEqual(
+    await shifts.tillFor({ ...user, userId: 'u9' }, 's1'),
+    { shiftId: null, ambiguous: false },
+    'a cashier with no till is simply on none',
+  );
+
+  // A cash refund in that state is refused, and nothing is written.
+  const build = () =>
+    returnHarness({
+      sale: { subtotal: 100, total: 100, amountPaid: 100 },
+      items: [{ id: 'tea', quantity: 1, lineTotal: 100 }],
+      salePaymentMethod: PaymentMethod.CASH,
+      tillsAmbiguous: true,
+    });
+  const cash = build();
+  await assert.rejects(
+    cash.ret([['tea', 1]], { items: [{ saleItemId: 'tea', quantity: 1 }] }),
+    (e: any) => e.getStatus() === 409 && e.getResponse().code === 'TILL_CHOICE' && /comes out of/.test(e.message),
+    'a cash refund names the till it comes out of',
+  );
+  assert.strictEqual(cash.state.payments.length, 0, 'and no refund is recorded');
+  // Back on the card: no drawer involved, so nothing to choose.
+  const card = build();
+  const res = await card.ret([['tea', 1]], {
+    refundMethod: PaymentMethod.CARD,
+    items: [{ saleItemId: 'tea', quantity: 1 }],
+  });
+  assert.strictEqual(res.refund, 100, 'a card refund goes through');
+}
+
+const utcDay = (iso: string) => new Date(`${iso}T00:00:00Z`);
+
+/**
+ * A sale says which batch its units came out of, and a return puts them back
+ * there. Before, the return guessed the earliest-expiring batch -- often one
+ * already expired, which the sale had skipped -- so a good unit was filed
+ * under it and later written off with it.
+ */
+async function aReturnGoesBackToTheBatchItCameFrom() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  // As the database orders them: expiry ascending, undated last.
+  const shelf = () => [
+    { id: 'A', productId: 'p1', expiryDate: utcDay('2020-01-01'), quantity: dec(5) }, // expired
+    { id: 'B', productId: 'p1', expiryDate: utcDay('2099-01-01'), quantity: dec(2) },
+    { id: 'C', productId: 'p1', expiryDate: null, quantity: dec(4) },
+  ];
+  const fefoDb: any = { batch: { findMany: async () => shelf() }, $executeRaw: async () => 0 };
+  const inventory = new InventoryService(stub<PrismaService>(fefoDb));
+  assert.deepStrictEqual(
+    await inventory.consumeBatchesFEFO(fefoDb, 's1', [{ productId: 'p1', quantity: 3 }]),
+    [[{ batchId: 'B', quantity: 2 }, { batchId: 'C', quantity: 1 }]],
+    'a sale draws in-date stock first and reports what it took',
+  );
+
+  const run = async (
+    drawn: { id: string; batchId: string; quantity: number; returnedQty: number; expiryDate: Date | null }[],
+    input: { quantity: number; restock: boolean; soldAt?: Date },
+  ) => {
+    const batchesBack: [string, number][] = [];
+    const rowsBack: [string, number][] = [];
+    const db: any = {
+      saleItemBatch: {
+        findMany: async () =>
+          drawn.map((d) => ({ ...d, quantity: dec(d.quantity), returnedQty: dec(d.returnedQty), batch: { expiryDate: d.expiryDate } })),
+        update: async ({ where, data }: any) => rowsBack.push([where.id, Number(data.returnedQty.increment)]),
+      },
+      batch: {
+        findMany: async () => shelf().map(({ id, expiryDate }) => ({ id, expiryDate })),
+        update: async ({ where, data }: any) => batchesBack.push([where.id, Number(data.quantity.increment)]),
+      },
+    };
+    await inventory.restoreBatchOnReturn(db, {
+      storeId: 's1',
+      productId: 'p1',
+      saleItemId: 'line1',
+      soldAt: input.soldAt ?? utcDay('2021-06-01'),
+      quantity: input.quantity,
+      restock: input.restock,
+    });
+    return { batchesBack, rowsBack };
+  };
+
+  const drawn = [
+    { id: 'r-c', batchId: 'C', quantity: 1, returnedQty: 0, expiryDate: null },
+    { id: 'r-b', batchId: 'B', quantity: 2, returnedQty: 1, expiryDate: utcDay('2099-01-01') },
+  ];
+  const back = await run(drawn, { quantity: 2, restock: true });
+  assert.deepStrictEqual(back.batchesBack, [['B', 1], ['C', 1]], 'back to the batches it was sold from, soonest first, never past what each gave');
+  assert.deepStrictEqual(back.rowsBack, [['r-b', 1], ['r-c', 1]]);
+
+  const broken = await run(drawn, { quantity: 1, restock: false });
+  assert.deepStrictEqual(broken.batchesBack, [], 'a unit written off on return reaches no batch');
+  assert.deepStrictEqual(broken.rowsBack, [['r-b', 1]], 'but counts against what the line drew');
+
+  // A line that drew from an expired batch as well as an in-date one. Sorted
+  // by date alone the expired one came first, and a good unit put back on the
+  // shelf was filed under it -- to be written off with it.
+  const mixed = [
+    { id: 'r-a', batchId: 'A', quantity: 1, returnedQty: 0, expiryDate: utcDay('2020-01-01') },
+    { id: 'r-b', batchId: 'B', quantity: 2, returnedQty: 0, expiryDate: utcDay('2099-01-01') },
+  ];
+  const good = await run(mixed, { quantity: 1, restock: true });
+  assert.deepStrictEqual(good.batchesBack, [['B', 1]], 'a good unit goes back into the in-date batch, not the expired one');
+  const bad = await run(mixed, { quantity: 1, restock: false });
+  assert.deepStrictEqual(bad.rowsBack, [['r-a', 1]], 'a unit written off on return counts against the expired batch first');
+
+  // A sale from before batches were recorded: inferred as the one the till
+  // sold from that day -- B, in date -- not A, already expired by then.
+  const legacy = await run([], { quantity: 1, restock: true });
+  assert.deepStrictEqual(legacy.batchesBack, [['B', 1]], 'an old sale is put back into in-date stock, not the expired batch');
+}
+
+/**
+ * A return can write goods off as expired, not only damaged, so Money Leaks
+ * reports what actually happened to them.
+ */
+async function aReturnCanBeWrittenOffAsExpired() {
+  const build = () =>
+    returnHarness({
+      sale: { subtotal: 200, total: 200, amountPaid: 200 },
+      items: [{ id: 'milk', quantity: 2, lineTotal: 200 }],
+      salePaymentMethod: PaymentMethod.CASH,
+      batchTracked: ['milk'],
+    });
+  const h = build();
+  await h.ret([['milk', 2]], {
+    reason: 'sour',
+    items: [{ saleItemId: 'milk', quantity: 2, writeOffReason: 'EXPIRED' }],
+  });
+  assert.deepStrictEqual(
+    h.state.moves.map((m) => [m.type, m.quantity, m.reason ?? null, m.note]),
+    [
+      ['RETURN_IN', 2, null, 'sour'],
+      ['ADJUSTMENT', -2, 'EXPIRED', 'Returned expired: sour'],
+    ],
+    'booked back in and written off as expired',
+  );
+  assert.strictEqual(h.state.stockBack, 0, 'nothing reaches the shelf');
+  assert.deepStrictEqual(h.state.writtenOffFromBatches, [['p-milk', 2]]);
+
+  await assert.rejects(
+    build().ret([['milk', 1]], {
+      items: [{ saleItemId: 'milk', quantity: 1, restock: true, writeOffReason: 'EXPIRED' }],
+    }),
+    /can’t also go back on the shelf/,
+    'a line cannot be both restocked and written off',
+  );
+}
+
+/**
+ * A product keeping one expiry date on itself moves onto batches when a
+ * delivery brings another date, instead of the old units taking the new one.
+ */
+async function aSecondDateMovesAProductOntoBatches() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  const product: any = { businessId: 'b1', trackBatches: false, expiryDate: utcDay('2026-11-01'), costPrice: dec(40) };
+  const batches: any[] = [];
+  const stockItems: any[] = [
+    // 10 old units at s1 plus the 6 just delivered; 3 old units at s2, marked down.
+    { storeId: 's1', quantity: dec(16), clearancePrice: null, clearanceFor: null },
+    { storeId: 's2', quantity: dec(3), clearancePrice: dec(30), clearanceFor: utcDay('2026-11-01') },
+  ];
+  const db: any = {
+    product: {
+      findUniqueOrThrow: async () => product,
+      update: async ({ data }: any) => Object.assign(product, data),
+    },
+    stockItem: {
+      findMany: async () => stockItems,
+      updateMany: async ({ data }: any) => stockItems.forEach((s) => Object.assign(s, data)),
+    },
+    batch: {
+      groupBy: async () => [],
+      findFirst: async ({ where }: any) =>
+        batches.find((b) => b.storeId === where.storeId && b.expiryDate?.getTime() === where.expiryDate?.getTime()) ?? null,
+      create: async ({ data }: any) => batches.push({ ...data, clearancePrice: null }),
+      update: async () => undefined,
+      updateMany: async ({ where, data }: any) =>
+        batches.filter((b) => b.storeId === where.storeId).forEach((b) => Object.assign(b, data)),
+    },
+  };
+  await convertToBatches(db, 'p1', { storeId: 's1', quantity: 6 });
+  assert.deepStrictEqual(
+    batches.map((b) => [b.storeId, Number(b.quantity), b.expiryDate.toISOString().slice(0, 10), b.clearancePrice && Number(b.clearancePrice)]),
+    [
+      ['s1', 10, '2026-11-01', null],
+      ['s2', 3, '2026-11-01', 30],
+    ],
+    'the stock already on hand keeps its date, as a batch; the delivery is left for its own',
+  );
+  assert.strictEqual(product.trackBatches, true);
+  assert.strictEqual(product.expiryDate, null, 'no product-level date left to count the same stock twice');
+  assert.ok(stockItems.every((s) => s.clearancePrice === null), 'the markdown moved onto the batch');
+
+  // Already on batches: nothing to do.
+  const before = batches.length;
+  await convertToBatches(db, 'p1');
+  assert.strictEqual(batches.length, before);
+}
+
+/** A markdown is a price below the shelf price, for stock still in date. */
+async function clearanceIsForStockStillInDate() {
+  const dec = (v: number) => new Prisma.Decimal(v);
+  const writes: any[] = [];
+  const build = (batch: any, product: any = {}) =>
+    new InventoryService(
+      stub<PrismaService>({
+        store: { findFirst: async () => ({ id: 's1' }) },
+        product: {
+          findFirst: async () => ({ id: 'p1' }),
+          findUniqueOrThrow: async () => ({ sellingPrice: dec(100), expiryDate: null, trackBatches: true, ...product }),
+        },
+        batch: {
+          findFirst: async () => batch,
+          update: async ({ data }: any) => writes.push(['batch', data.clearancePrice]),
+        },
+        stockItem: {
+          updateMany: async ({ data }: any) => {
+            writes.push(['stock', data.clearancePrice, data.clearanceFor?.toISOString().slice(0, 10) ?? null]);
+            return { count: 1 };
+          },
+        },
+      }),
+    );
+  const soon = { id: 'b1', expiryDate: utcDay('2099-01-01'), quantity: dec(4) };
+  const dto = (price: number | null, batchId?: string) => ({ storeId: 's1', productId: 'p1', batchId, price });
+
+  await build(soon).setClearance('b1', dto(80, 'b1'));
+  await assert.rejects(build(soon).setClearance('b1', dto(100, 'b1')), /below the selling price/);
+  await assert.rejects(
+    build({ ...soon, expiryDate: utcDay('2020-01-01') }).setClearance('b1', dto(50, 'b1')),
+    /already expired/,
+  );
+  await build({ ...soon, expiryDate: utcDay('2020-01-01') }).setClearance('b1', dto(null, 'b1'));
+  // A product's own date: the markdown is pinned to that date.
+  await build(null, { trackBatches: false, expiryDate: utcDay('2099-03-01') }).setClearance('b1', dto(60));
+  assert.deepStrictEqual(writes, [
+    ['batch', 80],
+    ['batch', null],
+    ['stock', 60, '2099-03-01'],
+  ], 'an expired batch can still have its markdown ended');
 }
 
 /**
@@ -1562,6 +2242,7 @@ async function aStaleReadCannotOverReturnALine() {
           // The sale lock. The read after it is the stale one here: that
           // lock is what normally prevents this, and the guard below is what
           // still holds if it ever doesn't.
+          if (sql.join('?').includes('FROM "Shift"')) return [{ id: params[0] }];
           if (sql.join('?').includes('FROM "Sale"')) return [{ id: 'sale1' }];
           const delta = new Prisma.Decimal(params[0]);
           if (committed.returnedQty.plus(delta).greaterThan(committed.quantity)) {
@@ -1586,7 +2267,10 @@ async function aStaleReadCannotOverReturnALine() {
     prisma,
     inventory,
     stub<MailService>({}),
-    stub<ShiftsService>({ resolveShiftId: async () => null }),
+    stub<ShiftsService>({
+      resolveShiftId: async () => null,
+      tillFor: async () => ({ shiftId: null, ambiguous: false }),
+    }),
     stub<PaymentsService>({ record: async () => undefined }),
   );
 
@@ -1871,6 +2555,67 @@ async function principalCacheCannotResurrectARetiredToken() {
     stillOk.email,
     principal.email,
     'a stale cache entry must not reject a valid newer token',
+  );
+}
+
+/**
+ * A cashier brought back must have a counter in use: they only ever open
+ * their own, and reactivated without one they found out at the till.
+ */
+async function aCashierComesBackWithACounter() {
+  const target = { id: 'u7', name: 'Hari', role: 'CASHIER', isActive: false, storeId: 's1', counterId: null as string | null };
+  let saved: any = null;
+  const service = (counter: { storeId: string; isActive: boolean; name: string } | null) =>
+    new UsersService(
+      // Saving onto a counter runs in a transaction under the store's lock.
+      stub<PrismaService>(withTx({
+        user: {
+          findFirst: async () => target,
+          update: async (args: any) => (saved = args.data),
+        },
+        counter: { findFirst: async () => counter },
+      })),
+      stub<PrincipalCache>({ evict: () => undefined }),
+    );
+  await assert.rejects(
+    service(null).update('b1', 'u7', { isActive: true }, 'OWNER' as any, 'owner1'),
+    /Hari has no counter/,
+    'no counter: choose one first',
+  );
+  target.counterId = 'c2';
+  await assert.rejects(
+    service({ storeId: 's1', isActive: false, name: 'Counter 2' }).update('b1', 'u7', { isActive: true }, 'OWNER' as any, 'owner1'),
+    /Counter 2 is no longer in use/,
+    'a counter taken out of use while they were away',
+  );
+  await service({ storeId: 's1', isActive: true, name: 'Counter 2' }).update('b1', 'u7', { isActive: true }, 'OWNER' as any, 'owner1');
+  assert.strictEqual(saved.isActive, true, 'with a counter in use, they are back');
+}
+
+/**
+ * Deleting a business clears its counters before the business: a store
+ * can't be deleted while a counter points at it, and every store has one.
+ */
+async function deletingABusinessClearsItsCounters() {
+  const steps: string[] = [];
+  const tx: any = new Proxy({}, {
+    get: (_t, model: string) => ({
+      deleteMany: async () => steps.push(`${model}.deleteMany`),
+      delete: async () => steps.push(`${model}.delete`),
+    }),
+  });
+  const service = new PlatformService(
+    stub<PrismaService>({
+      business: { findUnique: async () => ({ id: 'b1', name: 'Shop', _count: {} }) },
+      $transaction: async (fn: any) => fn(tx),
+    }),
+    stub<MailService>({}), stub<PlatformAuditService>({ record: async () => undefined }), stub<SubscriptionRemindersService>({}),
+    stub<PlatformBillingService>({}), stub<BusinessService>({}), stub<AuthService>({}), stub<SettingsService>({}),
+  );
+  await service.deleteBusiness({} as any, 'b1', { confirmName: 'Shop' });
+  assert.ok(
+    steps.indexOf('counter.deleteMany') >= 0 && steps.indexOf('counter.deleteMany') < steps.indexOf('business.delete'),
+    `counters go before the business: ${steps.join(', ')}`,
   );
 }
 
@@ -3785,7 +4530,9 @@ async function reminderGoesOutOncePerThreshold() {
 /**
  * An owner joins the cashier's drawer rather than opening a second one for
  * the same physical till -- but never guesses which when more than one is
- * running, and never lets a cashier onto someone else's.
+ * running, and never lets a cashier onto a till that isn't at their counter.
+ * (Here the cashier has no counter; aCashierWorksOnTheTillAtTheirCounter
+ * covers the till at theirs.)
  */
 async function anOwnerJoinsTheTillAlreadyOpen() {
   const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
@@ -3795,6 +4542,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
   const build = (open: { id: string; userId: string }[]) =>
     new ShiftsService(
       stub<PrismaService>({
+        user: { findUnique: async () => ({ counterId: null }) },
         shift: {
           // resolveShiftId asks for the caller's own shift first.
           findFirst: async (args: any) => {
@@ -3840,7 +4588,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
   assert.strictEqual(
     await build([other]).resolveShiftId(cashier, 's1'),
     null,
-    'a cashier is never put on a till someone else opened',
+    'a cashier is never put on a till someone else opened, away from their counter',
   );
 
   await assert.rejects(
@@ -3851,7 +4599,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
 
   await assert.rejects(
     build([ramesh]).resolveShiftId(owner, 's1', 'sh-closed'),
-    /No open shift/,
+    (e: any) => e.getResponse().code === 'SHIFT_CLOSED',
     'a remembered till that has since closed is refused, not silently swapped',
   );
 
@@ -3872,6 +4620,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
 async function everyPaymentLeavesATrail() {
   const recorded: any[] = [];
   let balance = 500;
+  let tillOpen = true;
 
   const makeService = () => {
     const prisma = stub<PrismaService>({
@@ -3890,6 +4639,8 @@ async function everyPaymentLeavesATrail() {
       // the stub just runs the callback, and the assertions below check that
       // a failure part-way leaves nothing behind.
       $transaction: async (fn: any) => fn(prisma),
+      // holdShiftOpen: the till's row, while it is open.
+      $queryRaw: async () => (tillOpen ? [{ id: 'sh1' }] : []),
     });
     const payments = stub<PaymentsService>({
       record: async (input: any) => {
@@ -3913,6 +4664,18 @@ async function everyPaymentLeavesATrail() {
   assert.strictEqual(recorded[0].amount, 200, 'amount recorded positive');
   assert.strictEqual(recorded[0].method, 'CARD', 'method carried through, not defaulted');
   assert.strictEqual(recorded[0].shiftId, 'sh1', 'attributed to the till that took it');
+
+  // The till was counted and closed between picking it and paying in: the
+  // cash would never reach a Z report, so nothing is taken.
+  tillOpen = false;
+  await assert.rejects(
+    service.payCredit('b1', 'c1', 50, { userId: 'u1', shiftId: 'sh1' }),
+    (e: any) => e.getStatus() === 409 && e.getResponse().code === 'SHIFT_CLOSED',
+    'cash is not booked into a closed till',
+  );
+  assert.strictEqual(balance, 300, 'and the customer still owes it');
+  assert.strictEqual(recorded.length, 1);
+  tillOpen = true;
 
   // Overpaying must move nothing and record nothing.
   await assert.rejects(
@@ -4633,6 +5396,16 @@ async function main() {
   await aPinnedCashierReturnsOnlyAtTheirStore();
   await aProductChargesTheTaxItShows();
   await aPartPaymentKeepsItsTender();
+  await aCashSaleNamesItsTillWhenSeveralAreOpen();
+  await aClosedTillTakesNoMoreMoney();
+  await twoOwnersOpenOneTill();
+  await aCashierWorksOnTheTillAtTheirCounter();
+  await aCashierReadsOnlyTheirOwnShift();
+  await cashNeedsANamedTill();
+  await aReturnGoesBackToTheBatchItCameFrom();
+  await aReturnCanBeWrittenOffAsExpired();
+  await aSecondDateMovesAProductOntoBatches();
+  await clearanceIsForStockStillInDate();
   aShopAlwaysTakesCash();
   await aPlanLimitsBranches();
   await devMailGoesToOneInbox();
@@ -4649,6 +5422,8 @@ async function main() {
   await freeTextIsBounded();
   await principalCacheCannotResurrectARetiredToken();
   await permanentDeleteRefusesToDestroyHistory();
+  await aCashierComesBackWithACounter();
+  await deletingABusinessClearsItsCounters();
   staffCannotReachAnotherStore();
   await productStoresCannotSilentlyWriteOffStock();
   await anAdminPasswordResetEndsTheirSessions();

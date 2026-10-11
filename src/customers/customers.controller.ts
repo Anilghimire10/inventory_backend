@@ -26,7 +26,7 @@ import {
 } from 'class-validator';
 import { PaymentMethod, UserRole } from '@prisma/client';
 import { CustomersService } from './customers.service';
-import { ShiftsService } from '../shifts/shifts.service';
+import { ShiftsService, chooseTill } from '../shifts/shifts.service';
 import { PaymentsService, SETTLE_METHODS } from '../payments/payments.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -125,9 +125,10 @@ export class CustomersController {
     return this.customers.findAll(u.businessId, q);
   }
 
+  /** The customer, with purchase totals and their latest sales. */
   @Get(':id')
   findOne(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.customers.findOne(u.businessId, id);
+    return this.customers.details(u.businessId, id, scopeToStore(u));
   }
 
   @Patch(':id')
@@ -165,10 +166,16 @@ export class CustomersController {
     // the same rule the POS uses, so an owner working on a cashier's till
     // books it to that cashier's drawer -- which is where the notes went.
     // With two tills open and none of their own, there is no safe guess;
-    // the client asks and sends the choice as `shiftId`.
-    const shiftId = storeId
-      ? await this.shifts.resolveShiftId(u, storeId, dto.shiftId)
-      : null;
+    // the client asks and sends the choice as `shiftId`. Cash arriving
+    // without one is refused: booked to no till, the drawer it went into
+    // would count over at close.
+    const till = storeId
+      ? await this.shifts.tillFor(u, storeId, dto.shiftId)
+      : { shiftId: null, ambiguous: false };
+    if (till.ambiguous && (dto.method ?? PaymentMethod.CASH) === PaymentMethod.CASH) {
+      throw chooseTill('in');
+    }
+    const shiftId = till.shiftId;
 
     return this.customers.payCredit(u.businessId, id, dto.amount, {
       method: dto.method,

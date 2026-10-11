@@ -29,4 +29,10 @@ export class CreateUserDto {
   @IsString()
   @MaxLength(64)
   storeId?: string;
+
+  @ApiPropertyOptional({ description: 'The counter a cashier works at; required for a cashier' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  counterId?: string;
 }

@@ -39,4 +39,10 @@ export class UpdateUserDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  @ApiPropertyOptional({ description: 'The counter a cashier works at; required for a cashier' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  counterId?: string | null;
 }

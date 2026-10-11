@@ -33,10 +33,16 @@ export class OpenShiftDto {
 
   @ApiPropertyOptional({
     description:
-      'Owner/manager only: open a second shift at a store where a till is ' +
-      'already open. Only right when this counter has its own cash drawer; ' +
-      'otherwise join the open till.',
+      'The counter to open. A cashier always opens their own; an owner or ' +
+      'manager names one when the store has more than one.',
   })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  counterId?: string;
+
+  /** No longer used -- choosing a counter replaced it. Accepted so older apps still open a shift. */
+  @ApiPropertyOptional({ deprecated: true })
   @IsOptional()
   @IsBoolean()
   separateDrawer?: boolean;

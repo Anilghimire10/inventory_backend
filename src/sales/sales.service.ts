@@ -14,14 +14,14 @@ import {
   StockMovementType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { ShiftsService } from '../shifts/shifts.service';
+import { ShiftsService, chooseTill, holdShiftOpen } from '../shifts/shifts.service';
 import { PaymentsService, SETTLE_METHODS } from '../payments/payments.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { MailService } from '../mail/mail.service';
 import { AuthUser } from '../common/types/auth-user';
 import { CreateSaleDto, SaleItemDto } from './dto/create-sale.dto';
 import { HoldSaleDto } from './dto/hold-sale.dto';
-import { ReturnSaleDto } from './dto/return-sale.dto';
+import { ReturnItemDto, ReturnSaleDto } from './dto/return-sale.dto';
 import { QuerySaleDto } from './dto/query-sale.dto';
 import { paginate } from '../common/dto/pagination.dto';
 import { TX_OPTS } from '../common/prisma-tx';
@@ -50,6 +50,16 @@ export interface ReturnLine {
 const round2 = (n: number) => Math.round(n * 100) / 100;
 /** Quantities are numeric(12,3) — keep float arithmetic on that grid. */
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+/**
+ * Why a returned line goes straight to write-off, or null when it goes back
+ * on the shelf. `restock: false` on its own is damage, as it always was;
+ * naming a reason writes off with that reason.
+ */
+function writtenOff(r: ReturnItemDto): AdjustmentReason | null {
+  if (r.writeOffReason) return r.writeOffReason;
+  return r.restock === false ? AdjustmentReason.DAMAGE : null;
+}
 
 @Injectable()
 export class SalesService {
@@ -111,11 +121,12 @@ export class SalesService {
     // two branches could ring up a sale at one and have it stamped onto the
     // other branch's drawer. Both Z reports were then wrong, and neither had
     // anything in it to show why.
-    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive, businessType }, shiftId] =
+    const [{ lines, subtotal, tax, billDiscount, total, taxInclusive, businessType }, till] =
       await Promise.all([
         this.buildLines(businessId, storeId, dto),
-        this.shifts.resolveShiftId(user, storeId, dto.shiftId),
+        this.shifts.tillFor(user, storeId, dto.shiftId),
       ]);
+    const shiftId = till.shiftId;
 
     // A pharmacy can't sell expired stock. Other shops get a warning at the
     // till and may go ahead; this is the one place that refuses outright.
@@ -173,9 +184,23 @@ export class SalesService {
     const tender = SETTLE_METHODS.includes(requestedMethod)
       ? requestedMethod
       : PaymentMethod.CASH;
+    // Cash into an unnamed drawer, with several open: booked to none, the
+    // drawer that took it counts over at close. The POS always names its
+    // till; this holds the rule for any other caller, as returns and credit
+    // payments already do.
+    if (till.ambiguous && amountPaid > 0 && tender === PaymentMethod.CASH) {
+      throw chooseTill('in');
+    }
 
     return this.createWithReceiptRetry(async () => this.prisma.$transaction(async (tx) => {
+      // The till was resolved before this transaction; it may have been
+      // counted and closed since. Hold it open until this sale is in.
+      await holdShiftOpen(tx, shiftId);
       const receiptNo = await this.nextReceiptNo(tx, businessId);
+      // Named here rather than left to the database, so the batches each
+      // line draws below can be recorded against it. Fresh per attempt: a
+      // receipt-number retry runs this whole callback again.
+      const lineIds = lines.map(() => randomUUID());
 
       const sale = await tx.sale.create({
         data: {
@@ -196,7 +221,8 @@ export class SalesService {
           prescriptionRef: dto.prescriptionRef,
           note: dto.note,
           items: {
-            create: lines.map((l) => ({
+            create: lines.map((l, i) => ({
+              id: lineIds[i],
               productId: l.productId,
               name: l.name,
               quantity: l.quantity,
@@ -246,13 +272,25 @@ export class SalesService {
           reference: sale.id,
         })),
       );
-      const batchTracked = lines.filter((l) => l.trackBatches);
+      const batchTracked = lines
+        .map((l, i) => ({ ...l, saleItemId: lineIds[i] }))
+        .filter((l) => l.trackBatches);
       if (batchTracked.length) {
-        await this.inventory.consumeBatchesFEFO(
+        const taken = await this.inventory.consumeBatchesFEFO(
           tx,
           storeId,
           batchTracked.map((l) => ({ productId: l.productId, quantity: l.quantity })),
         );
+        // Which batch each line's units came out of, for a return to put
+        // them back into.
+        const drawn = batchTracked.flatMap((l, i) =>
+          (taken[i] ?? []).map((t) => ({
+            saleItemId: l.saleItemId,
+            batchId: t.batchId,
+            quantity: t.quantity,
+          })),
+        );
+        if (drawn.length) await tx.saleItemBatch.createMany({ data: drawn });
       }
       for (const l of serialLines) {
         await this.inventory.sellSerials(tx, {
@@ -548,8 +586,13 @@ export class SalesService {
     if (!found) throw new NotFoundException('Sale not found');
     assertOwnStore(user, found.storeId);
     this.assertReturnable(found.status);
+    if (dto.items.some((r) => r.writeOffReason && r.restock === true)) {
+      throw new BadRequestException(
+        'A line written off as damaged or expired can’t also go back on the shelf',
+      );
+    }
 
-    const [trackedProducts, shiftId] = await Promise.all([
+    const [trackedProducts, till] = await Promise.all([
       this.prisma.product.findMany({
         where: {
           id: { in: found.items.map((i) => i.productId) },
@@ -561,12 +604,16 @@ export class SalesService {
       // The refund comes out of the drawer at the counter now, not the one the
       // sale was rung up on: a return a week later is paid from today's till,
       // and that till's count is the one it has to explain.
-      this.shifts.resolveShiftId(user, found.storeId, dto.shiftId),
+      this.shifts.tillFor(user, found.storeId, dto.shiftId),
     ]);
+    const shiftId = till.shiftId;
     const serialised = new Set(trackedProducts.filter((p) => p.trackSerials).map((p) => p.id));
     const batched = new Set(trackedProducts.filter((p) => p.trackBatches).map((p) => p.id));
 
     return this.prisma.$transaction(async (tx) => {
+      // The refund comes out of this till's drawer, so it must still be open
+      // to take it -- see holdShiftOpen.
+      await holdShiftOpen(tx, shiftId);
       // One return per sale at a time. Everything below reads the sale after
       // this, so a return that was waiting sees the one before it in full.
       await tx.$queryRaw`SELECT id FROM "Sale" WHERE id = ${found.id} FOR UPDATE`;
@@ -594,10 +641,10 @@ export class SalesService {
       const { creditCancelled, cashBack } = this.splitRefund(sale, refund, balance);
 
       // Stock-back-in is batched (one read + one bulk write for all lines).
-      // Goods that came back damaged are booked in and written off in the
-      // same batch: they never reach the shelf, and the history shows both
-      // what came back and why it isn't there. Batched together, their net
-      // change is zero, so the write-off can't fail for want of stock.
+      // Goods that came back damaged or expired are booked in and written off
+      // in the same batch: they never reach the shelf, and the history shows
+      // both what came back and why it isn't there. Batched together, their
+      // net change is zero, so the write-off can't fail for want of stock.
       const reason = dto.reason?.trim() || null;
       await this.inventory.applyMovementsBatch(
         tx,
@@ -612,14 +659,14 @@ export class SalesService {
           };
           return [
             { ...back, type: StockMovementType.RETURN_IN, quantity: r.quantity, note: reason },
-            ...(r.restock === false
+            ...(writtenOff(r)
               ? [
                   {
                     ...back,
                     type: StockMovementType.ADJUSTMENT,
                     quantity: -r.quantity,
-                    reason: AdjustmentReason.DAMAGE,
-                    note: reason ? `Returned damaged: ${reason}` : 'Returned damaged',
+                    reason: writtenOff(r)!,
+                    note: `Returned ${writtenOff(r) === AdjustmentReason.EXPIRED ? 'expired' : 'damaged'}${reason ? `: ${reason}` : ''}`,
                   },
                 ]
               : []),
@@ -653,16 +700,19 @@ export class SalesService {
             saleId: sale.id,
             quantity: r.quantity,
             serials: r.serials,
-            damaged: r.restock === false,
+            damaged: !!writtenOff(r),
           });
         }
-        // Written-off goods never reach the shelf, so they rejoin no batch.
-        if (batched.has(item.productId) && r.restock !== false) {
+        // Written-off goods never reach the shelf, so they rejoin no batch;
+        // they still count against what the line drew from its batches.
+        if (batched.has(item.productId)) {
           await this.inventory.restoreBatchOnReturn(tx, {
             storeId: sale.storeId,
             productId: item.productId,
+            saleItemId: item.id,
             quantity: r.quantity,
             soldAt: sale.createdAt,
+            restock: !writtenOff(r),
           });
         }
       }
@@ -682,6 +732,10 @@ export class SalesService {
       let method: PaymentMethod | null = null;
       if (cashBack > 0) {
         method = dto.refundMethod ?? (await this.defaultRefundMethod(tx, sale.id));
+        // Cash out of an unnamed drawer, with several open: booked to none,
+        // the drawer it really came from counts short at close. Only known
+        // here -- the tender and how much goes back read the locked rows.
+        if (till.ambiguous && method === PaymentMethod.CASH) throw chooseTill('out');
         await this.payments.record(
           {
             businessId: sale.businessId,

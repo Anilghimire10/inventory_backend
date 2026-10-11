@@ -1,7 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { SETTLE_METHODS } from '../../payments/payments.service';
-import { PaymentMethod } from '@prisma/client';
+import { AdjustmentReason, PaymentMethod } from '@prisma/client';
 import {
   ArrayMinSize,
   IsArray,
@@ -36,6 +36,17 @@ export class ReturnItemDto {
   @IsOptional()
   @IsBoolean()
   restock?: boolean;
+
+  @ApiPropertyOptional({
+    enum: [AdjustmentReason.DAMAGE, AdjustmentReason.EXPIRED],
+    description:
+      'Write the goods off as they come back, for this reason: damaged, or ' +
+      'past their date. Implies restock: false; omitted with restock: false ' +
+      'means damaged.',
+  })
+  @IsOptional()
+  @IsIn([AdjustmentReason.DAMAGE, AdjustmentReason.EXPIRED])
+  writeOffReason?: 'DAMAGE' | 'EXPIRED';
 
   @ApiPropertyOptional({
     type: [String],

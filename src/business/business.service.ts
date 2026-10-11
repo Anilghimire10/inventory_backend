@@ -109,12 +109,14 @@ export class BusinessService {
         where,
         select: {
           id: true, email: true, name: true, role: true,
-          storeId: true, isActive: true, emailVerified: true, createdAt: true,
+          storeId: true, counterId: true, isActive: true, emailVerified: true, createdAt: true,
         },
       }),
     );
 
     yield* this.pageTable('store', (a) => this.prisma.store.findMany({ ...a, where }));
+    // The drawers: which counter each shift counted, and each cashier works.
+    yield* this.pageTable('counter', (a) => this.prisma.counter.findMany({ ...a, where }));
     yield* this.pageTable('category', (a) => this.prisma.category.findMany({ ...a, where }));
     yield* this.pageTable('tax', (a) => this.prisma.tax.findMany({ ...a, where }));
     yield* this.pageTable('product', (a) =>

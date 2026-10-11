@@ -3,9 +3,11 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { PaymentMethod, PaymentType, Prisma } from '@prisma/client';
+import { PaymentMethod, PaymentType, Prisma, SaleStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TX_OPTS } from '../common/prisma-tx';
 import { PaymentsService } from '../payments/payments.service';
+import { holdShiftOpen } from '../shifts/shifts.service';
 import { QueryCustomerDto } from './dto/query-customer.dto';
 import {
   CreateCustomerDto,
@@ -55,22 +57,59 @@ export class CustomersService {
   async findOne(businessId: string, id: string) {
     const customer = await this.prisma.customer.findFirst({
       where: { id, businessId },
-      include: {
-        sales: {
-          take: 20,
-          orderBy: { createdAt: 'desc' },
-          select: {
-            id: true,
-            receiptNo: true,
-            total: true,
-            createdAt: true,
-            status: true,
-          },
-        },
-      },
     });
     if (!customer) throw new NotFoundException('Customer not found');
     return customer;
+  }
+
+  /**
+   * The customer, with what they have bought and their latest sales. Pinned
+   * staff pass their own store: the figures are then that branch's, the same
+   * scope the customer list uses.
+   */
+  async details(businessId: string, id: string, storeId?: string) {
+    const customer = await this.findOne(businessId, id);
+    // A held cart isn't a purchase yet.
+    const bought = {
+      businessId,
+      customerId: id,
+      status: { not: SaleStatus.HELD },
+      ...(storeId ? { storeId } : {}),
+    } satisfies Prisma.SaleWhereInput;
+    const [all, sales] = await Promise.all([
+      this.prisma.sale.aggregate({
+        where: bought,
+        _count: true,
+        _sum: { total: true, refundedTotal: true },
+        _max: { createdAt: true },
+      }),
+      this.prisma.sale.findMany({
+        where: { businessId, customerId: id, ...(storeId ? { storeId } : {}) },
+        take: 10,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          receiptNo: true,
+          total: true,
+          createdAt: true,
+          status: true,
+          paymentMethod: true,
+          store: { select: { id: true, name: true } },
+        },
+      }),
+    ]);
+    const n = (d: Prisma.Decimal | null) => Number(d ?? 0);
+    return {
+      ...customer,
+      sales,
+      summary: {
+        purchases: all._count,
+        // Net of refunds, the same rule revenue uses.
+        totalSpent:
+          Math.round((n(all._sum.total) - n(all._sum.refundedTotal)) * 100) / 100,
+        lastPurchaseAt: all._max.createdAt,
+      },
+    };
   }
 
   async update(businessId: string, id: string, dto: UpdateCustomerDto) {
@@ -106,6 +145,9 @@ export class CustomersService {
     await this.ensure(businessId, id);
 
     return this.prisma.$transaction(async (tx) => {
+      // Cash taken into a till that has closed since it was picked would
+      // never reach a Z report.
+      await holdShiftOpen(tx, context.shiftId);
       // Atomic guarded decrement: the balance check and the write happen in
       // one statement against the row's live value, so two concurrent
       // payments can't both pass a stale "amount <= balance" check and drive
@@ -137,7 +179,7 @@ export class CustomersService {
       );
 
       return tx.customer.findUniqueOrThrow({ where: { id } });
-    });
+    }, TX_OPTS);
   }
 
   /**

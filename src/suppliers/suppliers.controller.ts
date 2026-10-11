@@ -72,9 +72,15 @@ export class SuppliersController {
     return this.suppliers.findAll(u.businessId, q);
   }
 
+  /**
+   * The supplier, with purchase totals, what is owed, and recent purchases.
+   * Money figures, so the roles that work with suppliers and purchases --
+   * the same ones the app shows Suppliers to -- and not a cashier.
+   */
+  @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)
   @Get(':id')
   findOne(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.suppliers.findOne(u.businessId, id);
+    return this.suppliers.details(u.businessId, id);
   }
 
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.STOCK_KEEPER)

@@ -8,6 +8,8 @@ import {
 import * as argon2 from 'argon2';
 import { Prisma, UserRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TX_OPTS } from '../common/prisma-tx';
+import { lockStoreTills } from '../common/store-lock';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { normalizeEmail } from '../common/email';
@@ -27,6 +29,8 @@ const SAFE_SELECT = {
   name: true,
   role: true,
   storeId: true,
+  counterId: true,
+  counter: { select: { id: true, name: true, isActive: true } },
   isActive: true,
   createdAt: true,
 } satisfies Prisma.UserSelect;
@@ -55,15 +59,17 @@ export class UsersService {
     // creating owner/manager themselves works out of, so a cashier can
     // start ringing up sales immediately instead of landing store-less.
     const storeId = dto.storeId ?? actingStoreId ?? undefined;
+    const counterId = await this.counterFor(businessId, dto.role, storeId ?? null, dto.counterId ?? null);
 
     const passwordHash = await argon2.hash(dto.password);
-    return this.prisma.user.create({
+    return this.saveWithCounter(counterId, storeId ?? null, (db) => db.user.create({
       data: {
         businessId,
         email,
         name: dto.name,
         role: dto.role,
         storeId,
+        counterId,
         passwordHash,
         // Verified on creation. The emailVerified gate exists to prove a
         // self-signup controls the address they registered with; a staff
@@ -74,7 +80,7 @@ export class UsersService {
         emailVerified: true,
       },
       select: SAFE_SELECT,
-    });
+    }));
   }
 
   findAll(businessId: string) {
@@ -126,7 +132,27 @@ export class UsersService {
       );
     }
 
+    // The counter follows the role and the store: settled whenever either
+    // (or the counter itself) is part of this edit -- and when a cashier is
+    // brought back, who may have been left with none, or one since taken out
+    // of use, and would only find out at the till.
+    const reactivating = dto.isActive === true && !target.isActive;
+    const storeAfter = dto.storeId !== undefined ? dto.storeId : target.storeId;
+    let counter: Prisma.UserUpdateInput['counter'];
+    let assigned: string | null = null;
+    if (reactivating || dto.role !== undefined || dto.storeId !== undefined || dto.counterId !== undefined) {
+      assigned = await this.counterFor(
+        businessId,
+        dto.role ?? target.role,
+        storeAfter,
+        dto.counterId !== undefined ? dto.counterId : target.counterId,
+        reactivating ? `${target.name} has no counter. Edit them to choose one before reactivating them.` : undefined,
+      );
+      counter = assigned ? { connect: { id: assigned } } : { disconnect: true };
+    }
+
     const data: Prisma.UserUpdateInput = {
+      counter,
       name: dto.name,
       role: dto.role,
       isActive: dto.isActive,
@@ -147,11 +173,13 @@ export class UsersService {
       data.tokenVersion = { increment: 1 };
     }
 
-    const updated = await this.prisma.user.update({
-      where: { id },
-      data,
-      select: SAFE_SELECT,
-    });
+    const updated = await this.saveWithCounter(assigned, storeAfter, (db) =>
+      db.user.update({
+        where: { id },
+        data,
+        select: SAFE_SELECT,
+      }),
+    );
     // Always evict: the cached principal carries the role, the active flag and
     // the tokenVersion this edit may have just changed, and would keep serving
     // the stale copy for the rest of its TTL.
@@ -260,5 +288,57 @@ export class UsersService {
       where: { id: storeId, businessId },
     });
     if (!store) throw new BadRequestException('Invalid store');
+  }
+
+  /**
+   * The counter a user is saved with. A cashier must have one, at their
+   * store: they only ever open that counter's till, so a cashier without one
+   * could not sell at all. Every other role has none -- owners and managers
+   * choose a counter at the POS, and a stock keeper never opens one.
+   */
+  private async counterFor(
+    businessId: string,
+    role: UserRole,
+    storeId: string | null,
+    counterId: string | null,
+    /** What to say when there is no counter, if not the plain form message. */
+    missing?: string,
+  ): Promise<string | null> {
+    if (role !== UserRole.CASHIER) return null;
+    if (!storeId) throw new BadRequestException(missing ?? 'Choose the store this cashier works at');
+    if (!counterId) throw new BadRequestException(missing ?? 'Choose the counter this cashier works at');
+    const counter = await this.prisma.counter.findFirst({
+      where: { id: counterId, businessId },
+      select: { storeId: true, isActive: true, name: true },
+    });
+    if (!counter) throw new BadRequestException('Counter not found');
+    if (counter.storeId !== storeId) {
+      throw new BadRequestException(`${counter.name} is at another store. Choose a counter at this cashier’s store.`);
+    }
+    if (!counter.isActive) throw new BadRequestException(`${counter.name} is no longer in use`);
+    return counterId;
+  }
+
+  /**
+   * Saves a user assigned to a counter under the lock that taking a counter
+   * out of use holds, re-checking it is still in use. Without it, a cashier
+   * assigned at the moment their counter was retired ended up on a counter
+   * out of use, and could not sell.
+   */
+  private saveWithCounter<T>(
+    counterId: string | null,
+    storeId: string | null,
+    write: (db: Prisma.TransactionClient | PrismaService) => Promise<T>,
+  ): Promise<T> {
+    if (!counterId || !storeId) return write(this.prisma);
+    return this.prisma.$transaction(async (tx) => {
+      await lockStoreTills(tx, storeId);
+      const live = await tx.counter.findFirst({
+        where: { id: counterId, isActive: true },
+        select: { id: true },
+      });
+      if (!live) throw new BadRequestException('That counter was just taken out of use. Choose another.');
+      return write(tx);
+    }, TX_OPTS);
   }
 }
