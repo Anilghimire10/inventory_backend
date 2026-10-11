@@ -125,9 +125,10 @@ export class CustomersController {
     return this.customers.findAll(u.businessId, q);
   }
 
+  /** The customer, with purchase totals and their latest sales. */
   @Get(':id')
   findOne(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.customers.findOne(u.businessId, id);
+    return this.customers.details(u.businessId, id, scopeToStore(u));
   }
 
   @Patch(':id')
