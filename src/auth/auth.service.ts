@@ -30,6 +30,7 @@ import {
   ResetPasswordDto,
 } from './dto/password.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+import { firstCounter } from '../counters/default-counter';
 import { AuthUser } from '../common/types/auth-user';
 import { normalizeEmail } from '../common/email';
 import { PrincipalCache } from '../common/principal-cache';
@@ -99,7 +100,11 @@ export class AuthService {
         },
       });
       const store = await tx.store.create({
-        data: { businessId: business.id, name: 'Main Store' },
+        data: {
+          businessId: business.id,
+          name: 'Main Store',
+          counters: firstCounter(business.id),
+        },
       });
       const user = await tx.user.create({
         data: {
@@ -339,7 +344,8 @@ export class AuthService {
   async me(userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      include: { business: true, store: true },
+      // The counter a cashier works at: the till says which one it opens.
+      include: { business: true, store: true, counter: { select: { id: true, name: true } } },
     });
     if (!user) throw new UnauthorizedException();
     const { passwordHash, ...safe } = user;

@@ -16,6 +16,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TX_OPTS } from '../common/prisma-tx';
+import { lockStoreTills } from '../common/store-lock';
 import { AuthUser } from '../common/types/auth-user';
 import { PaymentsService } from '../payments/payments.service';
 import { paginate } from '../common/dto/pagination.dto';
@@ -38,6 +39,28 @@ const isManagement = (role: UserRole) =>
  * cash, and those rows keep reading the way they always did.
  */
 const CASH_TENDERS: PaymentMethod[] = [PaymentMethod.CASH, PaymentMethod.MIXED];
+
+/** What a shift report reads alongside the shift. */
+const REPORT_INCLUDE = {
+  user: { select: { id: true, name: true } },
+  store: { select: { id: true, name: true } },
+  counter: { select: { id: true, name: true } },
+  business: {
+    select: { shiftBlindClose: true, shiftVarianceNoteOver: true },
+  },
+  cashMovements: {
+    orderBy: { createdAt: 'asc' },
+    select: {
+      id: true,
+      type: true,
+      reason: true,
+      amount: true,
+      note: true,
+      createdAt: true,
+      user: { select: { id: true, name: true } },
+    },
+  },
+} satisfies Prisma.ShiftInclude;
 
 /** Who is looking at a report -- decides whose till it is, and blind close. */
 type Viewer = Pick<AuthUser, 'userId' | 'role'>;
@@ -150,20 +173,34 @@ export class ShiftsService {
   ) {}
 
   /**
-   * Start a till session, or resume the caller's one already open at this
-   * store. One open shift per user per store, enforced by the DB.
+   * Start a till session on a counter, or resume the caller's one already
+   * open at this store. One open shift per user per store, and one per
+   * counter -- one drawer, one count -- both enforced by the DB.
    *
-   * A shift is a drawer, not a login. An owner or manager arriving at a store
-   * where a till is already running chooses: work on that till -- a
-   * cashier's, or another owner's or manager's -- or open their own. Their
-   * own is only opened when they ask for it (`separateDrawer`), never by
-   * habit: a second shift on one physical drawer splits its cash across two
-   * Z reports, and neither then counts out. A cashier can't work on someone
-   * else's till, so a cashier taking over counts the drawer out and in --
-   * that handover is the check.
+   * A cashier opens the counter they are assigned to and no other: the owner
+   * set it up for them, and their drawer is that counter's. An owner or
+   * manager chooses: with one counter at the store it is that one; with
+   * several they name it (COUNTER_CHOICE otherwise). A counter already open is
+   * refused (COUNTER_BUSY): an owner works on its shift instead (see
+   * `current`), and a cashier waits for it to be counted out.
    */
   async open(user: AuthUser, dto: OpenShiftDto) {
     let storeId = dto.storeId ?? user.storeId;
+    let counterId = dto.counterId;
+    const isCashier = user.role === UserRole.CASHIER;
+
+    if (isCashier) {
+      const mine = await this.assignedCounter(user.userId);
+      if (counterId && counterId !== mine.id) {
+        throw new ForbiddenException(`You can only open your own counter, ${mine.name}`);
+      }
+      if (dto.storeId && dto.storeId !== mine.storeId) {
+        throw new ForbiddenException(`Your counter, ${mine.name}, is at another store`);
+      }
+      counterId = mine.id;
+      storeId = mine.storeId;
+    }
+
     if (!storeId) {
       const stores = await this.prisma.store.findMany({
         where: { businessId: user.businessId },
@@ -175,48 +212,50 @@ export class ShiftsService {
     if (!storeId) throw new BadRequestException('No store specified for this shift');
     const store = await this.prisma.store.findFirst({
       where: { id: storeId, businessId: user.businessId },
+      select: { id: true },
     });
     if (!store) throw new NotFoundException('Store not found');
+    const atStore = storeId;
 
     try {
       return await this.prisma.$transaction(async (tx) => {
-        // Opens at one store take turns. Two owners walking up to the same
-        // counter at once could otherwise both find no till running, both
-        // open one, and split one drawer's cash across two Z reports. The
-        // lock is released when the transaction ends.
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`shift-open:${storeId}`}))`;
+        // Opens at one store take turns, and so does taking a counter out of
+        // use or assigning a cashier to one: every read below is the settled
+        // answer, made once.
+        await lockStoreTills(tx, atStore);
 
         const own = await tx.shift.findFirst({
-          where: { businessId: user.businessId, userId: user.userId, storeId, closedAt: null },
+          where: { businessId: user.businessId, userId: user.userId, storeId: atStore, closedAt: null },
+          include: { counter: { select: { name: true } } },
         });
-        if (own) return own;
+        // No counter named and a till of their own already open here -- a
+        // second tab, a retry, an older app: hand it back rather than ask.
+        if (own && !counterId) return own;
 
-        if (isManagement(user.role) && !dto.separateDrawer) {
-          const running = await tx.shift.findFirst({
-            where: { businessId: user.businessId, storeId, closedAt: null },
-            select: { user: { select: { name: true } } },
-            orderBy: { openedAt: 'asc' },
-          });
-          if (running) {
-            throw new ConflictException({
-              statusCode: 409,
-              error: 'Conflict',
-              code: 'TILL_OPEN',
-              message:
-                `${running.user.name}’s till is already open at this store. Work on it, ` +
-                'or choose to open your own till.',
-            });
-          }
+        const counter = await this.counterToOpen(tx, user.businessId, atStore, counterId);
+        if (own) return this.resumeOwn(tx, own, counter, user.role);
+
+        const busy = await tx.shift.findFirst({
+          where: { counterId: counter.id, closedAt: null },
+          include: { user: { select: { name: true } } },
+        });
+        if (busy) {
+          // A cashier at their own counter works on the till already open
+          // there -- an owner or manager may have opened it first. One drawer
+          // has one session, and every sale says who rang it up.
+          if (isCashier) return busy;
+          throw this.counterBusy(counter.name, busy.user.name, user.role);
         }
 
         // Read server-side rather than trusted from the client: it is the
         // figure this shift's opening count is checked against.
-        const carried = await this.lastLeftInDrawer(user.businessId, storeId, tx);
+        const carried = await this.lastLeftInDrawer(user.businessId, atStore, counter.id, tx);
 
         return tx.shift.create({
           data: {
             businessId: user.businessId,
-            storeId,
+            storeId: atStore,
+            counterId: counter.id,
             userId: user.userId,
             openingFloat: dto.openingFloat,
             carriedFloat: carried?.amount ?? null,
@@ -225,48 +264,202 @@ export class ShiftsService {
         });
       }, TX_OPTS);
     } catch (err) {
-      // Partial unique index on (userId, storeId) WHERE closedAt IS NULL.
-      // Checking in JS first would let two concurrent requests both open a
-      // shift.
-      //
-      // Hitting it means the caller's till is already running here -- a POS
-      // that missed it on load, a double-tap, a second tab. Hand that shift
-      // back so they carry on with it: refusing would strand them in front of
-      // a drawer they can neither open nor see. The float they just typed is
-      // dropped on purpose; the drawer was counted in at its original float.
-      if (
-        err instanceof Prisma.PrismaClientKnownRequestError &&
-        err.code === 'P2002'
-      ) {
-        const existing = await this.prisma.shift.findFirst({
-          where: {
-            businessId: user.businessId,
-            userId: user.userId,
-            storeId,
-            closedAt: null,
-          },
-        });
-        if (existing) return existing;
+      // A partial unique index -- (userId, storeId) or the counter's -- caught
+      // what the checks above raced past. Checking in JS alone would let two
+      // concurrent requests both open a shift. Settle it the way the checks
+      // would have, under the lock; whatever is left is a race lost a moment
+      // ago, and trying again gets the settled answer.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        return this.prisma.$transaction(async (tx) => {
+          await lockStoreTills(tx, atStore);
+          const counter = await this.counterToOpen(tx, user.businessId, atStore, counterId);
+          const own = await tx.shift.findFirst({
+            where: { businessId: user.businessId, userId: user.userId, storeId: atStore, closedAt: null },
+            include: { counter: { select: { name: true } } },
+          });
+          if (own) return this.resumeOwn(tx, own, counter, user.role);
+          const busy = await tx.shift.findFirst({
+            where: { counterId: counter.id, closedAt: null },
+            include: { user: { select: { name: true } } },
+          });
+          if (busy && isCashier) return busy;
+          if (busy) throw this.counterBusy(counter.name, busy.user.name, user.role);
+          throw new ConflictException({
+            statusCode: 409,
+            error: 'Conflict',
+            code: 'COUNTER_RETRY',
+            message: `${counter.name} was being opened at the same moment. Try again.`,
+          });
+        }, TX_OPTS);
       }
       throw err;
     }
   }
 
   /**
-   * What the last shift closed at this store left in the drawer, or null.
+   * The caller already has a till open at this store, and asked for a
+   * counter. Theirs if it is that counter. A till from before counters
+   * belongs to none -- nothing stopped a second shift on its drawer -- so
+   * opened as this counter it becomes this counter's, if no one else is on it.
+   * Any other counter of theirs is refused: one till of their own per store.
+   */
+  private async resumeOwn(
+    tx: Prisma.TransactionClient,
+    own: { id: string; counterId: string | null; counter: { name: string } | null },
+    counter: { id: string; name: string },
+    role: UserRole,
+  ) {
+    if (own.counterId === counter.id) return tx.shift.findUniqueOrThrow({ where: { id: own.id } });
+    if (own.counterId === null) {
+      await this.assertCounterFree(tx, counter, role);
+      return tx.shift.update({ where: { id: own.id }, data: { counterId: counter.id } });
+    }
+    throw this.ownShiftOpen(own.counter?.name, counter.name);
+  }
+
+  /** A cashier's assigned counter id, or null. */
+  private async cashierCounterId(userId: string) {
+    const me = await this.prisma.user.findUnique({ where: { id: userId }, select: { counterId: true } });
+    return me?.counterId ?? null;
+  }
+
+  /**
+   * Whether this user may sell into, move cash on, or close a shift: their
+   * own; anyone's, for an owner or manager; and for a cashier, the one at
+   * the counter they are assigned to -- the drawer they stand at, whoever
+   * counted it in.
+   */
+  private async mayWorkOn(
+    user: Pick<AuthUser, 'userId' | 'role'>,
+    shift: { userId: string; counterId: string | null },
+  ) {
+    if (shift.userId === user.userId || isManagement(user.role)) return true;
+    if (user.role !== UserRole.CASHIER || !shift.counterId) return false;
+    return (await this.cashierCounterId(user.userId)) === shift.counterId;
+  }
+
+  /** The counter a cashier is assigned to, or a refusal saying how to fix it. */
+  private async assignedCounter(userId: string) {
+    const me = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { counter: { select: { id: true, name: true, storeId: true, isActive: true } } },
+    });
+    const counter = me?.counter;
+    if (!counter || !counter.isActive) {
+      throw new BadRequestException({
+        statusCode: 400,
+        error: 'Bad Request',
+        code: 'NO_COUNTER',
+        message: 'You are not assigned to a counter. Ask the owner to assign you one in Staff.',
+      });
+    }
+    return counter;
+  }
+
+  /**
+   * Which counter a shift opens on: the one named, if it is in use at this
+   * store; else the store's only one. With several and none named, which
+   * drawer is being counted in is a choice for the person at the till.
+   */
+  private async counterToOpen(
+    db: Prisma.TransactionClient,
+    businessId: string,
+    storeId: string,
+    counterId?: string,
+  ) {
+    if (counterId) {
+      const counter = await db.counter.findFirst({
+        where: { id: counterId, businessId, storeId },
+        select: { id: true, name: true, isActive: true },
+      });
+      if (!counter) throw new NotFoundException('Counter not found at this store');
+      if (!counter.isActive) throw new BadRequestException(`${counter.name} is no longer in use`);
+      return counter;
+    }
+    const counters = await db.counter.findMany({
+      where: { businessId, storeId, isActive: true },
+      select: { id: true, name: true, isActive: true },
+      orderBy: { createdAt: 'asc' },
+      take: 2,
+    });
+    if (counters.length === 0) {
+      throw new BadRequestException('This store has no counter. Add one in Settings → Stores.');
+    }
+    if (counters.length > 1) {
+      throw new ConflictException({
+        statusCode: 409,
+        error: 'Conflict',
+        code: 'COUNTER_CHOICE',
+        message: 'This store has more than one counter. Choose which one to open.',
+      });
+    }
+    return counters[0];
+  }
+
+  /** Refuses a counter with a shift already open on it. */
+  private async assertCounterFree(
+    db: Prisma.TransactionClient | PrismaService,
+    counter: { id: string; name: string },
+    role: UserRole,
+  ) {
+    const busy = await db.shift.findFirst({
+      where: { counterId: counter.id, closedAt: null },
+      select: { user: { select: { name: true } } },
+    });
+    if (busy) throw this.counterBusy(counter.name, busy.user.name, role);
+  }
+
+  private ownShiftOpen(open: string | undefined, asked: string) {
+    return new ConflictException({
+      statusCode: 409,
+      error: 'Conflict',
+      code: 'OWN_SHIFT_OPEN',
+      message: `You already have ${open ?? 'a till'} open here. Close it before opening ${asked}.`,
+    });
+  }
+
+  private counterBusy(counter: string, by: string, role: UserRole) {
+    return new ConflictException({
+      statusCode: 409,
+      error: 'Conflict',
+      code: 'COUNTER_BUSY',
+      message: isManagement(role)
+        ? `${counter} is already open on ${by}’s shift. Work on it, or choose another counter.`
+        : `${counter} is already open on ${by}’s shift. It has to be closed before you open yours.`,
+    });
+  }
+
+  /**
+   * What the last shift closed on this counter left in its drawer, or null.
    *
    * Only ever the most recent close: if that cashier didn't say what they
    * left, reaching back to an older shift would offer a float from a drawer
-   * that has been counted and emptied since. Store-wide rather than per user,
-   * because the drawer stays at the counter when the cashier goes home.
+   * that has been counted and emptied since. Per counter rather than per
+   * user, because the drawer stays at the counter when the cashier goes home.
+   * At a store with one counter, shifts from before counters (none named)
+   * still count, so the first opening after the change is checked against
+   * what was left then.
    */
   private async lastLeftInDrawer(
     businessId: string,
     storeId: string,
+    counterId: string | null,
     tx?: Prisma.TransactionClient,
   ) {
-    const last = await (tx ?? this.prisma).shift.findFirst({
-      where: { businessId, storeId, closedAt: { not: null } },
+    const db = tx ?? this.prisma;
+    // Closes from before counters name no drawer. With one counter at the
+    // store they were that drawer; with several -- counting those since taken
+    // out of use, which were drawers then -- any one of them could have been
+    // another counter's, and its leftover cash would be checked against the
+    // wrong drawer.
+    const legacyIsThisDrawer = !!counterId && (await db.counter.count({ where: { storeId } })) === 1;
+    const last = await db.shift.findFirst({
+      where: {
+        businessId,
+        storeId,
+        closedAt: { not: null },
+        ...(counterId ? (legacyIsThisDrawer ? { OR: [{ counterId }, { counterId: null }] } : { counterId }) : {}),
+      },
       orderBy: { closedAt: 'desc' },
       select: {
         cashLeft: true,
@@ -282,9 +475,25 @@ export class ShiftsService {
     };
   }
 
-  /** The opening float to offer: whatever the previous shift left behind. */
-  suggestedFloat(user: AuthUser, storeId: string) {
-    return this.lastLeftInDrawer(user.businessId, storeId);
+  /**
+   * The opening float to offer: whatever the previous shift on this counter
+   * left behind. A cashier's counter is theirs whatever the client says.
+   */
+  async suggestedFloat(user: AuthUser, storeId: string, counterId?: string) {
+    if (user.role === UserRole.CASHIER) {
+      counterId = (await this.cashierCounterId(user.userId)) ?? undefined;
+    } else if (!counterId) {
+      // No counter named: the store's only one, if it has just one. With
+      // several, the store-wide last close could be another drawer's cash.
+      const counters = await this.prisma.counter.findMany({
+        where: { storeId, isActive: true },
+        select: { id: true },
+        take: 2,
+      });
+      if (counters.length !== 1) return null;
+      counterId = counters[0].id;
+    }
+    return this.lastLeftInDrawer(user.businessId, storeId, counterId ?? null);
   }
 
   /**
@@ -360,6 +569,17 @@ export class ShiftsService {
     });
     if (own) return { shiftId: own.id, ambiguous: false };
 
+    // A cashier with none of their own works on the till open at their
+    // counter, whoever opened it -- there is only the one drawer there.
+    if (user.role === UserRole.CASHIER) {
+      const counterId = await this.cashierCounterId(user.userId);
+      if (!counterId) return { shiftId: null, ambiguous: false };
+      const atCounter = await this.prisma.shift.findFirst({
+        where: { businessId: user.businessId, counterId, closedAt: null, ...(storeId ? { storeId } : {}) },
+        select: { id: true },
+      });
+      return { shiftId: atCounter?.id ?? null, ambiguous: false };
+    }
     if (!isManagement(user.role)) return { shiftId: null, ambiguous: false };
     // Asked without a store -- an owner on "all stores" -- a shop with only
     // one has nothing to disambiguate: that's where the till is. With several
@@ -404,6 +624,7 @@ export class ShiftsService {
         openingFloat: true,
         userId: true,
         user: { select: { id: true, name: true, role: true } },
+        counter: { select: { id: true, name: true } },
         _count: { select: { sales: true } },
       },
       orderBy: { openedAt: 'asc' },
@@ -413,6 +634,7 @@ export class ShiftsService {
       openedAt: s.openedAt,
       openingFloat: Number(s.openingFloat),
       openedBy: s.user,
+      counter: s.counter,
       salesCount: s._count.sales,
       isOwnShift: s.userId === user.userId,
     }));
@@ -435,12 +657,12 @@ export class ShiftsService {
         closedAt: null,
         ...(storeId ? { storeId } : {}),
       },
-      select: { id: true, userId: true },
+      select: { id: true, userId: true, counterId: true },
     });
     if (!shift) throw shiftClosed();
-    if (shift.userId !== user.userId && !isManagement(user.role)) {
+    if (!(await this.mayWorkOn(user, shift))) {
       throw new ForbiddenException(
-        'Only an owner or manager can work on someone else’s shift',
+        'Only an owner or manager can work on someone else’s shift, or a cashier on the till at their own counter',
       );
     }
     return shift.id;
@@ -461,33 +683,24 @@ export class ShiftsService {
    * variance just for knowing a shift id, which every sale carries. Not found
    * rather than forbidden, so it doesn't confirm the shift exists.
    */
-  async report(businessId: string, id: string, viewer?: Viewer) {
-    const shift = await this.prisma.shift.findFirst({
-      where: {
-        id,
-        businessId,
-        ...(viewer && !isManagement(viewer.role) ? { userId: viewer.userId } : {}),
-      },
-      include: {
-        user: { select: { id: true, name: true } },
-        store: { select: { id: true, name: true } },
-        business: {
-          select: { shiftBlindClose: true, shiftVarianceNoteOver: true },
-        },
-        cashMovements: {
-          orderBy: { createdAt: 'asc' },
-          select: {
-            id: true,
-            type: true,
-            reason: true,
-            amount: true,
-            note: true,
-            createdAt: true,
-            user: { select: { id: true, name: true } },
-          },
-        },
-      },
-    });
+  async report(
+    businessId: string,
+    id: string,
+    viewer?: Viewer,
+    /** The caller already checked the viewer may work on it (close does). */
+    accessChecked = false,
+  ) {
+    const find = (where: Prisma.ShiftWhereInput) =>
+      this.prisma.shift.findFirst({ where: { id, businessId, ...where }, include: REPORT_INCLUDE });
+    let shift = await find(
+      viewer && !isManagement(viewer.role) && !accessChecked ? { userId: viewer.userId } : {},
+    );
+    // A cashier also reads the till open at their counter that they are
+    // working on -- looked up only when it isn't their own, the usual case.
+    if (!shift && viewer?.role === UserRole.CASHIER) {
+      const counterId = await this.cashierCounterId(viewer.userId);
+      if (counterId) shift = await find({ counterId, closedAt: null });
+    }
     if (!shift) throw new NotFoundException('Shift not found');
     const { business, cashMovements, ...row } = shift;
     const totals = await this.totals(id, Number(shift.openingFloat));
@@ -554,8 +767,8 @@ export class ShiftsService {
     });
     if (!shift) throw new NotFoundException('Shift not found');
     if (shift.closedAt) throw new BadRequestException('Shift is already closed');
-    if (shift.userId !== user.userId && !isManagement(user.role)) {
-      throw new ForbiddenException('Only the cashier or a manager can close this shift');
+    if (!(await this.mayWorkOn(user, shift))) {
+      throw new ForbiddenException('Only the cashier at this counter or a manager can close this shift');
     }
     if (dto.cashLeft !== undefined && dto.cashLeft > dto.countedCash) {
       throw new BadRequestException(
@@ -613,7 +826,9 @@ export class ShiftsService {
       });
     }, TX_OPTS);
 
-    return this.report(user.businessId, id, user);
+    // The Z report of the drawer just counted -- for the cashier at that
+    // counter too, though it is no longer open and may not be their shift.
+    return this.report(user.businessId, id, user, true);
   }
 
   /**
@@ -682,6 +897,7 @@ export class ShiftsService {
         include: {
           user: { select: { id: true, name: true } },
           store: { select: { id: true, name: true } },
+          counter: { select: { id: true, name: true } },
           _count: { select: { sales: true } },
         },
         orderBy: { openedAt: 'desc' },

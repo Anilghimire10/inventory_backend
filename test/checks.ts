@@ -375,6 +375,17 @@ async function cashControlOnAShift() {
     const service = new ShiftsService(
       stub<PrismaService>(withTx({
         store: { findFirst: async () => ({ id: 's1' }) },
+        // The cashier works Counter 1.
+        user: {
+          findUnique: async () => ({
+            counterId: 'c1',
+            counter: { id: 'c1', name: 'Counter 1', storeId: 's1', isActive: true },
+          }),
+        },
+        counter: {
+          findFirst: async () => ({ id: 'c1', name: 'Counter 1', isActive: true }),
+          count: async () => 1,
+        },
         shift: {
           // Nothing open at the store; the last close left 1500.
           findFirst: async (args: any) =>
@@ -392,67 +403,158 @@ async function cashControlOnAShift() {
     await service.open(user, { storeId: 's1', openingFloat: 1400 });
     assert.strictEqual(createdShift.carriedFloat, 1500, 'the 100 missing overnight is on record');
     assert.strictEqual(createdShift.openingFloat, 1400);
+    assert.strictEqual(createdShift.counterId, 'c1', 'on the counter the cashier is assigned to');
   }
 }
 
 /**
- * One drawer, one shift. An owner at a store where a till is running joins it
- * rather than opening a second one by habit -- unless they say the counter
- * has its own cash. The Z report then says whose sales are in the drawer.
+ * Counters: one drawer each, one open shift each. A cashier opens the counter
+ * they are assigned to and no other; an owner or manager chooses one when the
+ * store has more than one, and a counter already open is theirs to work on,
+ * not to open again.
  */
 async function oneDrawerOneShift() {
   const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
   const cashier: AuthUser = { ...user, userId: 'u2', role: 'CASHIER' as AuthUser['role'] };
+  const C1 = { id: 'c1', name: 'Counter 1', storeId: 's1', isActive: true };
+  const C2 = { id: 'c2', name: 'Counter 2', storeId: 's1', isActive: true };
 
-  // `open` is every shift open at store s1.
-  const build = (open: { id: string; userId: string; name: string }[]) => {
+  // `open` is every shift open at store s1; `assigned` the cashier's counter.
+  const build = (
+    open: { id: string; userId: string; name: string; counterId: string | null }[],
+    counters = [C1, C2],
+    assigned: typeof C1 | null = C1,
+  ) => {
     const created: any[] = [];
     const service = new ShiftsService(
       stub<PrismaService>(withTx({
         store: { findFirst: async () => ({ id: 's1' }) },
+        user: { findUnique: async () => ({ counter: assigned, counterId: assigned?.id ?? null }) },
+        counter: {
+          findFirst: async ({ where }: any) => counters.find((c) => c.id === where.id) ?? null,
+          findMany: async () => counters.filter((c) => c.isActive),
+          count: async () => counters.filter((c) => c.isActive).length,
+        },
         shift: {
           findFirst: async (args: any) => {
             if (args.where.closedAt !== null) return null; // no previous close
-            const hit = open.find((sh) => !args.where.userId || sh.userId === args.where.userId);
-            return hit ? { ...hit, user: { name: hit.name } } : null;
+            const hit = open.find((sh) =>
+              args.where.userId ? sh.userId === args.where.userId : sh.counterId === args.where.counterId,
+            );
+            const counter = counters.find((c) => c.id === hit?.counterId);
+            return hit ? { ...hit, user: { name: hit.name }, counter: counter ? { name: counter.name } : null } : null;
           },
           create: async (args: any) => {
             created.push(args.data);
             return { id: 'new', ...args.data };
           },
+          update: async ({ where, data }: any) => {
+            updated.push([where.id, data.counterId]);
+            return { ...open.find((sh) => sh.id === where.id), ...data };
+          },
+          findUniqueOrThrow: async ({ where }: any) => open.find((sh) => sh.id === where.id),
         },
       })),
       stub<PaymentsService>({}),
     );
-    return { service, created };
+    return { service, created, updated };
   };
-  const sangu = { id: 'sh-sangu', userId: 'u2', name: 'Sangu' };
+  const updated: [string, string][] = [];
+  const sangu = { id: 'sh-sangu', userId: 'u2', name: 'Sangu', counterId: 'c1' };
+  const code = (c: string) => (e: any) => e.getResponse?.().code === c;
 
   {
     const { service, created } = build([sangu]);
     await assert.rejects(
       service.open(owner, { storeId: 's1', openingFloat: 1200 }),
-      (e: any) => e.getStatus() === 409 && /Sangu’s till is already open/.test(e.message),
-      'an owner is sent to the open till, not given a second drawer',
+      code('COUNTER_CHOICE'),
+      'with two counters, the owner chooses which one to open',
+    );
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1200, counterId: 'c1' }),
+      (e: any) => code('COUNTER_BUSY')(e) && /Counter 1 is already open on Sangu’s shift/.test(e.message),
+      'a counter already open is worked on, not opened twice',
     );
     assert.strictEqual(created.length, 0);
-    await service.open(owner, { storeId: 's1', openingFloat: 500, separateDrawer: true });
-    assert.strictEqual(created[0].userId, 'owner1', 'unless the counter really has its own cash');
+    await service.open(owner, { storeId: 's1', openingFloat: 500, counterId: 'c2' });
+    assert.deepStrictEqual([created[0].userId, created[0].counterId], ['owner1', 'c2'], 'the free counter opens');
   }
 
   {
-    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner' };
+    const { service, created } = build([], [C1]);
+    await service.open(owner, { storeId: 's1', openingFloat: 500 });
+    assert.strictEqual(created[0].counterId, 'c1', 'one counter: nothing to choose');
+  }
+
+  {
+    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner', counterId: 'c2' };
     const { service, created } = build([sangu, mine]);
-    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1 });
-    assert.strictEqual(got.id, 'sh-mine', 'an owner with their own till open here resumes it');
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c2' });
+    assert.strictEqual(got.id, 'sh-mine', 'an owner with that counter open resumes it');
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c1' }),
+      code('OWN_SHIFT_OPEN'),
+      'one till of their own per store: close it before opening another',
+    );
     assert.strictEqual(created.length, 0);
   }
 
   {
-    const ownerTill = { id: 'sh-owner', userId: 'owner1', name: 'Owner' };
-    const { service, created } = build([ownerTill]);
+    const { service, created } = build([]);
     await service.open(cashier, { storeId: 's1', openingFloat: 1000 });
-    assert.strictEqual(created[0].userId, 'u2', 'a cashier, who cannot join, is never blocked');
+    assert.deepStrictEqual([created[0].userId, created[0].counterId], ['u2', 'c1'], 'a cashier opens their own counter');
+    await assert.rejects(
+      service.open(cashier, { storeId: 's1', openingFloat: 1000, counterId: 'c2' }),
+      (e: any) => e.getStatus() === 403,
+      'and no other',
+    );
+  }
+
+  {
+    const { service } = build([], [C1, C2], null);
+    await assert.rejects(
+      service.open(cashier, { storeId: 's1', openingFloat: 1000 }),
+      code('NO_COUNTER'),
+      'a cashier with no counter is told to ask the owner',
+    );
+  }
+
+  {
+    // The owner opened Counter 1 before its cashier arrived. One drawer, one
+    // session: the cashier works on that till rather than being locked out.
+    const ownerOnC1 = { id: 'sh-owner', userId: 'owner1', name: 'Owner', counterId: 'c1' };
+    const { service, created } = build([ownerOnC1]);
+    const got: any = await service.open(cashier, { storeId: 's1', openingFloat: 1000 });
+    assert.strictEqual(got.id, 'sh-owner', 'the cashier works on the till open at their counter');
+    assert.strictEqual(created.length, 0, 'no second shift on the drawer');
+  }
+
+  {
+    // A second tab or an older app opens without naming a counter: the till
+    // they already have here comes back, rather than "choose a counter".
+    const mine = { id: 'sh-mine', userId: 'owner1', name: 'Owner', counterId: 'c2' };
+    const { service, created } = build([sangu, mine]);
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1 });
+    assert.strictEqual(got.id, 'sh-mine', 'an owner with a till open here resumes it');
+    assert.strictEqual(created.length, 0);
+  }
+
+  {
+    // A till the owner had open before counters existed belongs to none, so
+    // it held no drawer. Opened as a free counter it becomes that counter's;
+    // opened as a busy one it is refused.
+    const legacy = { id: 'sh-legacy', userId: 'owner1', name: 'Owner', counterId: null };
+    const { service, created } = build([sangu, legacy]);
+    updated.length = 0;
+    await assert.rejects(
+      service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c1' }),
+      code('COUNTER_BUSY'),
+      'not onto a counter someone else has open',
+    );
+    const got: any = await service.open(owner, { storeId: 's1', openingFloat: 1, counterId: 'c2' });
+    assert.deepStrictEqual(updated, [['sh-legacy', 'c2']], 'the old till takes the free counter');
+    assert.strictEqual(got.counterId, 'c2');
+    assert.strictEqual(created.length, 0, 'no second shift on the drawer');
   }
 
   // Whose sales are in the drawer.
@@ -1545,9 +1647,42 @@ async function aClosedTillTakesNoMoreMoney() {
 }
 
 /**
- * Two owners at one counter. Each joins the till that is open; with none open
- * and both opening at once, only one drawer opens and the other is sent to
- * it. Without the per-store lock both found nothing running and both opened.
+ * A cashier works on the till open at their own counter -- an owner may have
+ * opened it first -- and only that one: it is what they sell into, move cash
+ * on and may close. Another counter's till stays someone else's.
+ */
+async function aCashierWorksOnTheTillAtTheirCounter() {
+  const cashier: AuthUser = { ...user, userId: 'u2', role: 'CASHIER' as AuthUser['role'] };
+  const shifts = [
+    { id: 'sh-owner', userId: 'owner1', counterId: 'c1', storeId: 's1' },
+    { id: 'sh-other', userId: 'owner2', counterId: 'c2', storeId: 's1' },
+  ];
+  const service = new ShiftsService(
+    stub<PrismaService>({
+      user: { findUnique: async () => ({ counterId: 'c1' }) },
+      shift: {
+        findFirst: async ({ where }: any) => {
+          if (where.userId) return null; // no till of their own
+          if (where.id) return shifts.find((sh) => sh.id === where.id) ?? null;
+          return shifts.find((sh) => sh.counterId === where.counterId) ?? null;
+        },
+      },
+    }),
+    stub<PaymentsService>({}),
+  );
+  assert.strictEqual(await service.resolveShiftId(cashier, 's1'), 'sh-owner', 'their counter’s till is theirs to sell into');
+  assert.strictEqual(await service.joinable(cashier, 'sh-owner'), 'sh-owner');
+  await assert.rejects(
+    service.joinable(cashier, 'sh-other'),
+    (e: any) => e.getStatus() === 403,
+    'another counter’s till is not',
+  );
+}
+
+/**
+ * Two owners at the store's one counter, opening at once: only one shift
+ * opens and the other is sent to work on it. Without the per-store lock both
+ * found the counter free and both opened it.
  */
 async function twoOwnersOpenOneTill() {
   const owner1: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
@@ -1558,12 +1693,19 @@ async function twoOwnersOpenOneTill() {
   const yieldTurn = () => new Promise((r) => setImmediate(r));
   const db: any = {
     store: { findFirst: async () => ({ id: 's1' }) },
+    counter: {
+      findMany: async () => [{ id: 'c1', name: 'Counter 1', isActive: true }],
+      findFirst: async () => ({ id: 'c1', name: 'Counter 1', isActive: true }),
+      count: async () => 1,
+    },
     shift: {
       findFirst: async (args: any) => {
         await yieldTurn();
         if (args.where.closedAt !== null) return null; // nothing closed before
-        const hit = open.find((sh) => !args.where.userId || sh.userId === args.where.userId);
-        return hit ? { ...hit, user: { name: hit.name } } : null;
+        const hit = open.find((sh) =>
+          args.where.userId ? sh.userId === args.where.userId : sh.counterId === args.where.counterId,
+        );
+        return hit ? { ...hit, user: { name: hit.name }, counter: { name: 'Counter 1' } } : null;
       },
       create: async ({ data }: any) => {
         await yieldTurn();
@@ -1603,7 +1745,7 @@ async function twoOwnersOpenOneTill() {
   assert.strictEqual(open.length, 1, 'one counter, one drawer');
   const refused = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
   assert.ok(refused, 'the second owner is not given a drawer of their own');
-  assert.strictEqual(refused.reason.getResponse().code, 'TILL_OPEN', 'they are sent to join it');
+  assert.strictEqual(refused.reason.getResponse().code, 'COUNTER_BUSY', 'they are sent to work on it');
 }
 
 /**
@@ -1614,16 +1756,20 @@ async function twoOwnersOpenOneTill() {
 async function aCashierReadsOnlyTheirOwnShift() {
   const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
   const theirs = {
-    id: 'sh-other', businessId: 'b1', userId: 'u9', openedAt: new Date(), closedAt: null,
+    id: 'sh-other', businessId: 'b1', userId: 'u9', counterId: 'c2', openedAt: new Date(), closedAt: null,
     openingFloat: 1000, expectedCash: null, countedCash: null, variance: null,
     refundsAtClose: null, carriedFloat: null, cashLeft: null,
     business: { shiftBlindClose: false, shiftVarianceNoteOver: null }, cashMovements: [],
   };
   const service = new ShiftsService(
     stub<PrismaService>({
+      // The cashier works Counter 1; the colleague's till is at Counter 2.
+      user: { findUnique: async () => ({ counterId: 'c1' }) },
       shift: {
         findFirst: async ({ where }: any) =>
-          where.id === theirs.id && (!where.userId || where.userId === theirs.userId)
+          where.id === theirs.id &&
+          (!where.userId || where.userId === theirs.userId) &&
+          (!where.counterId || where.counterId === theirs.counterId)
             ? theirs
             : null,
       },
@@ -1657,6 +1803,8 @@ async function cashNeedsANamedTill() {
   const open = [{ id: 'sh-a', userId: 'u2' }, { id: 'sh-b', userId: 'u3' }];
   const shifts = new ShiftsService(
     stub<PrismaService>({
+      // The cashier below has no counter, so no till waits for them either.
+      user: { findUnique: async () => ({ counterId: null }) },
       shift: {
         findFirst: async (args: any) =>
           args.where.id
@@ -2382,6 +2530,67 @@ async function principalCacheCannotResurrectARetiredToken() {
     stillOk.email,
     principal.email,
     'a stale cache entry must not reject a valid newer token',
+  );
+}
+
+/**
+ * A cashier brought back must have a counter in use: they only ever open
+ * their own, and reactivated without one they found out at the till.
+ */
+async function aCashierComesBackWithACounter() {
+  const target = { id: 'u7', name: 'Hari', role: 'CASHIER', isActive: false, storeId: 's1', counterId: null as string | null };
+  let saved: any = null;
+  const service = (counter: { storeId: string; isActive: boolean; name: string } | null) =>
+    new UsersService(
+      // Saving onto a counter runs in a transaction under the store's lock.
+      stub<PrismaService>(withTx({
+        user: {
+          findFirst: async () => target,
+          update: async (args: any) => (saved = args.data),
+        },
+        counter: { findFirst: async () => counter },
+      })),
+      stub<PrincipalCache>({ evict: () => undefined }),
+    );
+  await assert.rejects(
+    service(null).update('b1', 'u7', { isActive: true }, 'OWNER' as any, 'owner1'),
+    /Hari has no counter/,
+    'no counter: choose one first',
+  );
+  target.counterId = 'c2';
+  await assert.rejects(
+    service({ storeId: 's1', isActive: false, name: 'Counter 2' }).update('b1', 'u7', { isActive: true }, 'OWNER' as any, 'owner1'),
+    /Counter 2 is no longer in use/,
+    'a counter taken out of use while they were away',
+  );
+  await service({ storeId: 's1', isActive: true, name: 'Counter 2' }).update('b1', 'u7', { isActive: true }, 'OWNER' as any, 'owner1');
+  assert.strictEqual(saved.isActive, true, 'with a counter in use, they are back');
+}
+
+/**
+ * Deleting a business clears its counters before the business: a store
+ * can't be deleted while a counter points at it, and every store has one.
+ */
+async function deletingABusinessClearsItsCounters() {
+  const steps: string[] = [];
+  const tx: any = new Proxy({}, {
+    get: (_t, model: string) => ({
+      deleteMany: async () => steps.push(`${model}.deleteMany`),
+      delete: async () => steps.push(`${model}.delete`),
+    }),
+  });
+  const service = new PlatformService(
+    stub<PrismaService>({
+      business: { findUnique: async () => ({ id: 'b1', name: 'Shop', _count: {} }) },
+      $transaction: async (fn: any) => fn(tx),
+    }),
+    stub<MailService>({}), stub<PlatformAuditService>({ record: async () => undefined }), stub<SubscriptionRemindersService>({}),
+    stub<PlatformBillingService>({}), stub<BusinessService>({}), stub<AuthService>({}), stub<SettingsService>({}),
+  );
+  await service.deleteBusiness({} as any, 'b1', { confirmName: 'Shop' });
+  assert.ok(
+    steps.indexOf('counter.deleteMany') >= 0 && steps.indexOf('counter.deleteMany') < steps.indexOf('business.delete'),
+    `counters go before the business: ${steps.join(', ')}`,
   );
 }
 
@@ -4296,7 +4505,9 @@ async function reminderGoesOutOncePerThreshold() {
 /**
  * An owner joins the cashier's drawer rather than opening a second one for
  * the same physical till -- but never guesses which when more than one is
- * running, and never lets a cashier onto someone else's.
+ * running, and never lets a cashier onto a till that isn't at their counter.
+ * (Here the cashier has no counter; aCashierWorksOnTheTillAtTheirCounter
+ * covers the till at theirs.)
  */
 async function anOwnerJoinsTheTillAlreadyOpen() {
   const owner: AuthUser = { ...user, userId: 'owner1', role: 'OWNER' as AuthUser['role'] };
@@ -4306,6 +4517,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
   const build = (open: { id: string; userId: string }[]) =>
     new ShiftsService(
       stub<PrismaService>({
+        user: { findUnique: async () => ({ counterId: null }) },
         shift: {
           // resolveShiftId asks for the caller's own shift first.
           findFirst: async (args: any) => {
@@ -4351,7 +4563,7 @@ async function anOwnerJoinsTheTillAlreadyOpen() {
   assert.strictEqual(
     await build([other]).resolveShiftId(cashier, 's1'),
     null,
-    'a cashier is never put on a till someone else opened',
+    'a cashier is never put on a till someone else opened, away from their counter',
   );
 
   await assert.rejects(
@@ -5162,6 +5374,7 @@ async function main() {
   await aCashSaleNamesItsTillWhenSeveralAreOpen();
   await aClosedTillTakesNoMoreMoney();
   await twoOwnersOpenOneTill();
+  await aCashierWorksOnTheTillAtTheirCounter();
   await aCashierReadsOnlyTheirOwnShift();
   await cashNeedsANamedTill();
   await aReturnGoesBackToTheBatchItCameFrom();
@@ -5184,6 +5397,8 @@ async function main() {
   await freeTextIsBounded();
   await principalCacheCannotResurrectARetiredToken();
   await permanentDeleteRefusesToDestroyHistory();
+  await aCashierComesBackWithACounter();
+  await deletingABusinessClearsItsCounters();
   staffCannotReachAnotherStore();
   await productStoresCannotSilentlyWriteOffStock();
   await anAdminPasswordResetEndsTheirSessions();

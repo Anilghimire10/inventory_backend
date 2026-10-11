@@ -211,6 +211,7 @@ model Business {
   emailLogs            EmailLog[]
 
   stores         Store[]
+  counters       Counter[]
   users          User[]
   taxes          Tax[]
   categories     Category[]
@@ -251,6 +252,7 @@ model Store {
   sales          Sale[]
   batches        Batch[]
   shifts         Shift[]
+  counters       Counter[]
   payments       Payment[]
   serials        Serial[]
 
@@ -265,6 +267,10 @@ model User {
   business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
   storeId       String? // default store for this user (optional)
   store         Store?   @relation(fields: [storeId], references: [id])
+  /// The counter (till) a cashier works at -- required for a cashier, null for
+  /// every other role. Owners and managers choose a counter at the POS.
+  counterId     String?
+  counter       Counter? @relation(fields: [counterId], references: [id])
   email         String   @unique // globally unique -> simple login
   passwordHash  String
   name          String
@@ -693,6 +699,11 @@ model Shift {
   store          Store     @relation(fields: [storeId], references: [id])
   userId         String
   user           User      @relation(fields: [userId], references: [id])
+  /// The counter whose drawer this shift counts. Null only for shifts opened
+  /// before counters existed. One open shift per counter is a partial unique
+  /// index in the migration SQL: one drawer, one count.
+  counterId      String?
+  counter        Counter?  @relation(fields: [counterId], references: [id])
   openedAt       DateTime  @default(now())
   closedAt       DateTime?
   openingFloat   Decimal   @default(0) @db.Decimal(12, 2)
@@ -731,6 +742,29 @@ model Shift {
   // that an owner joins the cashier's drawer rather than opening a second
   // one, and by the sale path to resolve which drawer a sale lands in.
   @@index([storeId, closedAt])
+  @@index([counterId, closedAt])
+}
+
+/// A counter: one cash drawer at a store ("Counter 1", "Pharmacy desk"). The
+/// owner sets them up per store; a cashier is assigned to one and only ever
+/// opens that one; an owner or manager chooses one at the POS. A shift is a
+/// counter's drawer counted in and out.
+model Counter {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  storeId    String
+  store      Store    @relation(fields: [storeId], references: [id])
+  name       String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  users  User[]
+  shifts Shift[]
+
+  @@unique([storeId, name])
+  @@index([businessId])
 }
 
 /// Which way cash crossed the drawer outside a sale, refund or credit payment.

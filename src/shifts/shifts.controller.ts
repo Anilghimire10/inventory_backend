@@ -65,15 +65,20 @@ export class ShiftsController {
   }
 
   /**
-   * What the last shift closed at this store left in the drawer, offered as
-   * the opening float. Null when it didn't say, or nothing has closed yet.
+   * What the last shift closed on this counter left in its drawer, offered
+   * as the opening float. Null when it didn't say, or nothing has closed yet.
+   * A cashier's counter is their own whatever is asked for.
    */
   @Roles(UserRole.OWNER, UserRole.MANAGER, UserRole.CASHIER)
   @Get('float')
-  suggestedFloat(@CurrentUser() u: AuthUser, @Query('storeId') storeId?: string) {
+  suggestedFloat(
+    @CurrentUser() u: AuthUser,
+    @Query('storeId') storeId?: string,
+    @Query('counterId') counterId?: string,
+  ) {
     const scoped = scopeToStore(u, storeId);
     if (!scoped) throw new BadRequestException('storeId is required');
-    return this.shifts.suggestedFloat(u, scoped);
+    return this.shifts.suggestedFloat(u, scoped, counterId);
   }
 
   /** Shift history — owners and managers only. */

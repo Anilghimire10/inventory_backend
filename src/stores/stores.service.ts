@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { SettingsService, planFull } from '../settings/settings.service';
 import { CreateStoreDto, UpdateStoreDto } from './dto/store.dto';
 import { TX_OPTS } from '../common/prisma-tx';
+import { firstCounter } from '../counters/default-counter';
 
 @Injectable()
 export class StoresService {
@@ -36,7 +37,11 @@ export class StoresService {
     // follow-up to it.
     return this.prisma.$transaction(async (tx) => {
       const store = await tx.store.create({
-        data: { businessId, ...dto },
+        data: {
+          businessId,
+          ...dto,
+          counters: firstCounter(businessId),
+        },
       });
       const products = await tx.product.findMany({
         where: { businessId },
